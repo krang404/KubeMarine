@@ -625,7 +625,7 @@ def verify_selinux_status(cluster: KubernetesCluster) -> None:
     :param cluster: KubernetesCluster object
     :return: None
     """
-    if cluster.get_os_family() not in ('rhel', 'rhel8'):
+    if cluster.get_os_family() not in ('rhel', 'rhel8', 'rhel9'):
         return
 
     with TestCase(cluster, '213', "Security", "Selinux security policy") as tc:
@@ -684,7 +684,7 @@ def verify_selinux_config(cluster: KubernetesCluster) -> None:
     :param cluster: KubernetesCluster object
     :return: None
     """
-    if cluster.get_os_family() not in ('rhel', 'rhel8'):
+    if cluster.get_os_family() not in ('rhel', 'rhel8', 'rhel9'):
         return
 
     with TestCase(cluster, '214', "Security", "Selinux configuration") as tc:
@@ -1224,7 +1224,7 @@ def verify_apparmor_status(cluster: KubernetesCluster) -> None:
     :param cluster: KubernetesCluster object
     :return: None
     """
-    if cluster.get_os_family() in ['rhel', 'rhel8']:
+    if cluster.get_os_family() in ['rhel', 'rhel8', 'rhel9']:
         return
 
     with TestCase(cluster, '227', "Security", "Apparmor security policy") as tc:
@@ -1252,7 +1252,7 @@ def verify_apparmor_config(cluster: KubernetesCluster) -> None:
     :param cluster: KubernetesCluster object
     :return: None
     """
-    if cluster.get_os_family() in ['rhel', 'rhel8']:
+    if cluster.get_os_family() in ['rhel', 'rhel8', 'rhel9']:
         return
 
     with TestCase(cluster, '228', "Security", "Apparmor security policy") as tc:
