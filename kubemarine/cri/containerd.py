@@ -24,7 +24,7 @@ from kubemarine import system, packages
 from kubemarine.core import utils
 from kubemarine.core.group import NodeGroup, RunnersGroupResult, CollectorCallback
 
-def add_yum_repo_docker(group: NodeGroup):
+def add_yum_repo_docker(group: NodeGroup)-> RunnersGroupResult:
     # Add YUM repo for Docker
     collector = CollectorCallback(group.cluster)
     with group.new_executor() as exe:

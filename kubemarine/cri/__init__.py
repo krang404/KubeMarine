@@ -18,7 +18,7 @@ from kubemarine.core.cluster import KubernetesCluster
 from kubemarine.core.group import RunnersGroupResult, NodeGroup
 from kubemarine.cri import docker, containerd
 
-def add_missing_repo(group: NodeGroup):
+def add_missing_repo(group: NodeGroup)-> RunnersGroupResult:
     if group.get_nodes_os() in ['rhel', 'rhel8', 'rhel9']:
         return containerd.add_yum_repo_docker(group)
     else:
