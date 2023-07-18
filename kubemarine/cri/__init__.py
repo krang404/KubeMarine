@@ -24,6 +24,8 @@ def add_missing_repo(group: NodeGroup)-> RunnersGroupResult:
     else:
         group.cluster.log.debug("Skipped. If you have Ubuntu 20.04 and Debian 10, add podman repo manually")
 
+    return group
+
 def enrich_inventory(inventory: dict, cluster: KubernetesCluster) -> dict:
     if cluster.context.get("initial_procedure") == "migrate_cri":
         return inventory
