@@ -220,7 +220,7 @@ class UpgradeCRI(unittest.TestCase):
     def _packages_for_cri_os_family(self, cri: str, os_family: str) -> List[str]:
         if cri == 'containerd':
             package_names = ['podman']
-            if os_family in ('rhel', 'rhel8'):
+            if os_family in ('rhel', 'rhel8', 'rhel9'):
                 package_names.append('containerdio')
             else:
                 package_names.append('containerd')
