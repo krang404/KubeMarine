@@ -184,7 +184,7 @@ def install_haproxy_check_script(group: NodeGroup) -> None:
     group.put(io.StringIO(script), "/usr/local/bin/check_haproxy.sh", sudo=True)
     group.sudo("chmod +x /usr/local/bin/check_haproxy.sh")
     if group.get_nodes_os() in ['rhel', 'rhel8', 'rhel9']:
-        group.sudo("chcon -h system_u:object_r:bin_t /usr/local/bin/check_haproxy.sh")
+        group.sudo("chcon -u system_u -r object_r -t bin_t /usr/local/bin/check_haproxy.sh")
 
 
 def uninstall(group: NodeGroup) -> RunnersGroupResult:
