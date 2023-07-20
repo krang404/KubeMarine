@@ -175,7 +175,6 @@ def install(group: NodeGroup) -> RunnersGroupResult:
     patch_path = "./resources/drop_ins/keepalived.conf"
     group.call(system.patch_systemd_service, service_name=service_name, patch_source=patch_path)
     group.call(install_haproxy_check_script)
-    enable(group)
 
     return installation_result
 
@@ -185,7 +184,7 @@ def install_haproxy_check_script(group: NodeGroup) -> None:
     group.put(io.StringIO(script), "/usr/local/bin/check_haproxy.sh", sudo=True)
     group.sudo("chmod +x /usr/local/bin/check_haproxy.sh")
     if group.get_nodes_os() in ['rhel', 'rhel8', 'rhel9']:
-        group.sudo("chcon -u system_u -t bin_t /usr/local/bin/check_haproxy.sh")
+        group.sudo("chcon -h system_u:object_r:bin_t /usr/local/bin/check_haproxy.sh")
 
 
 def uninstall(group: NodeGroup) -> RunnersGroupResult:
@@ -278,6 +277,6 @@ def configure(group: NodeGroup) -> RunnersGroupResult:
 
     log.debug(group.sudo('ls -la %s' % package_associations['config_location']))
 
-    restart(group)
+    enable(group)
 
     return group.sudo('systemctl status %s' % package_associations['service_name'], warn=True)

@@ -163,10 +163,10 @@ For cluster machines, ensure the following requirements are met:
 
 * The following distributives and versions are supported:
 
-  * Centos 7.5+, 8.4
+  * Centos 7.5+, 8.4, 9+
   * RHEL 7.5+, 8.4, 8.6, 8.7
-  * Oracle Linux 7.5+, 8.4
-  * RockyLinux 8.6, 8.7
+  * Oracle Linux 7.5+, 8.4, 9.1+
+  * RockyLinux 8.6, 8.7, 9.1+
   * Ubuntu 20.04
   * Ubuntu 22.04.1
 
@@ -210,7 +210,7 @@ If you have other solution, remove or switch off the IP firewall before the inst
 
 * Installation of the following packages is highly recommended; however, Kubernetes can work without them, but may show warnings:
   * ethtool
-  * ebtables
+  * ebtables (included in the iptables-nft package which is available on systems like rchel 9+)
   * socat
 
 **Warning**: You have to specify packages names in "RPM format" if it is possible for you OS,
