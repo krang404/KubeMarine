@@ -351,6 +351,7 @@ compatibility_map:
       - os_family: 'rhel8'
         versions:
           - '8.6'
+          - '8.7'
           - '8.8'
     ubuntu:
       - os_family: 'debian'

@@ -32,7 +32,7 @@ def add_yum_repo_docker(group: NodeGroup)-> RunnersGroupResult:
 
             exe.cluster.log.debug("Add docker repo on %s node" % node.get_node_name())
             node.sudo("yum install -y yum-utils", callback=collector)
-            node.sudo("yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo", callback=collector)
+            node.sudo("yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo; if [ $? != 0 ]; then echo \"Failed to add repo.\"; exit 1; fi", callback=collector)
     return collector.result
 
 

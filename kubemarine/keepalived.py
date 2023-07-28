@@ -277,6 +277,7 @@ def configure(group: NodeGroup) -> RunnersGroupResult:
 
     log.debug(group.sudo('ls -la %s' % package_associations['config_location']))
 
-    enable(group)
+    enable(group) 
+    restart(group)
 
     return group.sudo('systemctl status %s' % package_associations['service_name'], warn=True)
