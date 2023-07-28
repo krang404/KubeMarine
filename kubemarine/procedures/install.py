@@ -373,14 +373,6 @@ def manage_custom_packages(group: NodeGroup) -> None:
     return None
 
 @_applicable_for_new_nodes_with_roles('control-plane', 'worker')
-def system_cri_add_missing_repo(group: NodeGroup):
-    """
-    Task which is used to install CRI. Could be skipped, if CRI already installed.
-    """
-    group.call(cri.add_missing_repo)
-
-
-@_applicable_for_new_nodes_with_roles('control-plane', 'worker')
 def system_cri_install(group: NodeGroup):
     """
     Task which is used to install CRI. Could be skipped, if CRI already installed.
@@ -597,7 +589,6 @@ tasks = OrderedDict({
             }
         },
         "cri": {
-            "add_repo": system_cri_add_missing_repo,
             "install": system_cri_install,
             "configure": system_cri_configure
         },
