@@ -175,6 +175,7 @@ def install(group: NodeGroup) -> RunnersGroupResult:
     patch_path = "./resources/drop_ins/keepalived.conf"
     group.call(system.patch_systemd_service, service_name=service_name, patch_source=patch_path)
     group.call(install_haproxy_check_script)
+    enable(group)
 
     return installation_result
 
@@ -277,7 +278,6 @@ def configure(group: NodeGroup) -> RunnersGroupResult:
 
     log.debug(group.sudo('ls -la %s' % package_associations['config_location']))
 
-    enable(group) 
     restart(group)
 
     return group.sudo('systemctl status %s' % package_associations['service_name'], warn=True)

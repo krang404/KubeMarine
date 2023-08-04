@@ -173,8 +173,8 @@ class TestKeepalivedInstallation(unittest.TestCase):
         cluster.fake_shell.add(expected_results_2, 'sudo', ["mkdir -p /etc/systemd/system/keepalived.service.d"])
 
         # simulate chcon command
-        expected_results_3 = demo.create_nodegroup_result(cluster.nodes['balancer'])
-        cluster.fake_shell.add(expected_results_3, 'sudo', ["chcon -u system_u /etc/systemd/system/keepalived.service.d"])
+        # expected_results_3 = demo.create_nodegroup_result(cluster.nodes['balancer'])
+        # cluster.fake_shell.add(expected_results_3, 'sudo', ["chcon -u system_u /etc/systemd/system/keepalived.service.d"])
 
         # simulate systemd daemon reload
         expected_results_4 = demo.create_nodegroup_result(cluster.nodes['balancer'])
@@ -224,8 +224,8 @@ class TestKeepalivedInstallation(unittest.TestCase):
         cluster.fake_shell.add(expected_results_2, 'sudo', ["mkdir -p /etc/systemd/system/keepalived.service.d"])
 
         # simulate chcon command
-        expected_results_3 = demo.create_nodegroup_result(cluster.nodes['balancer'])
-        cluster.fake_shell.add(expected_results_3, 'sudo', ["chcon -u system_u /etc/systemd/system/keepalived.service.d"])
+        # expected_results_3 = demo.create_nodegroup_result(cluster.nodes['balancer'])
+        # cluster.fake_shell.add(expected_results_3, 'sudo', ["chcon -u system_u /etc/systemd/system/keepalived.service.d"])
 
         # simulate systemd daemon reload
         expected_results_4 = demo.create_nodegroup_result(cluster.nodes['balancer'])

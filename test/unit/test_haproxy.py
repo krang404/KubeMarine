@@ -80,8 +80,8 @@ class TestHaproxyInstallation(unittest.TestCase):
         cluster.fake_shell.add(expected_results_2, 'sudo', ["mkdir -p /etc/systemd/system/rh-haproxy18-haproxy.service.d"])
 
         # simulate chcon command
-        expected_results_3 = demo.create_nodegroup_result(cluster.nodes['balancer'])
-        cluster.fake_shell.add(expected_results_3, 'sudo', ["chcon -u system_u /etc/systemd/system/rh-haproxy18-haproxy.service.d"])
+        # expected_results_3 = demo.create_nodegroup_result(cluster.nodes['balancer'])
+        # cluster.fake_shell.add(expected_results_3, 'sudo', ["chcon -u system_u /etc/systemd/system/rh-haproxy18-haproxy.service.d"])
 
         # simulate systemd daemon reload
         expected_results_4 = demo.create_nodegroup_result(cluster.nodes['balancer'])
@@ -125,9 +125,9 @@ class TestHaproxyInstallation(unittest.TestCase):
         expected_results_2 = demo.create_nodegroup_result(cluster.nodes['balancer'])
         cluster.fake_shell.add(expected_results_2, 'sudo', ["mkdir -p /etc/systemd/system/rh-haproxy18-haproxy.service.d"])
 
-        # simulate chcon command
-        expected_results_3 = demo.create_nodegroup_result(cluster.nodes['balancer'])
-        cluster.fake_shell.add(expected_results_3, 'sudo', ["chcon -u system_u /etc/systemd/system/rh-haproxy18-haproxy.service.d"])
+        # # simulate chcon command
+        # expected_results_3 = demo.create_nodegroup_result(cluster.nodes['balancer'])
+        # cluster.fake_shell.add(expected_results_3, 'sudo', ["chcon -u system_u /etc/systemd/system/rh-haproxy18-haproxy.service.d"])
 
         # simulate systemd daemon reload
         expected_results_4 = demo.create_nodegroup_result(cluster.nodes['balancer'])
