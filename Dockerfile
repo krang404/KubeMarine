@@ -10,7 +10,7 @@ ENV ANSIBLE_HOST_KEY_CHECKING False
 COPY . /opt/kubemarine/
 WORKDIR /opt/kubemarine/
 
-RUN apt update && apt-get -y install coreutils \
+RUN apt update && apt install -y coreutils && \
     pip3 install --no-cache-dir build && \
     python3 -m build -n && \
     # In any if branch delete source code, but preserve specific directories for different service aims
