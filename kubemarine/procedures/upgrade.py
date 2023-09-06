@@ -22,7 +22,7 @@ from typing import List
 
 import toml
 
-from kubemarine import kubernetes, plugins
+from kubemarine import kubernetes, plugins, admission
 from kubemarine.core import flow
 from kubemarine.core import utils
 from kubemarine.core.action import Action
@@ -48,7 +48,16 @@ def prepull_images(cluster: KubernetesCluster) -> None:
 
 
 def kubernetes_upgrade(cluster: KubernetesCluster) -> None:
+    minor_version = int(cluster.context['upgrade_version'].split('.')[1])
+
     upgrade_group = kubernetes.get_group_for_upgrade(cluster)
+    if minor_version >= 28:
+        first_control_plane = cluster.nodes["control-plane"].get_first_member()
+
+        cluster.log.debug("Updating kubeadm config map")
+        final_features_list = first_control_plane.call(admission.update_kubeadm_configmap_pss, target_state="enabled")
+        cluster.log.debug("Updating kube-apiserver configs on control-planes")
+        cluster.nodes["control-plane"].call(admission.update_kubeapi_config_pss, features_list=final_features_list)
 
     drain_timeout = cluster.procedure_inventory.get('drain_timeout')
     grace_period = cluster.procedure_inventory.get('grace_period')
@@ -124,10 +133,6 @@ def upgrade_containerd(cluster: KubernetesCluster) -> None:
             cluster.inventory["services"]["cri"]['containerdConfig'][path]["sandbox_image"] = sandbox
             config_string = ""
             containerd_config = cluster.inventory["services"]["cri"]['containerdConfig']
-            runc_options_path = 'plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options'
-            if not isinstance(containerd_config[runc_options_path]['SystemdCgroup'], bool):
-                containerd_config[runc_options_path]['SystemdCgroup'] = \
-                    bool(strtobool(containerd_config[runc_options_path]['SystemdCgroup']))
             for key, value in containerd_config.items():
                 # first we process all "simple" `key: value` pairs
                 if not isinstance(value, dict):
@@ -160,7 +165,6 @@ tasks = OrderedDict({
     "verify_upgrade_versions": kubernetes.verify_upgrade_versions,
     "thirdparties": system_prepare_thirdparties,
     "prepull_images": prepull_images,
-    "configure_policy": install.system_prepare_policy,
     "kubernetes": kubernetes_upgrade,
     "kubernetes_cleanup": kubernetes_cleanup_nodes_versions,
     "packages": upgrade_packages,
