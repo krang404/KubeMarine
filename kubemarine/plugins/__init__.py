@@ -32,7 +32,7 @@ from distutils.dir_util import remove_tree
 from distutils.dir_util import mkpath
 from itertools import chain
 from types import ModuleType, FunctionType
-from typing import Dict, List, Tuple, Callable, Union, no_type_check, Set, Any, cast, TextIO
+from typing import Dict, List, Tuple, Callable, Union, no_type_check, Set, Any, cast, TextIO, Optional
 
 import yaml
 import inspect
@@ -57,12 +57,22 @@ def verify_inventory(inventory: dict, cluster: KubernetesCluster) -> dict:
         for step in plugin_item.get('installation', {}).get('procedures', []):
             for procedure_type, configs in step.items():
                 if procedure_types()[procedure_type].get('verify') is not None:
-                    procedure_types()[procedure_type]['verify'](cluster, configs)
+                    procedure_types()[procedure_type]['verify'](cluster, configs, plugin_name)
 
     return inventory
 
 
 def enrich_inventory(inventory: dict, cluster: KubernetesCluster) -> dict:
+    # it is necessary to convert URIs from quay.io/xxx:v1 to example.com:XXXX/xxx:v1
+    plugins_default_registry = inventory['plugin_defaults']['installation'].get('registry')
+
+    if plugins_default_registry is not None:
+        # The following section rewrites DEFAULT plugins registries
+        # and does not touch user-defined registries in plugins
+        for plugin_name, plugin_item in cluster.inventory['plugins'].items():
+            if cluster.raw_inventory.get('plugins', {}).get(plugin_name, {}).get('installation', {}).get('registry') is None:
+                plugin_item.setdefault('installation', {})['registry'] = plugins_default_registry
+
     for plugin_name, plugin_item in inventory["plugins"].items():
         for i, step in enumerate(plugin_item.get('installation', {}).get('procedures', [])):
             for procedure_type, configs in step.items():
@@ -514,7 +524,7 @@ def convert_template(_: KubernetesCluster, config: Union[str, dict]) -> dict:
     return _convert_file(config)
 
 
-def verify_template(_: KubernetesCluster, config: dict) -> None:
+def verify_template(_: KubernetesCluster, config: dict, plugin_name: Optional[str] = None) -> None:
     _verify_file(config, "Template")
 
 
@@ -595,7 +605,7 @@ def get_python_module(module_path: str) -> ModuleType:
     return module 
 
 
-def get_python_method_args(cluster: KubernetesCluster, step: dict) -> Tuple[Callable[..., None], Dict[str, Any]]:
+def get_python_method_args(step: dict) -> Tuple[str, FunctionType, Dict[str, Any]]:
     module_path, _ = utils.determine_resource_absolute_file(step['module'])
     method_name = step['method']
     method_arguments = step.get('arguments', {})
@@ -609,34 +619,31 @@ def get_python_method_args(cluster: KubernetesCluster, step: dict) -> Tuple[Call
     # Get the method object
     method = getattr(module, method_name)
 
+    return module_path, method, method_arguments
+
+
+def verify_python(cluster: KubernetesCluster, step: dict, plugin_name: Optional[str] = None) -> None:
+    _, method, method_arguments = get_python_method_args(step)
+
     # Get the signature of the method
     signature = inspect.signature(method)
 
     # Check if the passed arguments match the signature
     try:
-        signature.bind(cluster=cluster, **method_arguments)
+        signature.bind(cluster, **method_arguments)
     except TypeError as e:
-        raise ValueError(f"Invalid arguments for method {method_name}: {e}")
-
-    return method, method_arguments
-
-
-def verify_python(cluster: KubernetesCluster, step: dict) -> None:
-    method, method_arguments = get_python_method_args(cluster, step)
-    # Additional verification logic can be added here
+        raise ValueError(f"Invalid arguments for python method {method.__name__} for {plugin_name!r} plugin: {e}")
 
 
 def apply_python(cluster: KubernetesCluster, step: dict) -> None:
-    method, method_arguments = get_python_method_args(cluster, step)
-
-    func = cast(FunctionType, method)
-    cluster.log.debug("Running method %s from %s module..." % (func.__name__, func.__module__))
+    module_path, method, method_arguments = get_python_method_args(step)
+    cluster.log.debug("Running method %s from %s module..." % (method.__name__, module_path))
     method(cluster, **method_arguments)
 
 
 # **** THIRDPARTIES ****
 
-def verify_thirdparty(cluster: KubernetesCluster, thirdparty: str) -> None:
+def verify_thirdparty(cluster: KubernetesCluster, thirdparty: str, plugin_name: Optional[str] = None) -> None:
     defined_thirdparties = list(cluster.inventory['services'].get('thirdparties', {}).keys())
     if thirdparty not in defined_thirdparties:
         raise Exception('Specified thirdparty %s not found in thirdpartirs definition. Expected any of %s.'
@@ -657,7 +664,7 @@ def convert_shell(_: KubernetesCluster, config: Union[str, dict]) -> dict:
     return config
 
 
-def verify_shell(cluster: KubernetesCluster, config: dict) -> None:
+def verify_shell(cluster: KubernetesCluster, config: dict, plugin_name: Optional[str] = None) -> None:
     out_vars = config.get('out_vars', [])
     groups = config.get('groups', [])
     nodes = config.get('nodes', [])
@@ -752,7 +759,7 @@ def _get_absolute_playbook(config: dict) -> str:
     return utils.determine_resource_absolute_file(config['playbook'])[0]
 
 
-def verify_ansible(cluster: KubernetesCluster, config: dict) -> None:
+def verify_ansible(cluster: KubernetesCluster, config: dict, plugin_name: Optional[str] = None) -> None:
     _get_absolute_playbook(config)
     if cluster.is_deploying_from_windows():
         raise Exception("Executing of playbooks on Windows deployer is currently not supported")
@@ -940,7 +947,7 @@ def convert_config(_: KubernetesCluster, config: Union[str, dict]) -> dict:
     return _convert_file(config)
 
 
-def verify_config(_: KubernetesCluster, config: dict) -> None:
+def verify_config(_: KubernetesCluster, config: dict, plugin_name: Optional[str] = None) -> None:
     _verify_file(config, "Config")
 
 
@@ -1051,7 +1058,7 @@ def apply_source(cluster: KubernetesCluster, config: dict) -> None:
     else:
         apply_common_group = cluster.create_group_from_groups_nodes_names(apply_groups, apply_nodes)
 
-    destination_common_group.put(source, destination_path, backup=True, sudo=use_sudo)
+    destination_common_group.put(source, destination_path, backup=True, mkdir=True, sudo=use_sudo)
 
     if apply_required:
         cluster.log.debug("Applying yaml...")

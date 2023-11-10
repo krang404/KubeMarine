@@ -20,9 +20,10 @@ import yaml
 
 from kubemarine.core.cluster import KubernetesCluster
 from kubemarine.core.errors import KME
-from kubemarine import jinja
+from kubemarine import jinja, keepalived, haproxy
 from kubemarine.core import utils, static, log, os
 from kubemarine.core.yaml_merger import default_merger
+from kubemarine.cri.containerd import contains_old_format_properties
 
 # All enrichment procedures should not connect to any node.
 # The information about nodes should be collected within KubernetesCluster#detect_nodes_context().
@@ -32,10 +33,12 @@ DEFAULT_ENRICHMENT_FNS = [
     "kubemarine.kubernetes.verify_initial_version",
     "kubemarine.admission.enrich_default_admission",
     "kubemarine.kubernetes.add_node_enrichment",
+    "kubemarine.core.defaults.calculate_node_names",
     "kubemarine.kubernetes.remove_node_enrichment",
     "kubemarine.controlplane.controlplane_node_enrichment",
     "kubemarine.core.defaults.append_controlplain",
     "kubemarine.kubernetes.enrich_upgrade_inventory",
+    "kubemarine.kubernetes.enrich_restore_inventory",
     "kubemarine.core.defaults.compile_inventory",
     "kubemarine.core.defaults.manage_true_false_values",
     "kubemarine.plugins.enrich_upgrade_inventory",
@@ -43,10 +46,11 @@ DEFAULT_ENRICHMENT_FNS = [
     "kubemarine.packages.enrich_upgrade_inventory",
     "kubemarine.packages.enrich_inventory_apply_defaults",
     "kubemarine.thirdparties.enrich_upgrade_inventory",
+    "kubemarine.thirdparties.enrich_restore_inventory",
     "kubemarine.admission.manage_enrichment",
     "kubemarine.procedures.migrate_cri.enrich_inventory",
     "kubemarine.core.defaults.apply_registry",
-    "kubemarine.core.defaults.calculate_node_names",
+    "kubemarine.cri.enrich_upgrade_inventory",
     "kubemarine.core.defaults.verify_node_names",
     "kubemarine.core.defaults.apply_defaults",
     "kubemarine.keepalived.enrich_inventory_apply_defaults",
@@ -79,7 +83,6 @@ supported_defaults = {
         'account_defaults': 'accounts'
     },
     'node_defaults': 'nodes',
-    'plugin_defaults': 'plugins',
 }
 
 invalid_node_name_regex = re.compile("[^a-z-.\\d]", re.M)
@@ -138,29 +141,10 @@ def apply_registry(inventory: dict, cluster: KubernetesCluster) -> dict:
         if inventory['registry'].get('webserver', False):
             thirdparties_address = f"{protocol}://{inventory['registry']['address']}"
 
-    # Patch kubeadm imageRepository
-    if not inventory['services']['kubeadm'].get('imageRepository'):
+    # Patch kubeadm imageRepository and plugin_defaults registry
+    if cluster.raw_inventory.get('services', {}).get('kubeadm', {}).get('imageRepository') is None:
         inventory['services']['kubeadm']["imageRepository"] = registry_mirror_address
-
-    # it is necessary to convert URIs from quay.io/xxx:v1 to example.com:XXXX/xxx:v1
-    if inventory.get('plugin_defaults') is None:
-        inventory['plugin_defaults'] = {}
-    if inventory['plugin_defaults'].get('installation') is None:
-        inventory['plugin_defaults']['installation'] = {}
-    if inventory['plugin_defaults']['installation'].get('registry') is None:
-        inventory['plugin_defaults']['installation']['registry'] = registry_mirror_address
-
-    # The following section rewrites DEFAULT plugins registries and do not touches user-defined registries in plugins
-    # This section required, because plugins defaults contains default non-docker registries and method
-    # "kubemarine.core.defaults.recursive_apply_defaults" will not overwrite this default registries, because it can not
-    # distinguish default from user-defined.
-    # Also, this part of code supports plugin_defaults inventory section and applies everything in accordance with the
-    # priority of the registries.
-    for plugin_name, plugin_params in cluster.inventory['plugins'].items():
-        if cluster.inventory['plugins'][plugin_name].get('installation') is None:
-            cluster.inventory['plugins'][plugin_name]['installation'] = {}
-        if cluster.raw_inventory.get('plugins', {}).get(plugin_name, {}).get('installation', {}).get('registry') is None:
-            cluster.inventory['plugins'][plugin_name]['installation']['registry'] = inventory['plugin_defaults']['installation']['registry']
+    inventory['plugin_defaults']['installation'].setdefault('registry', registry_mirror_address)
 
     cri_impl = inventory['services']['cri']['containerRuntime']
 
@@ -184,25 +168,27 @@ def apply_registry(inventory: dict, cluster: KubernetesCluster) -> dict:
         inventory['services']['cri']['dockerConfig']["registry-mirrors"] = list(set(registry_mirrors))
 
     elif cri_impl == "containerd":
-        registry_section = f'plugins."io.containerd.grpc.v1.cri".registry.mirrors."{registry_mirror_address}"'
+        if not containerd_endpoints:
+            containerd_endpoints = ["%s://%s" % (protocol, registry_mirror_address)]
 
-        containerd_config = inventory['services']['cri']['containerdConfig']
-        if not containerd_config.get(registry_section):
-            if not containerd_endpoints:
-                containerd_endpoints = ["%s://%s" % (protocol, registry_mirror_address)]
-
-            containerd_config[registry_section] = {
-                'endpoint': containerd_endpoints
-            }
-
-        path = 'plugins."io.containerd.grpc.v1.cri"'
-        if not containerd_config.get(path):
-            containerd_config[path] = {}
-        if not containerd_config[path].get('sandbox_image'):
-            kubernetes_version = inventory['services']['kubeadm']['kubernetesVersion']
-            pause_version = cluster.globals['compatibility_map']['software']['pause'][kubernetes_version]['version']
-            containerd_config[path]['sandbox_image'] = \
-                f"{inventory['services']['kubeadm']['imageRepository']}/pause:{pause_version}"
+        old_format_result, _ = contains_old_format_properties(inventory)
+        # todo remove p3_reconfigure_registries after next release
+        if old_format_result or not cluster.context.get('p3_reconfigure_registries', True):
+            # Add registry info in old format
+            registry_section = f'plugins."io.containerd.grpc.v1.cri".registry.mirrors."{registry_mirror_address}"'
+            containerd_config = inventory['services']['cri']['containerdConfig']
+            if not containerd_config.get(registry_section):
+                containerd_config[registry_section] = {
+                    'endpoint': containerd_endpoints
+                }
+        else:
+            # Add registry info in new format
+            old_registry_config = inventory['services']['cri'].get('containerdRegistriesConfig', {})
+            inventory['services']['cri']['containerdRegistriesConfig'] = {registry_mirror_address: {
+                                     f'host."{endpoint}"': {'capabilities': ['pull', 'resolve']}
+                                     for endpoint in containerd_endpoints
+                                 }}
+            default_merger.merge(inventory['services']['cri']['containerdRegistriesConfig'], old_registry_config)
 
     from kubemarine import thirdparties
 
@@ -251,17 +237,24 @@ def append_controlplain(inventory: dict, cluster: Optional[KubernetesCluster]) -
     external_address: Optional[str] = None
     external_address_source: Optional[str] = None
 
+    balancer_names = keepalived.get_all_balancer_names(inventory, final=True)
     # vrrp_ip section is not enriched yet
-    # todo what if ip is an ip of some node to remove?
-    if inventory.get('vrrp_ips'):
+    # If no VRRP IPs or no balancers are configured, Keepalived is not enabled.
+    if inventory.get('vrrp_ips') and balancer_names:
         for i, item in enumerate(inventory['vrrp_ips']):
             if isinstance(item, str):
                 if internal_address is None:
                     internal_address = item
                     internal_address_source = 'vrrp_ip[%s]' % i
-            # todo remove p1_migrate_not_bind_vrrp_fix after next release
-            elif item.get('params', {}).get('maintenance-type', False) != 'not bind' \
-                    or (cluster and not cluster.context.get('p1_migrate_not_bind_vrrp_fix', True)):
+            else:
+                if haproxy.is_vrrp_not_bind(item):
+                    continue
+                final_hosts = item.get('hosts', balancer_names)
+                # There is a small gap here.
+                # The check is invoked when inventory is not yet compiled, so checking names for equality is not fair.
+                if not any((host['name'] if isinstance(host, dict) else host) in balancer_names
+                           for host in final_hosts):
+                    continue
                 if internal_address is None or item.get('control_endpoint', False):
                     internal_address = item['ip']
                     internal_address_source = 'vrrp_ip[%s]' % i
@@ -274,20 +267,16 @@ def append_controlplain(inventory: dict, cluster: Optional[KubernetesCluster]) -
 
     if internal_address is None or external_address is None:
         # 'master' role is not deleted due to unit tests are not refactored
-        for role in ['balancer', 'master', 'control-plane']:
+        for role in ['balancer', 'control-plane', 'master']:
             # nodes are not compiled to groups yet
             for node in inventory['nodes']:
                 if role in node['roles'] and 'remove_node' not in node['roles']:
                     if internal_address is None or node.get('control_endpoint', False):
                         internal_address = node['internal_address']
-                        internal_address_source = role
-                        if node.get('name'):
-                            internal_address_source += ' \"%s\"' % node['name']
+                        internal_address_source = f"{role} \"{node['name']}\""
                     if node.get('address') and (external_address is None or node.get('control_endpoint', False)):
                         external_address = node['address']
-                        external_address_source = role
-                        if node.get('name'):
-                            external_address_source += ' \"%s\"' % node['name']
+                        external_address_source = f"{role} \"{node['name']}\""
 
     if external_address is None:
         if cluster:
@@ -315,33 +304,25 @@ def recursive_apply_defaults(defaults: dict, section: dict) -> None:
         if isinstance(value, dict) and section.get(key) is not None and section[key]:
             recursive_apply_defaults(value, section[key])
         # check if target section exists and not empty
-        elif section.get(value) is not None and section[value]:
+        elif section.get(value) is not None:
+            for i, custom_value in enumerate(section[value]):
+                # copy defaults as new dict, to avoid problems with memory links
+                default_value = deepcopy(section[key])
 
-            if isinstance(section[value], list):
-                for i, v in enumerate(section[value]):
-                    # copy defaults as new dict, to avoid problems with memory links
-                    node_config = deepcopy(section[key])
+                # update defaults with custom-defined node configs
+                # TODO: Use deepmerge instead of update
+                default_value.update(custom_value)
 
-                    # update defaults with custom-defined node configs
-                    # TODO: Use deepmerge instead of update
-                    node_config.update(v)
-
-                    # replace old node config with merged one
-                    section[value][i] = node_config
-
-            else:
-                # deepcopy the whole section, otherwise it will break dict while replacing
-                section_copy = deepcopy(section[value])
-                for custom_key, custom_value in section_copy.items():
-                    # here section['key'] refers to default, not custom value
-                    default_value = deepcopy(section[key])
-                    section[value][custom_key] = default_merger.merge(default_value, custom_value)
+                # replace old node config with merged one
+                section[value][i] = default_value
 
 
-def calculate_node_names(inventory: dict, _: KubernetesCluster) -> dict:
+def calculate_node_names(inventory: dict, cluster: KubernetesCluster) -> dict:
     roles_iterators: Dict[str, int] = {}
     for i, node in enumerate(inventory['nodes']):
-        for role_name in ['control-plane', 'worker', 'balancer']:
+        # 'master' role is not deleted because calculate_node_names() can be run over initial inventory,
+        # that still supports the old role.
+        for role_name in ['control-plane', 'master', 'worker', 'balancer']:
             if role_name in node['roles']:
                 # The idea is this:
                 # If the name is already specified, we must skip this node,
@@ -362,7 +343,11 @@ def calculate_node_names(inventory: dict, _: KubernetesCluster) -> dict:
                 role_i = roles_iterators.get(role_name, 1)
                 roles_iterators[role_name] = role_i + 1
                 if node.get('name') is None:
-                    inventory['nodes'][i]['name'] = '%s-%s' % (role_name, role_i)
+                    if role_name == 'master':
+                        role_name = 'control-plane'
+                    new_name = '%s-%s' % (role_name, role_i)
+                    cluster.log.debug(f"Assigning name {new_name} to node {cluster.get_access_address_from_node(node)}")
+                    node['name'] = new_name
     return inventory
 
 

@@ -17,7 +17,7 @@ This section describes the features and steps for performing maintenance procedu
     - [Cri Migration Procedure](#cri-migration-procedure)
     - [Admission Migration Procedure](#admission-migration-procedure)
 - [Procedure Execution](#procedure-execution)
-    - [Procedure Execution from CLI](#procedure-execution-from-cli)
+    - [Procedure Execution From CLI](#procedure-execution-from-cli)
     - [Logging](#logging)
     - [Inventory Preservation](#inventory-preservation)
     - [Additional Parameters](#additional-parameters)
@@ -27,6 +27,7 @@ This section describes the features and steps for performing maintenance procedu
     - [Changing Calico Settings](#changing-calico-settings)
     - [Data Encryption in Kubernetes](#data-encryption-in-kubernetes)
     - [Changing Cluster CIDR](#changing-cluster-cidr)
+    - [Kubelet Server Certificate Approval](#kubelet-server-certificate-approval)
 - [Common Practice](#common-practice)
 
 # Prerequisites
@@ -77,6 +78,14 @@ If called without arguments, `migrate_kubemarine` tries to apply all patches in 
 Kubemarine applies the patches in a strict order, though it is possible to choose only a subset of patches or skip not necessary patches.
 Use `migrate_kubemarine --force-apply <patches>` or `migrate_kubemarine --force-skip <patches>` correspondingly,
 where, `<patches>` are the patch identifiers separated by comma.
+
+### Kubemarine Migration Procedure Parameters
+
+The procedure accepts optional positional argument with the path to the procedure inventory file.
+You can find description and examples of the accepted parameters in the next sections.
+
+The JSON schema for procedure inventory is available by [URL](../kubemarine/resources/schemas/migrate_kubemarine.json?raw=1).
+For more information, see [Validation by JSON Schemas](Installation.md#inventory-validation).
 
 ### Software Upgrade Patches
 
@@ -198,6 +207,11 @@ The configuration format for the plugins is the same.
 ## Upgrade Procedure
 
 **Warnings**: 
+* Follow Kubernetes upgrade best practises, like:
+  * Have a number of replicas configured for Application Microservices
+  * [Pod anti-affinity](https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/#inter-pod-affinity-and-anti-affinity) rules should be configured to avoid placement of more than one pod replicas on the  same worker node
+  * [PodDisruptionBudget](https://kubernetes.io/docs/tasks/run-application/configure-pdb) is configured for desired Deployments
+  * https://kubernetes.io/docs/tasks/run-application/configure-pdb/#unhealthy-pod-eviction-policy is configured to _AlwaysAllow_
 * API versions `extensions/v1beta1` and `networking.k8s.io/v1beta1` are not supported starting from Kubernetes 1.22 and higher. Need to update ingress to the new API `networking.k8s.io/v1`. More info: https://kubernetes.io/docs/reference/using-api/deprecation-guide/#ingress-v122
 * Before starting the upgrade, make sure you make a backup. For more information, see the section [Backup Procedure](#backup-procedure).
 * The upgrade procedure only maintains upgrading from one `supported` version to the next `supported` version. For example, from 1.18 to 1.20 or from 1.20 to 1.21.
@@ -205,8 +219,11 @@ The configuration format for the plugins is the same.
 
 ### Upgrade Procedure Parameters
 
+The procedure accepts required positional argument with the path to the procedure inventory file.
+You can find description and examples of the accepted parameters in the next sections.
+
 The JSON schema for procedure inventory is available by [URL](../kubemarine/resources/schemas/upgrade.json?raw=1).
-For more information, see [Validation by JSON Schemas](Installation.md#validation-by-json-schemas).
+For more information, see [Validation by JSON Schemas](Installation.md#inventory-validation).
 
 #### Upgrade Plan
 
@@ -419,7 +436,6 @@ The `upgrade` procedure executes the following sequence of tasks:
 * kubernetes
 * kubernetes_cleanup
 * packages
-* upgrade_containerd
 * plugins
 * overview
 
@@ -489,8 +505,11 @@ backup-Jan-01-21-09-00-00.tar.gz
 
 ### Backup Procedure Parameters
 
+The procedure accepts optional positional argument with the path to the procedure inventory file.
+You can find description and examples of the accepted parameters in the next sections.
+
 The JSON schema for procedure inventory is available by [URL](../kubemarine/resources/schemas/backup.json?raw=1).
-For more information, see [Validation by JSON Schemas](Installation.md#validation-by-json-schemas).
+For more information, see [Validation by JSON Schemas](Installation.md#inventory-validation).
 
 **Note**: There are some examples located in [procedure.yaml examples](../examples/procedure.yaml).
 
@@ -521,7 +540,7 @@ backup_plan:
     source_node: control-plane-1
 ```
 
-#### Nodes Parameter
+#### nodes Parameter
 
 By default, the following files are backed up from all nodes in the cluster:
 
@@ -539,6 +558,7 @@ By default, the following files are backed up from all nodes in the cluster:
 * /etc/systemd/system/{keepalived_service_name}.service.d/{keepalived_service_name}.conf
 * /usr/local/bin/check_haproxy.sh
 * /etc/yum.repos.d/
+* /etc/apt/sources.list.d/
 * /etc/modules-load.d/
 * /etc/audit/rules.d/
 * /etc/kubernetes/
@@ -558,7 +578,7 @@ backup_plan:
     /etc/hosts: False
 ```
 
-#### Kubernetes Parameter
+#### kubernetes Parameter
 
 The procedure exports all available Kubernetes resources from the cluster to yaml files. There are two types of resources - namespaced and non-namespaced. If you need to restrict resources for export, you can specify which ones you need.
 
@@ -643,8 +663,11 @@ After recovery, the procedure reboots all cluster nodes.
 
 ### Restore Procedure Parameters
 
+The procedure accepts required positional argument with the path to the procedure inventory file.
+You can find description and examples of the accepted parameters in the next sections.
+
 The JSON schema for procedure inventory is available by [URL](../kubemarine/resources/schemas/restore.json?raw=1).
-For more information, see [Validation by JSON Schemas](Installation.md#validation-by-json-schemas).
+For more information, see [Validation by JSON Schemas](Installation.md#inventory-validation).
 
 **Note**: There are some examples located in [procedure.yaml examples](../examples/procedure.yaml).
 
@@ -668,7 +691,7 @@ By default, ETCD restore does not require additional parameters, however, if req
 * image - the full name of the ETCD image, including the registry address. On its basis, the restoration is performed.
 * certificates - ETCD certificates for `etcdctl` connection to ETCD API. You can specify some certificates, or specify them all. Certificates should be presented on all nodes.
 
-#### Thirdparties Parameter
+#### thirdparties Parameter
 
 The procedure recovers thirdparties based on the `cluster.yaml`. If rpm thirdparties outdated or incorrect, specify the correct ones in this section, in the same format. For example:
 
@@ -693,16 +716,15 @@ restore_plan:
 The `restore` procedure executes the following sequence of tasks:
 
 * prepare
-  * unpack
-  * verify_backup_data
   * stop_cluster
 * restore
+  * dns
+    * resolv_conf
   * thirdparties
 * import
   * nodes
   * etcd
 * reboot
-* overview
 
 
 ## Add Node Procedure
@@ -714,10 +736,10 @@ The procedure works as shown in the following table:
 
 |Case|Expected Result|Important Note|
 |---|---|---|
-|Add load balancer|A new load balancer is configured. If `vrrp_ip` is present, then all the Keepalived nodes are reconfigured and restarted.|Kubernetes and Keepalived installations should not start.|
+|Add load balancer|A new load balancer is configured. If `vrrp_ip` is present, then all the Keepalived nodes are reconfigured and restarted.|Kubernetes installation should not start. Keepalived installation should start only if `vrrp_ip` is present.|
 |Add load balancer + Keepalived|A new load balancer is configured. Keepalived is installed and configured on all the load balancers.|Kubernetes installation should not start.|
-|Add control-plane|Kubernetes is installed only on a new node. A new control-plane is added to the Kubernetes cluster, and all Haproxy nodes are reconfigured and restarted.|Haproxy installation should not start.|
-|Add worker|Kubernetes is installed only on a new node. A new worker is added to the Kubernetes cluster, and all Haproxy nodes are reconfigured and restarted.|Haproxy installation should not start.|
+|Add control-plane|Kubernetes is installed only on a new node. A new control-plane is added to the Kubernetes cluster, and all Haproxy nodes are reconfigured and restarted.|Haproxy and Keepalived installation should not start.|
+|Add worker|Kubernetes is installed only on a new node. A new worker is added to the Kubernetes cluster, and all Haproxy nodes are reconfigured and restarted.|Haproxy and Keepalived installation should not start.|
 
 Also pay attention to the following:
 
@@ -735,8 +757,10 @@ Also pay attention to the following:
 
 ### Configuring Add Node Procedure
 
+The procedure accepts required positional argument with the path to the procedure inventory file.
+
 The JSON schema for procedure inventory is available by [URL](../kubemarine/resources/schemas/add_node.json?raw=1).
-For more information, see [Validation by JSON Schemas](Installation.md#validation-by-json-schemas).
+For more information, see [Validation by JSON Schemas](Installation.md#inventory-validation).
 
 The `nodes` configuration format for specifying new nodes is the same as that of the installation procedure. For more information, refer to [Kubemarine Inventory Nodes](Installation.md#nodes) section in _Kubemarine Installation Procedure_.
 
@@ -755,32 +779,41 @@ nodes:
 **Note**:
 
 * The connection information for new nodes can be used from defaults as described in the [Kubemarine Inventory Node Defaults](Installation.md#nodedefaults) section in _Kubemarine Installation Procedure_. If the connection information is not present by default, define the information in each new node configuration.
-* You can add the `vrrp_ips` section to **procedure.yaml** if you intend to add the new `balancer` node and have previously not configured the `vrrp_ips` section.
+* If you intend to add the new `balancer` node with VRRP IP, and have previously not configured the `vrrp_ips` section, you need to do the following preliminarily:
+  * And the section to the main `cluster.yaml`.
+  * If you already have balancers without VRRP IPs, reconfigure the balancers and DNS,
+    for example, using `kubemarine install --tasks prepare.dns.etc_hosts,deploy.loadbalancer.haproxy.configure,deploy.loadbalancer.keepalived,deploy.coredns`
 
 ### Add Node Tasks Tree
 
 The `add_node` procedure executes the following sequence of tasks:
 
+* cache_packages
 * prepare
   * check
     * sudoer
     * system
     * cluster_installation
   * dns
+    * hostname
     * resolv_conf
     * etc_hosts
+  * package_manager
+    * configure
+    * manage_packages
   * ntp
     * chrony
-  * package_manager
-    * configure_yum
-    * manage_packages
+    * timesyncd
   * system
     * setup_selinux
+    * setup_apparmor
     * disable_firewalld
     * disable_swap
     * modprobe
     * sysctl
     * audit
+      * install
+      * configure
   * **cri**
     * **install** 
     * **configure**
@@ -796,8 +829,12 @@ The `add_node` procedure executes the following sequence of tasks:
   * kubernetes
     * reset
     * install
+    * prepull_images
     * init (as join)
-    * wait_for_nodes
+    * audit
+  * admission
+  * coredns
+  * plugins
 * overview
 
 ## Remove Node Procedure
@@ -814,7 +851,9 @@ The procedure works as follows:
 
 Also pay attention to the following:
 
-* If `vrrp_ip` is not used by any node after nodes removal, then the `vrrp_ip` is removed from **cluster.yaml**.
+* The `vrrp_ips` section is not touched.
+  If it specifies some hosts to enable the Keepalived on, and some of these hosts no longer exist,
+  such hosts are ignored with warnings.
 * The file `/etc/hosts` is updated and uploaded to all remaining nodes in the cluster. The control plane address may change.
 * This procedure only removes nodes and does not restore nodes to their original state. Packages, configurations, and Thirdparties are also not deleted.
 
@@ -831,8 +870,10 @@ Removing a node from a Kubernetes cluster is done in the following order:
 
 ### Configuring Remove Node Procedure
 
+The procedure accepts required positional argument with the path to the procedure inventory file.
+
 The JSON schema for procedure inventory is available by [URL](../kubemarine/resources/schemas/remove_node.json?raw=1).
-For more information, see [Validation by JSON Schemas](Installation.md#validation-by-json-schemas).
+For more information, see [Validation by JSON Schemas](Installation.md#inventory-validation).
 
 To remove nodes, it is possible to use the configuration format similar to installation or adding. For more information, refer to [Kubemarine Inventory Nodes](Installation.md#nodes) section in _Kubemarine Installation Procedure_.
 
@@ -869,7 +910,10 @@ The `remove_node` procedure executes the following sequence of tasks:
   * configure
     * haproxy
     * keepalived
-* update_etc_hosts
+* update
+  * etc_hosts
+  * coredns
+  * plugins
 * remove_kubernetes_nodes
 * overview
 
@@ -911,8 +955,10 @@ Manage PSP procedure works as follows:
 
 ### Configuring Manage PSP Procedure
 
+The procedure accepts required positional argument with the path to the procedure inventory file.
+
 The JSON schema for procedure inventory is available by [URL](../kubemarine/resources/schemas/manage_psp.json?raw=1).
-For more information, see [Validation by JSON Schemas](Installation.md#validation-by-json-schemas).
+For more information, see [Validation by JSON Schemas](Installation.md#inventory-validation).
 
 To manage PSPs on existing cluster, use the configuration similar to PSP installation, except the
 `custom-policies` is replaced by `add-policies` and `delete-policies` as follows:
@@ -953,6 +999,7 @@ To avoid this, you need to specify custom policy and bind it using `ClusterRoleB
 
 The `manage_psp` procedure executes the following sequence of tasks:
 
+1. check_inventory
 1. delete_custom
 2. add_custom
 3. reconfigure_oob
@@ -969,8 +1016,10 @@ The manage PSS procedure allows:
 
 ### Configure Manage PSS Procedure
 
+The procedure accepts required positional argument with the path to the procedure inventory file.
+
 The JSON schema for procedure inventory is available by [URL](../kubemarine/resources/schemas/manage_pss.json?raw=1).
-For more information, see [Validation by JSON Schemas](Installation.md#validation-by-json-schemas).
+For more information, see [Validation by JSON Schemas](Installation.md#inventory-validation).
 
 To manage PSS on existing cluster one should configure `procedure.yaml` similar the following:
 
@@ -1019,7 +1068,8 @@ from particular namespaces will be applied.
 * Be careful with the `exemptions` section it may cause cluster instability.
 * Do not delete `kube-system` namespace from `exemptions` list without strong necessity.
 * The PSS labels in namespaces for Kubemarine supported plugins ('nginx-ingress-controller', 'local-path-provisioner', 
-'kubernetes-dashboard' etc) will be deleted during the procedure in case of using `pod-security: disabled`
+'kubernetes-dashboard', and 'calico' (calico-apiserver)) are managed automatically.
+They are deleted during the procedure in case of using `pod-security: disabled`, and changed accordingly in case `pss.defaults.enforce` is changed.
 * Be careful with the `restart-pods: true` options it drains nodes one by one and may cause cluster instability. The best way to 
 restart pods in cluster is a manual restart according to particular application. The restart procedure should consider if the 
 application is stateless or stateful. Also shouldn't use `restart-pod: true` option if [Pod Disruption Budget](https://kubernetes.io/docs/tasks/run-application/configure-pdb/) is configured.
@@ -1033,7 +1083,7 @@ The `manage_pss procedure executes the following sequence of tasks:
 1. check_inventory
 2. delete_default_pss
 3. apply_default_pss
-4. restart_pods_task
+4. restart_pods
 
 ## Reboot Procedure
 
@@ -1041,8 +1091,11 @@ This procedure allows you to safely reboot all nodes in one click. By default, a
 
 ### Reboot Procedure Parameters
 
+The procedure accepts optional positional argument with the path to the procedure inventory file.
+You can find description and examples of the accepted parameters in the next sections.
+
 The JSON schema for procedure inventory is available by [URL](../kubemarine/resources/schemas/reboot.json?raw=1).
-For more information, see [Validation by JSON Schemas](Installation.md#validation-by-json-schemas).
+For more information, see [Validation by JSON Schemas](Installation.md#inventory-validation).
 
 #### graceful_reboot Parameter
 
@@ -1057,7 +1110,7 @@ Example:
 graceful_reboot: False
 ```
 
-#### Nodes Parameter
+#### nodes Parameter
 
 This parameter allows you to specify which nodes should be rebooted. Other nodes are not affected. In this parameter, you must specify a list of node names, as is follows:
 
@@ -1079,22 +1132,28 @@ For Kubernetes, most of the internal certificates could be updated, specifically
 Certificate used by `kubelet.conf` by default is updated automatically by Kubernetes, 
 link to Kubernetes docs regarding `kubelet.conf` rotation: https://kubernetes.io/docs/tasks/tls/certificate-rotation/#understanding-the-certificate-rotation-configuration.
 
-**Note**: Serving kubelet certificate `kubelet.crt` is updated forcefully by this procedure each time it runs.
-
 **Note**: Each time you run this procedure, kubelet and all control plane containers are restarted.
 
 **Note**: CA certificates cannot be updated automatically and should be updated manually after 10 years.
 
+**Note**: The `cert_renew` procedure does not renew the `kubelet` server certificate. To avoid this, implement the changes mentioned in the [Kubelet Server Certificate Approval](#kubelet-server-certificate-approval) section.
+
 For nginx-ingress-controller, the config map along with the default certificate is updated with a new certificate and key. The config map update is performed by plugin re-installation.
+
+For Calico, the certificate is updated for the Calico API server.
 
 The `cert_renew` procedure also allows you to monitor Kubernetes internal certificates expiration status.
 
 ### Configuring Certificate Renew Procedure
 
+The procedure accepts required positional argument with the path to the procedure inventory file.
+You can find description and examples of the accepted parameters in the next sections.
+
 The JSON schema for procedure inventory is available by [URL](../kubemarine/resources/schemas/cert_renew.json?raw=1).
-For more information, see [Validation by JSON Schemas](Installation.md#validation-by-json-schemas).
+For more information, see [Validation by JSON Schemas](Installation.md#inventory-validation).
 
 #### Configuring Certificate Renew Procedure for nginx-ingress-controller
+
 To update the certificate and key for `nginx-ingress-controller`, use the following configuration:
 
 ```yaml
@@ -1113,7 +1172,23 @@ nginx-ingress-controller:
 Similar to the plugin configuration, you can either use the data format or the paths format.
 For more information about these formats, refer to the [nginx-ingress-controller](Installation.md#nginx-ingress-controller) section in the _Kubemarine Installation Procedure_.
 
-#### Configuring Certificate Renew Procedure For Kubernetes Internal Certificates
+#### Configuring Certificate Renew Procedure for Calico
+
+To update the certificate and key for `calico` API server, use the following configuration:
+
+```yaml
+calico:
+  apiserver:
+    renew: true
+```
+
+**Note**: The certificate update procedure follows the default Calico API server installation procedure.
+If you have custom Calico installation steps in the `plugins.calico.installation.procedures` section of the `cluster.yaml`
+that in particular renews the certificate in a custom way,
+you may want to repeat the corresponding steps using [Plugins Reinstallation](Installation.md#plugins-reinstallation).
+
+#### Configuring Certificate Renew Procedure for Kubernetes Internal Certificates
+
 To update internal Kubernetes certificates you can use the following configuration:
 ```yaml
 kubernetes:
@@ -1143,7 +1218,8 @@ The `cert_renew` procedure executes the following sequence of tasks:
 
 1. kubernetes
 2. nginx_ingress_controller
-3. certs_overview
+3. calico
+4. certs_overview
 
 ## Cri Migration Procedure
 
@@ -1161,21 +1237,24 @@ If there is such disk, it will be **cleared** and re-mounted to `/var/lib/contai
 ### Procedure Execution Steps
 
 This procedure includes the following steps:
-1. Verify and merge all the specified parameters into the inventory
-2. Install and configure containerd
-3. Install crictl
+1. Verify and merge all the specified parameters into the inventory.
+2. Install and configure containerd.
+3. Install crictl.
 4. Implement the following steps on each control-plane and worker node by node:
-    1. Drain the node
-    2. Update configurations on the node for migration to containerd
-    3. Move the pods on the node from the docker's containers to those of containerd
-    4. Uncordon the node
+    1. Drain the node.
+    2. Update configurations on the node for migration to containerd.
+    3. Move the pods on the node from the docker's containers to those of containerd.
+    4. Uncordon the node.
 
 **Warning**: Before starting the migration procedure, verify that you already have the actual cluster.yaml structure. The services.docker scheme is deprecated. 
 
 ### migrate_cri Parameters
 
+The procedure accepts required positional argument with the path to the procedure inventory file.
+You can find description and examples of the accepted parameters in the next sections.
+
 The JSON schema for procedure inventory is available by [URL](../kubemarine/resources/schemas/migrate_cri.json?raw=1).
-For more information, see [Validation by JSON Schemas](Installation.md#validation-by-json-schemas).
+For more information, see [Validation by JSON Schemas](Installation.md#inventory-validation).
 
 The following sections describe the `migrate_cri` parameters.
 
@@ -1234,7 +1313,7 @@ packages:
       config_location: '/etc/containerd/config.toml'
 ```
 
-#### Thirdparties Parameter
+#### thirdparties Parameter
 
 This parameter allows you to specify the link to a concrete version of a crictl third-party. In the absence of this parameter, crictl is downloaded from Github/registry in case you ran the procedure from CLI. 
 
@@ -1767,6 +1846,48 @@ data:
 ```
 
 11. Check that everything works properly and remove the old ippool if necessary.
+
+## Kubelet Server Certificate Approval
+
+The `kubelet` server certificate is self-signed by default, and is usually stored in the `/var/lib/kubelet/pki/kubelet.crt` file. To avoid using the self-signed `kubelet` server certificate, alter the `cluster.yaml` file in the following way:
+
+```yaml
+...
+services:
+  kubeadm_kubelet:
+    serverTLSBootstrap: true
+    rotateCertificates: true
+  kubeadm:
+    apiServer:
+      extraArgs:
+        kubelet-certificate-authority: /etc/kubernetes/pki/ca.crt
+...
+```
+
+These settings enforce `kubelet` on each node of the cluster to request certificate approval (for `kubelet` server part) from the default Kubernetes CA and rotate certificate in the future. The `kube-apiserver` machinery does not approve certificate requests for `kubelet` automatically. They might be approved manually by the following commans. Get the list of certificate requests:
+
+```
+# kubectl get csr
+NAME        AGE     SIGNERNAME                          REQUESTOR                 REQUESTEDDURATION    CONDITION
+csr-2z6rv   12m     kubernetes.io/kubelet-serving       system:node:nodename-1    <none>               Pending
+csr-424qg   89m     kubernetes.io/kubelet-serving       system:node:nodename-2    <none>               Pending
+```
+
+Approve the particular request:
+
+```
+kubectl certificate approve csr-424qg
+```
+
+These commands might be automated in several ways.
+
+### Auto Approval CronJob
+
+Basically, `CronJob` runs the approval command above for every CSR according to some schedule.
+
+### Auto Approval Service
+
+It is possible to install the kubelet-csr-approver service. For more information, refer to [[kubelet-csr-approver](https://github.com/postfinance/kubelet-csr-approver)](https://github.com/postfinance/kubelet-csr-approver). This service approves CSR automatically when a CSR is created according to several settings. It is better to restrict nodes' IP addresses (`providerIpPrefixes` option) and FQDN templates (providerRegex). For more information, refer to the official documentation.
 
 # Common Practice
 

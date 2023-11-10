@@ -18,6 +18,7 @@ from copy import deepcopy
 
 from kubemarine import demo
 from kubemarine.core import errors, utils
+from test.unit import utils as test_utils
 
 
 class TestInventoryValidation(unittest.TestCase):
@@ -66,28 +67,31 @@ class TestInventoryValidation(unittest.TestCase):
         error_regex = r"Value should be one of \['worker', 'control-plane', 'master', 'balancer']"
         inventory = demo.generate_inventory(**demo.MINIHA_KEEPALIVED)
         inventory['nodes'][1]['roles'].append('add_node')
-        context = demo.create_silent_context(procedure='add_node')
+        context = demo.create_silent_context(['fake.yaml'], procedure='add_node')
         context['nodes'] = demo.generate_nodes_context(inventory)
-        procedure_inventory = {'nodes': [inventory['nodes'].pop(0)]}
+        procedure_inventory = demo.generate_procedure_inventory('add_node')
+        procedure_inventory['nodes'] = [inventory['nodes'].pop(0)]
         with self.assertRaisesRegex(errors.FailException, error_regex):
             demo.new_cluster(inventory, context=context, procedure_inventory=procedure_inventory)
 
         inventory = demo.generate_inventory(**demo.MINIHA_KEEPALIVED)
         inventory['nodes'][1]['roles'].append('remove_node')
-        context = demo.create_silent_context(procedure='remove_node')
+        context = demo.create_silent_context(['fake.yaml'], procedure='remove_node')
         context['nodes'] = demo.generate_nodes_context(inventory)
-        procedure_inventory = {'nodes': deepcopy([inventory['nodes'][0]])}
+        procedure_inventory = demo.generate_procedure_inventory('remove_node')
+        procedure_inventory['nodes'] = [inventory['nodes'][0]]
         with self.assertRaisesRegex(errors.FailException, error_regex):
             demo.new_cluster(inventory, context=context, procedure_inventory=procedure_inventory)
 
     def test_remove_node_invalid_specification(self):
         inventory = demo.generate_inventory(**demo.MINIHA_KEEPALIVED)
-        context = demo.create_silent_context(procedure='remove_node')
-        procedure_inventory = {'nodes': [inventory['nodes'][0]['name']]}
+        context = demo.create_silent_context(['fake.yaml'], procedure='remove_node')
+        procedure_inventory = demo.generate_procedure_inventory('remove_node')
+        procedure_inventory['nodes'] = [inventory['nodes'][0]['name']]
         with self.assertRaisesRegex(errors.FailException, r"Actual instance type is 'string'\. Expected: 'object'"):
-            demo.new_cluster(deepcopy(inventory), context=deepcopy(context), procedure_inventory=procedure_inventory)
+            demo.new_cluster(deepcopy(inventory), context=deepcopy(context), procedure_inventory=deepcopy(procedure_inventory))
 
-        procedure_inventory = {'nodes': [{}]}
+        procedure_inventory['nodes'] = [{}]
         with self.assertRaisesRegex(errors.FailException, r"'name' is a required property"):
             demo.new_cluster(deepcopy(inventory), context=deepcopy(context), procedure_inventory=procedure_inventory)
 
@@ -250,12 +254,11 @@ class TestInventoryValidation(unittest.TestCase):
         inventory = demo.generate_inventory(**demo.MINIHA_KEEPALIVED)
         for node in inventory['nodes']:
             node.pop('address')
-        procedure_inventory = {
-            'nodes': [copy.deepcopy(inventory['nodes'][0])]
-        }
+        procedure_inventory = demo.generate_procedure_inventory('remove_node')
+        procedure_inventory['nodes'] = [copy.deepcopy(inventory['nodes'][0])]
 
         # Remove node inventory
-        context = demo.create_silent_context(procedure='remove_node')
+        context = demo.create_silent_context(['fake.yaml'], procedure='remove_node')
         cluster = demo.new_cluster(inventory, procedure_inventory=procedure_inventory, context=context)
         for node in cluster.inventory['nodes']:
             self.assertNotIn('address', node)
@@ -270,10 +273,11 @@ class TestInventoryValidation(unittest.TestCase):
             node.pop('address')
 
         # Add node inventory
-        context = demo.create_silent_context(procedure='add_node')
+        context = demo.create_silent_context(['fake.yaml'], procedure='add_node')
         host_different_os = inventory['nodes'][0]['internal_address']
         context['nodes'] = self._nodes_context_one_different_os(inventory, host_different_os)
-        procedure_inventory = {'nodes': [inventory['nodes'].pop(0)]}
+        procedure_inventory = demo.generate_procedure_inventory('add_node')
+        procedure_inventory['nodes'] = [inventory['nodes'].pop(0)]
         cluster = demo.new_cluster(inventory, procedure_inventory=procedure_inventory, context=context)
         for node in cluster.inventory['nodes']:
             self.assertNotIn('address', node)
@@ -301,6 +305,126 @@ class TestInventoryValidation(unittest.TestCase):
         self.assertEqual(['balancer-1', 'balancer-2',
                           'control-plane-1', 'control-plane-2', 'control-plane-3',
                           'worker-1', 'worker-2', 'worker-3'], names)
+
+    def test_target_host_ports_generation(self):
+        # services.loadbalancer.target_ports default value depends on nodes configuration in cluster
+        # This check validates, that default value is calculated correctly for different schemas
+
+        # All-in-one without balancers
+        inventory = demo.generate_inventory(balancer=0, worker=1, master=1)
+        cluster = demo.new_cluster(inventory)
+        self.assertEqual(80, int(cluster.inventory['services']['loadbalancer']['target_ports']['http']))
+        self.assertEqual(443, int(cluster.inventory['services']['loadbalancer']['target_ports']['https']))
+        self.assertEqual(80, int(next(filter(
+            lambda port: port['name'] == 'http',
+            cluster.inventory['plugins']['nginx-ingress-controller']['ports']))['hostPort']))
+        self.assertEqual(443, int(next(filter(
+            lambda port: port['name'] == 'https',
+            cluster.inventory['plugins']['nginx-ingress-controller']['ports']))['hostPort']))
+
+        # All-in-one with balancer
+        inventory = demo.generate_inventory(**demo.ALLINONE)
+        cluster = demo.new_cluster(inventory)
+        self.assertEqual(20080, int(cluster.inventory['services']['loadbalancer']['target_ports']['http']))
+        self.assertEqual(20443, int(cluster.inventory['services']['loadbalancer']['target_ports']['https']))
+        self.assertEqual(20080, int(next(filter(
+            lambda port: port['name'] == 'http',
+            cluster.inventory['plugins']['nginx-ingress-controller']['ports']))['hostPort']))
+        self.assertEqual(20443, int(next(filter(
+            lambda port: port['name'] == 'https',
+            cluster.inventory['plugins']['nginx-ingress-controller']['ports']))['hostPort']))
+
+        # MinHA
+        inventory = demo.generate_inventory(**demo.MINIHA)
+        cluster = demo.new_cluster(inventory)
+        self.assertEqual(20080, int(cluster.inventory['services']['loadbalancer']['target_ports']['http']))
+        self.assertEqual(20443, int(cluster.inventory['services']['loadbalancer']['target_ports']['https']))
+        self.assertEqual(20080, int(next(filter(
+            lambda port: port['name'] == 'http',
+            cluster.inventory['plugins']['nginx-ingress-controller']['ports']))['hostPort']))
+        self.assertEqual(20443, int(next(filter(
+            lambda port: port['name'] == 'https',
+            cluster.inventory['plugins']['nginx-ingress-controller']['ports']))['hostPort']))
+
+        # FullHA
+        inventory = demo.generate_inventory(**demo.FULLHA)
+        cluster = demo.new_cluster(inventory)
+        self.assertEqual(20080, int(cluster.inventory['services']['loadbalancer']['target_ports']['http']))
+        self.assertEqual(20443, int(cluster.inventory['services']['loadbalancer']['target_ports']['https']))
+        self.assertEqual(20080, int(next(filter(
+            lambda port: port['name'] == 'http',
+            cluster.inventory['plugins']['nginx-ingress-controller']['ports']))['hostPort']))
+        self.assertEqual(20443, int(next(filter(
+            lambda port: port['name'] == 'https',
+            cluster.inventory['plugins']['nginx-ingress-controller']['ports']))['hostPort']))
+
+        # FullHA without balancers
+        inventory = demo.generate_inventory(**demo.FULLHA_NOBALANCERS)
+        cluster = demo.new_cluster(inventory)
+        self.assertEqual(80, int(cluster.inventory['services']['loadbalancer']['target_ports']['http']))
+        self.assertEqual(443, int(cluster.inventory['services']['loadbalancer']['target_ports']['https']))
+        self.assertEqual(80, int(next(filter(
+            lambda port: port['name'] == 'http',
+            cluster.inventory['plugins']['nginx-ingress-controller']['ports']))['hostPort']))
+        self.assertEqual(443, int(next(filter(
+            lambda port: port['name'] == 'https',
+            cluster.inventory['plugins']['nginx-ingress-controller']['ports']))['hostPort']))
+
+    def test_use_proxy_protocol_generation(self):
+        # plugins.nginx-ingress-controller.config_map.use-proxy-protocol default value depends on nodes configuration in cluster
+        # This check validates, that default value is calculated correctly for different schemas
+
+        # All-in-one without balancers
+        inventory = demo.generate_inventory(balancer=0, worker=1, master=1)
+        cluster = demo.new_cluster(inventory)
+        self.assertEqual('false', cluster.inventory['plugins']['nginx-ingress-controller']['config_map']['use-proxy-protocol'])
+
+        # All-in-one with balancer
+        inventory = demo.generate_inventory(**demo.ALLINONE)
+        cluster = demo.new_cluster(inventory)
+        self.assertEqual('true', cluster.inventory['plugins']['nginx-ingress-controller']['config_map']['use-proxy-protocol'])
+
+        # MinHA
+        inventory = demo.generate_inventory(**demo.MINIHA)
+        cluster = demo.new_cluster(inventory)
+        self.assertEqual('true', cluster.inventory['plugins']['nginx-ingress-controller']['config_map']['use-proxy-protocol'])
+
+        # FullHA
+        inventory = demo.generate_inventory(**demo.FULLHA)
+        cluster = demo.new_cluster(inventory)
+        self.assertEqual('true', cluster.inventory['plugins']['nginx-ingress-controller']['config_map']['use-proxy-protocol'])
+
+        # FullHA without balancers
+        inventory = demo.generate_inventory(**demo.FULLHA_NOBALANCERS)
+        cluster = demo.new_cluster(inventory)
+        self.assertEqual('false', cluster.inventory['plugins']['nginx-ingress-controller']['config_map']['use-proxy-protocol'])
+
+    def test_allow_missed_procedure(self):
+        inventory = demo.generate_inventory(**demo.ALLINONE)
+        for procedure in ('backup', 'check_paas', 'migrate_kubemarine', 'reboot'):
+            context = demo.create_silent_context(procedure=procedure)
+
+            # No exception should be thrown
+            demo.new_cluster(deepcopy(inventory), procedure_inventory=None, context=context)
+
+    def test_enrich_certsans_with_custom(self):
+        inventory = demo.generate_inventory(**demo.MINIHA_KEEPALIVED)
+        first_node_name = inventory['nodes'][0]['name']
+        inventory['services'].setdefault('kubeadm', {}).setdefault('apiServer', {})['certSANs'] = [
+            first_node_name, 'custom'
+        ]
+
+        cluster = demo.new_cluster(inventory)
+        certsans = cluster.inventory["services"]["kubeadm"]['apiServer']['certSANs']
+        self.assertIn('custom', certsans)
+        self.assertEqual(1, len([san for san in certsans if san == first_node_name]))
+
+        test_utils.stub_associations_packages(cluster, {})
+        finalized_inventory = cluster.make_finalized_inventory()
+        certsans = finalized_inventory["services"]["kubeadm"]['apiServer']['certSANs']
+
+        self.assertIn('custom', certsans)
+        self.assertEqual(1, len([san for san in certsans if san == first_node_name]))
 
 
 if __name__ == '__main__':

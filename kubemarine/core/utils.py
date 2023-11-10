@@ -29,6 +29,7 @@ from copy import deepcopy
 from datetime import datetime
 from collections import OrderedDict
 
+from pathvalidate import sanitize_filepath
 from ruamel.yaml import CommentedMap
 from typing_extensions import Protocol
 
@@ -173,21 +174,26 @@ def get_final_inventory(c: object, initial_inventory: dict = None) -> dict:
     else:
         inventory = deepcopy(initial_inventory)
 
-    from kubemarine import admission, kubernetes, packages, plugins, thirdparties
+    from kubemarine import admission, cri, kubernetes, packages, plugins, thirdparties
+    from kubemarine.core import defaults
     from kubemarine.plugins import nginx_ingress
     from kubemarine.procedures import add_node, remove_node, migrate_cri
 
-    inventory_finalize_functions = {
+    inventory_finalize_functions = [
         add_node.add_node_finalize_inventory,
+        lambda cluster, inventory: defaults.calculate_node_names(inventory, cluster),
         remove_node.remove_node_finalize_inventory,
+        kubernetes.restore_finalize_inventory,
         kubernetes.upgrade_finalize_inventory,
+        thirdparties.restore_finalize_inventory,
         thirdparties.upgrade_finalize_inventory,
         plugins.upgrade_finalize_inventory,
         packages.upgrade_finalize_inventory,
         admission.finalize_inventory,
         nginx_ingress.finalize_inventory,
-        migrate_cri.migrate_cri_finalize_inventory
-    }
+        migrate_cri.migrate_cri_finalize_inventory,
+        cri.upgrade_finalize_inventory,
+    ]
 
     for finalize_fn in inventory_finalize_functions:
         inventory = finalize_fn(cluster, inventory)
@@ -196,6 +202,11 @@ def get_final_inventory(c: object, initial_inventory: dict = None) -> dict:
 
 
 def merge_vrrp_ips(procedure_inventory: dict, inventory: dict) -> None:
+    # This method is currently unused.
+    # If it is ever supported when adding and removing node,
+    # it will be necessary to more accurately install and reconfigure the keepalived on existing nodes.
+    # Also, it is desirable to change the section format, for example, as for etc_hosts.
+
     if "vrrp_ips" in inventory and len(inventory["vrrp_ips"]) > 0:
         raise Exception("vrrp_ips section already defined, merging not supported yet")
     else:
@@ -206,7 +217,7 @@ def merge_vrrp_ips(procedure_inventory: dict, inventory: dict) -> None:
 
 
 def dump_file(context: Union[dict, object], data: Union[TextIO, str], filename: str,
-              *, dump_location: bool = True) -> None:
+              *, dump_location: bool = True, create_subdir: bool = False) -> None:
     if dump_location:
         if not isinstance(context, dict):
             # cluster is passed instead of the context directly
@@ -223,6 +234,12 @@ def dump_file(context: Union[dict, object], data: Union[TextIO, str], filename: 
         target_path = get_dump_filepath(context, filename)
     else:
         target_path = get_external_resource_path(filename)
+    # sanitize_filepath is needed for windows/macOS, where some symbols are restricted in file path,
+    # but they can appear in target path. They will be replaced with '_'
+    target_path = sanitize_filepath(target_path, replacement_text='_')
+
+    if create_subdir:
+        os.makedirs(os.path.dirname(target_path), exist_ok=True)
 
     if isinstance(data, io.StringIO):
         text = data.getvalue()
@@ -253,8 +270,14 @@ def wait_command_successful(g: object, command: str,
     while retries > 0:
         log.debug("Waiting for command to succeed, %s retries left" % retries)
         result = group.sudo(command, warn=warn, hide=hide)
-        exit_code = list(result.values())[0].exited
-        if exit_code == 0:
+        if hide:
+            log.verbose(result)
+            for host in result.get_failed_hosts_list():
+                stderr = result[host].stderr.rstrip('\n')
+                if stderr:
+                    log.debug(f"{host}: {stderr}")
+
+        if not result.is_any_failed():
             log.debug("Command succeeded")
             return
         retries = retries - 1

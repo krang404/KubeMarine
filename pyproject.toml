@@ -43,6 +43,7 @@ dependencies = [
     "paramiko==2.11.*",
     "jsonschema==4.17.*",
     "typing_extensions==4.7.*",
+    "pathvalidate==3.2.*"
 ]
 requires-python = ">=3.7"
 
@@ -74,8 +75,8 @@ Issues = "https://github.com/Netcracker/KubeMarine/issues/"
 # 1. pip install bumpver
 # 2. bumpver update --set-version <new version>
 [tool.bumpver]
-current_version = "0.21.0"
-version_pattern = "MAJOR.MINOR.PATCH"
+current_version = "v0.23.1"
+version_pattern = "vMAJOR.MINOR.PATCH"
 commit_message = "bump version to {new_version}"
 commit = true
 tag = true

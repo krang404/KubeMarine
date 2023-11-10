@@ -15,12 +15,8 @@
 
 
 from collections import OrderedDict
-from distutils.util import strtobool
-from io import StringIO
 from itertools import chain
 from typing import List
-
-import toml
 
 from kubemarine import kubernetes, plugins, admission
 from kubemarine.core import flow
@@ -29,7 +25,6 @@ from kubemarine.core.action import Action
 from kubemarine.core.cluster import KubernetesCluster
 from kubemarine.core.resources import DynamicResources
 from kubemarine.procedures import install
-
 
 
 def system_prepare_thirdparties(cluster: KubernetesCluster) -> None:
@@ -51,7 +46,7 @@ def kubernetes_upgrade(cluster: KubernetesCluster) -> None:
     minor_version = int(cluster.context['upgrade_version'].split('.')[1])
 
     upgrade_group = kubernetes.get_group_for_upgrade(cluster)
-    if minor_version >= 28:
+    if minor_version >= 28 and cluster.inventory['rbac']['pss']['pod-security'] == 'enabled':
         first_control_plane = cluster.nodes["control-plane"].get_first_member()
 
         cluster.log.debug("Updating kubeadm config map")
@@ -112,55 +107,6 @@ def upgrade_plugins(cluster: KubernetesCluster) -> None:
     plugins.install(cluster, upgrade_candidates)
 
 
-def upgrade_containerd(cluster: KubernetesCluster) -> None:
-    """
-        This function fixes the incorrect version of pause during the cluster update procedure
-    """
-
-    cri = cluster.inventory["services"]["cri"]['containerRuntime']
-    if cri == 'containerd':
-        path = 'plugins."io.containerd.grpc.v1.cri"'
-        target_kubernetes_version = cluster.context["upgrade_version"]
-        pause_version = cluster.globals['compatibility_map']['software']['pause'][target_kubernetes_version]['version']
-        if not cluster.inventory["services"]["cri"]['containerdConfig'].get(path, False):
-            return
-        last_pause_version = cluster.inventory["services"]["cri"]['containerdConfig'][path]["sandbox_image"].split(":")[
-            2]
-        if True:
-            sandbox = cluster.inventory["services"]["cri"]['containerdConfig'][path]["sandbox_image"]
-            param_begin_pos = sandbox.rfind(":")
-            sandbox = sandbox[:param_begin_pos] + ":" + str(pause_version)
-            cluster.inventory["services"]["cri"]['containerdConfig'][path]["sandbox_image"] = sandbox
-            config_string = ""
-            containerd_config = cluster.inventory["services"]["cri"]['containerdConfig']
-            for key, value in containerd_config.items():
-                # first we process all "simple" `key: value` pairs
-                if not isinstance(value, dict):
-                    config_string += f"{toml.dumps({key: value})}"
-            for key, value in containerd_config.items():
-                # next we process all "complex" `key: dict_value` pairs, representing named sections
-                if isinstance(value, dict):
-                    config_string += f"\n[{key}]\n{toml.dumps(value)}"
-            utils.dump_file(cluster, config_string, 'containerd-config.toml')
-
-            kubernetes_nodes = cluster.make_group_from_roles(['control-plane', 'worker'])
-            for member_node in kubernetes_nodes.get_ordered_members_list():
-                kubeadm_flags_file = "/var/lib/kubelet/kubeadm-flags.env"
-                kubeadm_flags = member_node.sudo(f"cat {kubeadm_flags_file}").get_simple_out()
-                updated_kubeadm_flags = kubernetes._config_changer(kubeadm_flags, f"--pod-infra-container-image={sandbox}")
-                member_node.put(StringIO(updated_kubeadm_flags), kubeadm_flags_file, backup=True, sudo=True)
-
-            with kubernetes_nodes.new_executor() as exe:
-                for node in exe.group.get_ordered_members_list():
-                    os_specific_associations = cluster.get_associations_for_node(node.get_host(), 'containerd')
-                    node.put(StringIO(config_string), os_specific_associations['config_location'],
-                             backup=True, sudo=True, mkdir=True)
-                    node.sudo(
-                        f"sudo systemctl restart {os_specific_associations['service_name']} && "
-                        f"systemctl status {os_specific_associations['service_name']} && " 
-                        f"sudo systemctl restart kubelet")
-
-
 tasks = OrderedDict({
     "verify_upgrade_versions": kubernetes.verify_upgrade_versions,
     "thirdparties": system_prepare_thirdparties,
@@ -168,7 +114,6 @@ tasks = OrderedDict({
     "kubernetes": kubernetes_upgrade,
     "kubernetes_cleanup": kubernetes_cleanup_nodes_versions,
     "packages": upgrade_packages,
-    "upgrade_containerd": upgrade_containerd,
     "plugins": upgrade_plugins,
     "overview": install.overview
 
@@ -183,7 +128,9 @@ class UpgradeFlow(flow.Flow):
         logger = resources.logger()
 
         previous_version = kubernetes.get_initial_kubernetes_version(resources.raw_inventory())
-        upgrade_plan = resources.procedure_inventory()['upgrade_plan']
+        upgrade_plan = resources.procedure_inventory().get('upgrade_plan')
+        if not upgrade_plan:
+            raise Exception('Upgrade plan is not specified in procedure')
         upgrade_plan = verify_upgrade_plan(previous_version, upgrade_plan)
         logger.debug(f"Loaded upgrade plan: current ({previous_version}) ⭢ {' ⭢ '.join(upgrade_plan)}")
 
@@ -213,7 +160,7 @@ class UpgradeAction(Action):
         context['dump_filename_prefix'] = self.upgrade_version
 
 
-def main(cli_arguments: List[str] = None) -> None:
+def create_context(cli_arguments: List[str] = None) -> dict:
     cli_help = '''
     Script for automated upgrade of the entire Kubernetes cluster to a new version.
 
@@ -224,6 +171,11 @@ def main(cli_arguments: List[str] = None) -> None:
     parser = flow.new_procedure_parser(cli_help, tasks=tasks)
 
     context = flow.create_context(parser, cli_arguments, procedure='upgrade')
+    return context
+
+
+def main(cli_arguments: List[str] = None) -> None:
+    context = create_context(cli_arguments)
     flow_ = UpgradeFlow()
     result = flow_.run_flow(context)
 

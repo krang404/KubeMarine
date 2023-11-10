@@ -21,7 +21,6 @@ from contextlib import contextmanager
 from copy import deepcopy
 from typing import List, Dict, Tuple, Iterator, Any, Optional
 
-import ruamel.yaml
 import yaml
 from jinja2 import Template
 import ipaddress
@@ -35,6 +34,7 @@ from kubemarine.core.group import (
     NodeConfig, RunnersGroupResult, RunResult, CollectorCallback
 )
 from kubemarine.core.errors import KME
+from kubemarine.cri import containerd
 
 ERROR_DOWNGRADE='Kubernetes old version \"%s\" is greater than new one \"%s\"'
 ERROR_SAME='Kubernetes old version \"%s\" is the same as new one \"%s\"'
@@ -53,8 +53,11 @@ def add_node_enrichment(inventory: dict, cluster: KubernetesCluster) -> dict:
         node["roles"].append("add_node")
         inventory["nodes"].append(node)
 
-    if "vrrp_ips" in cluster.procedure_inventory:
-        utils.merge_vrrp_ips(cluster.procedure_inventory, inventory)
+    # If "vrrp_ips" section is ever supported when adding node,
+    # It will be necessary to more accurately install and reconfigure the keepalived on existing nodes.
+
+    # if "vrrp_ips" in cluster.procedure_inventory:
+    #     utils.merge_vrrp_ips(cluster.procedure_inventory, inventory)
 
     return inventory
 
@@ -65,9 +68,15 @@ def remove_node_enrichment(inventory: dict, cluster: KubernetesCluster) -> dict:
 
     # adding role "remove_node" for all specified nodes
     node_names_to_remove = [node['name'] for node in cluster.procedure_inventory.get("nodes", [])]
-    for i, node in enumerate(inventory['nodes']):
-        if node['name'] in node_names_to_remove:
-            inventory['nodes'][i]['roles'].append('remove_node')
+    for node_remove in node_names_to_remove:
+        for i, node in enumerate(inventory['nodes']):
+            # Inventory is not compiled at this step.
+            # Expecting that the names are not jinja, or the same jinja expressions.
+            if node['name'] == node_remove:
+                node['roles'].append('remove_node')
+                break
+        else:
+            raise Exception(f"Failed to find node to remove {node_remove} among existing nodes")
 
     return inventory
 
@@ -96,38 +105,62 @@ def generic_upgrade_inventory(cluster: KubernetesCluster, inventory: dict) -> di
     return inventory
 
 
-def enrich_inventory(inventory: dict, _: KubernetesCluster) -> dict:
-    repository = inventory['services']['kubeadm'].get('imageRepository', "")
-    if repository:
-        inventory['services']['kubeadm']['dns'] = {}
-        inventory['services']['kubeadm']['dns']['imageRepository'] = ("%s/coredns" % repository)
-    # if user redefined apiServer as, string, for example?
-    if not isinstance(inventory["services"]["kubeadm"].get('apiServer'), dict):
-        inventory["services"]["kubeadm"]['apiServer'] = {}
+def enrich_restore_inventory(inventory: dict, cluster: KubernetesCluster) -> dict:
+    if cluster.context.get("initial_procedure") != "restore":
+        return inventory
 
-    # if user redefined apiServer.certSANs as, string, or removed it, for example?
-    if not isinstance(inventory["services"]["kubeadm"]['apiServer'].get('certSANs'), list):
-        inventory["services"]["kubeadm"]['apiServer']['certSANs'] = []
+    logger = cluster.log
+    kubernetes_descriptor = cluster.context['backup_descriptor'].setdefault('kubernetes', {})
+    initial_kubernetes_version = get_initial_kubernetes_version(inventory)
+    backup_kubernetes_version = kubernetes_descriptor.get('version')
+    if not backup_kubernetes_version:
+        logger.warning("Not possible to verify Kubernetes version, as descriptor does not contain 'kubernetes.version'")
+        backup_kubernetes_version = initial_kubernetes_version
+
+    if backup_kubernetes_version != initial_kubernetes_version:
+        logger.warning('Installed kubernetes version does not match version from backup')
+        verify_allowed_version(backup_kubernetes_version)
+
+    kubernetes_descriptor['version'] = backup_kubernetes_version
+    return restore_finalize_inventory(cluster, inventory)
+
+
+def restore_finalize_inventory(cluster: KubernetesCluster, inventory: dict) -> dict:
+    if cluster.context.get("initial_procedure") != "restore":
+        return inventory
+
+    target_kubernetes_version = cluster.context['backup_descriptor']['kubernetes']['version']
+    inventory.setdefault("services", {}).setdefault("kubeadm", {})['kubernetesVersion'] = target_kubernetes_version
+    return inventory
+
+
+def enrich_inventory(inventory: dict, _: KubernetesCluster) -> dict:
+    kubeadm = inventory['services']['kubeadm']
+    kubeadm['dns'].setdefault('imageRepository', f"{kubeadm['imageRepository']}/coredns")
+
+    enriched_certsans = []
+
+    for node in inventory["nodes"]:
+        if ('balancer' in node['roles'] or 'control-plane' in node['roles']) and 'remove_node' not in node['roles']:
+            enriched_certsans.extend([node['name'], node['internal_address']])
+            if node.get('address') is not None:
+                enriched_certsans.append(node['address'])
+
+    # The VRRP IP may be actually unused, but let's add it because it is probably specified to be used in the future.
+    for item in inventory["vrrp_ips"]:
+        enriched_certsans.append(item['ip'])
+        if item.get("floating_ip"):
+            enriched_certsans.append(item["floating_ip"])
+
+    if inventory.get("public_cluster_ip"):
+        enriched_certsans.append(inventory["public_cluster_ip"])
 
     certsans = inventory["services"]["kubeadm"]['apiServer']['certSANs']
 
     # do not overwrite apiServer.certSANs, but append - may be user specified something already there?
-    for node in inventory["nodes"]:
-        if 'balancer' in node['roles'] or 'control-plane' in node['roles']:
-            inventory["services"]["kubeadm"]['apiServer']['certSANs'].append(node['internal_address'])
-            inventory["services"]["kubeadm"]['apiServer']['certSANs'].append(node['name'])
-            if node.get('address') is not None and node['address'] not in certsans:
-                inventory["services"]["kubeadm"]['apiServer']['certSANs'].append(node['address'])
-
-    if inventory["vrrp_ips"] is not None:
-        for item in inventory["vrrp_ips"]:
-            inventory["services"]["kubeadm"]['apiServer']['certSANs'].append(item['ip'])
-            if item.get("floating_ip"):
-                inventory["services"]["kubeadm"]["apiServer"]["certSANs"].append(item["floating_ip"])
-
-    if inventory.get("public_cluster_ip"):
-        if inventory["public_cluster_ip"] not in inventory["services"]["kubeadm"]["apiServer"]["certSANs"]:
-            inventory["services"]["kubeadm"]["apiServer"]["certSANs"].append(inventory["public_cluster_ip"])
+    for name in enriched_certsans:
+        if name not in certsans:
+            certsans.append(name)
 
     any_worker_found = False
 
@@ -324,7 +357,6 @@ def install(group: NodeGroup) -> RunnersGroupResult:
         log.debug("Making systemd unit...")
         for node in exe.group.get_ordered_members_list():
             node.sudo('rm -rf /etc/systemd/system/kubelet*')
-            node.get_node_name()
             template = Template(utils.read_internal('templates/kubelet.service.j2')).render(
                 hostname=node.get_node_name())
             log.debug("Uploading to '%s'..." % node.get_host())
@@ -433,20 +465,24 @@ def join_control_plane(cluster: KubernetesCluster, node: NodeGroup, join_dict: d
 
 
 @contextmanager
-def local_admin_config(node: NodeGroup) -> Iterator[str]:
+def local_admin_config(nodes: NodeGroup) -> Iterator[str]:
     temp_filepath = "/tmp/%s" % uuid.uuid4().hex
 
-    cluster_name = node.cluster.inventory['cluster_name']
-    internal_address = node.get_config()['internal_address']
-    if type(ipaddress.ip_address(internal_address)) is ipaddress.IPv6Address:
-        internal_address = f"[{internal_address}]"
+    cluster_name = nodes.cluster.inventory['cluster_name']
 
     try:
-        node.sudo(f"cp /root/.kube/config {temp_filepath} "
-                  f"&& sudo sed -i 's/{cluster_name}/{internal_address}/' {temp_filepath}")
+        with nodes.new_executor() as exe:
+            for defer in exe.group.get_ordered_members_list():
+                internal_address = defer.get_config()['internal_address']
+                if type(ipaddress.ip_address(internal_address)) is ipaddress.IPv6Address:
+                    internal_address = f"[{internal_address}]"
+
+                defer.sudo(
+                    f"cp /root/.kube/config {temp_filepath} "
+                    f"&& sudo sed -i 's/{cluster_name}/{internal_address}/' {temp_filepath}")
         yield temp_filepath
     finally:
-        node.sudo(f'rm -f {temp_filepath}')
+        nodes.sudo(f'rm -f {temp_filepath}')
 
 
 def copy_admin_config(logger: log.EnhancedLogger, nodes: AbstractGroup[RunResult]) -> None:
@@ -799,9 +835,7 @@ def upgrade_first_control_plane(upgrade_group: NodeGroup, cluster: KubernetesClu
     first_control_plane.sudo(drain_cmd, hide=False)
 
     upgrade_cri_if_required(first_control_plane)
-
-    # The procedure for removing the deprecated kubelet flag for versions older than 1.27.0
-    fix_flag_kubelet(cluster, first_control_plane)
+    fix_flag_kubelet(first_control_plane)
 
     first_control_plane.sudo(
         f"sudo kubeadm upgrade apply {version} {flags} && "
@@ -836,9 +870,7 @@ def upgrade_other_control_planes(upgrade_group: NodeGroup, cluster: KubernetesCl
             node.sudo(drain_cmd, hide=False)
 
             upgrade_cri_if_required(node)
-
-            # The procedure for removing the deprecated kubelet flag for versions older than 1.27.0
-            fix_flag_kubelet(cluster, node)
+            fix_flag_kubelet(node)
 
             node.sudo(
                 f"sudo kubeadm upgrade node --certificate-renewal=true --patches=/etc/kubernetes/patches && "
@@ -873,9 +905,7 @@ def upgrade_workers(upgrade_group: NodeGroup, cluster: KubernetesCluster, **drai
         first_control_plane.sudo(drain_cmd, hide=False)
 
         upgrade_cri_if_required(node)
-
-        # The procedure for removing the deprecated kubelet flag for versions older than 1.27.0
-        fix_flag_kubelet(cluster, node)
+        fix_flag_kubelet(node)
 
         node.sudo(
             "kubeadm upgrade node --certificate-renewal=true --patches=/etc/kubernetes/patches && "
@@ -912,7 +942,7 @@ def upgrade_cri_if_required(group: NodeGroup) -> None:
     log = cluster.log
     cri_impl = cluster.inventory['services']['cri']['containerRuntime']
 
-    if cri_impl in cluster.context["packages"]["upgrade_required"]:
+    if cri_impl in cluster.context["upgrade"]["required"]['packages']:
         cri_packages = cluster.get_package_association_for_node(group.get_host(), cri_impl, 'package_name')
 
         log.debug(f"Installing {cri_packages} on node: {group.get_node_name()}")
@@ -923,7 +953,13 @@ def upgrade_cri_if_required(group: NodeGroup) -> None:
         else:
             group.sudo("crictl rm -fa", warn=True)
     else:
-        log.debug(f"{cri_impl} upgrade is not required")
+        log.debug(f"{cri_impl!r} package upgrade is not required")
+
+    # upgrade of sandbox_image is currently not supported for migrate_kubemarine
+    if cri_impl == 'containerd' and cluster.context["upgrade"]["required"].get('containerdConfig', False):
+        containerd.configure_containerd(group)
+    else:
+        log.debug(f"{cri_impl!r} configuration upgrade is not required")
 
 
 def verify_upgrade_versions(cluster: KubernetesCluster) -> None:
@@ -1322,22 +1358,40 @@ def create_kubeadm_patches_for_node(cluster: KubernetesCluster, node: NodeGroup)
             node.sudo(f'chmod 644 {patch_file}')
 
 
-def fix_flag_kubelet(cluster: KubernetesCluster, node: NodeGroup) -> None:
-    # Deprecated flag removal function for kubelet
-    kubeadm_file = "/var/lib/kubelet/kubeadm-flags.env"
+def fix_flag_kubelet(group: NodeGroup) -> bool:
+    kubeadm_flags_file = "/var/lib/kubelet/kubeadm-flags.env"
+    cluster = group.cluster
     version = cluster.inventory["services"]["kubeadm"]["kubernetesVersion"]
+    sandbox_image = containerd.get_sandbox_image(cluster.inventory['services']['cri'])
+    infra_image_flag = f"--pod-infra-container-image={sandbox_image}"
+    container_runtime_flag = '--container-runtime=remote'
 
-    if utils.version_key(version) < utils.version_key("v1.27.0"):
-        # Target version is lower than v1.27.0. Flag is actual and should not be removed.
-        return
+    collector = CollectorCallback(cluster)
+    with group.new_executor() as exe:
+        for node in exe.group.get_ordered_members_list():
+            node.sudo(f"cat {kubeadm_flags_file}", callback=collector)
 
-    kubeadm_flags = node.sudo(f"cat {kubeadm_file}").get_simple_out()
-    if kubeadm_flags.find('--container-runtime=remote') != -1:
-        kubeadm_flags = kubeadm_flags.replace('--container-runtime=remote', '')
-        node.put(io.StringIO(kubeadm_flags), kubeadm_file, backup=True, sudo=True)
- 
+    with group.new_executor() as exe:
+        for node in exe.group.get_ordered_members_list():
+            kubeadm_flags = collector.result[node.get_host()].stdout
+            updated_kubeadm_flags = kubeadm_flags
+            if utils.version_key(version) >= utils.version_key("v1.27.0"):
+                # remove the deprecated kubelet flag for versions starting from 1.27.0
+                updated_kubeadm_flags = updated_kubeadm_flags.replace(container_runtime_flag, '')
 
-def _config_changer(config: str, word: str) -> str:
+            if infra_image_flag not in updated_kubeadm_flags:
+                # patch --pod-infra-container-image with target sandbox_image
+                updated_kubeadm_flags = config_changer(updated_kubeadm_flags, infra_image_flag)
+
+            if kubeadm_flags != updated_kubeadm_flags:
+                cluster.log.debug(f"Patching {kubeadm_flags_file} on {node.get_node_name()} node...")
+                node.put(io.StringIO(updated_kubeadm_flags), kubeadm_flags_file, backup=True, sudo=True)
+
+    # If file is changed on at least one node, last results will be not empty
+    return len(exe.get_last_results()) > 0
+
+
+def config_changer(config: str, word: str) -> str:
     equal_pos = word.find("=") + 1
     param_begin_pos = config.find(word[:equal_pos])
     if param_begin_pos != -1:

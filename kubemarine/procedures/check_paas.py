@@ -17,6 +17,7 @@ import sys
 import time
 from collections import OrderedDict
 import re
+from textwrap import dedent
 from typing import List, Dict, Optional
 
 import yaml
@@ -29,11 +30,14 @@ from kubemarine.core.action import Action
 from kubemarine.core.cluster import KubernetesCluster
 from kubemarine.core.group import NodeConfig, NodeGroup
 from kubemarine.core.resources import DynamicResources
+from kubemarine.cri import containerd
+from kubemarine.plugins import calico
 from kubemarine.procedures import check_iaas
 from kubemarine.core import flow, static
 from kubemarine.testsuite import TestSuite, TestCase, TestFailure, TestWarn
 from kubemarine.kubernetes.daemonset import DaemonSet
 from kubemarine.kubernetes.deployment import Deployment
+from kubemarine.kubernetes.object import KubernetesObject
 from kubemarine.coredns import generate_configmap
 from deepdiff import DeepDiff  # type: ignore[import]
 
@@ -545,16 +549,23 @@ def kubernetes_pods_condition(cluster: KubernetesCluster) -> None:
 def kubernetes_dashboard_status(cluster: KubernetesCluster) -> None:
     with TestCase(cluster, '208', "Plugins", "Dashboard Availability") as tc:
         retries = 10
-        test_succeeded = False
-        i = 0
-        while not test_succeeded and i < retries:
-            i += 1
-            if cluster.inventory['plugins']['kubernetes-dashboard']['install']:
+        test_service_succeeded = False
+        test_ingress_succeeded = False
+        ingress_ip = cluster.inventory['control_plain']['internal']
+
+        if not cluster.inventory['plugins']['kubernetes-dashboard']['install']:
+            tc.success(results="skipped")
+        else:
+            # check dashboard service 
+            cluster.log.debug('Check kubernetes-dashboard service...')
+            i = 0
+            while not test_service_succeeded and i < retries:
+                i += 1
                 results = cluster.nodes['control-plane'].get_first_member().sudo("kubectl get svc -n kubernetes-dashboard kubernetes-dashboard -o=jsonpath=\"{['spec.clusterIP']}\"", warn=True)
                 for control_plane, result in results.items():
                     if result.failed:
-                       cluster.log.debug(f'Can not resolve dashboard IP: {result.stderr} ')
-                       raise TestFailure("not available",hint=f"Please verify the following Kubernetes Dashboard status and fix this issue")
+                        cluster.log.debug(f'Can not get dashboard service IP: {result.stderr} ')
+                        raise TestFailure("not available",hint=f"Please verify the following Kubernetes Dashboard status and fix this issue")
                 found_url = result.stdout
                 if ipaddress.ip_address(found_url).version == 4:
                     check_url = cluster.nodes['control-plane'].get_first_member().sudo(f'curl -k -I https://{found_url}:443', warn=True)
@@ -563,16 +574,40 @@ def kubernetes_dashboard_status(cluster: KubernetesCluster) -> None:
                 status = list(check_url.values())[0].stdout
                 if '200' in status:
                     cluster.log.debug(status)
-                    test_succeeded = True
-                    tc.success(results="available")
+                    test_service_succeeded = True
                 else:
-                    cluster.log.debug(f'Dashboard is not running yet... Retries left: {retries - i}')
+                    cluster.log.debug(f'Dashboard service is not running yet... Retries left: {retries - i}')
                     time.sleep(60)
+
+            # check dashboard ingress
+            cluster.log.debug('Check kubernetes-dashboard ingress...')
+            i = 0
+            while not test_ingress_succeeded and test_service_succeeded and i < retries:
+                i += 1
+                results = cluster.nodes['control-plane'].get_first_member().sudo("kubectl -n kubernetes-dashboard get ingress kubernetes-dashboard -o=jsonpath=\"{.spec.rules[0].host}\"", warn=True)
+                for control_plane, result in results.items():
+                    if result.failed:
+                        cluster.log.debug(f'Can not get dashboard ingress hostname: {result.stderr} ')
+                        raise TestFailure("not available",hint=f"Please verify the following Kubernetes Dashboard status and fix this issue")
+                found_url = result.stdout
+                
+                if ipaddress.ip_address(ingress_ip).version == 4:
+                    check_url = cluster.nodes['control-plane'].get_first_member().sudo(f'curl -k -I --resolve {found_url}:443:{ingress_ip} https://{found_url} 2>&1', warn=True)
+                else:
+                    check_url = cluster.nodes['control-plane'].get_first_member().sudo(f'curl -g -k -I --resolve "{found_url}:443:{ingress_ip}" https://{found_url} 2>&1', warn=True)
+                status = list(check_url.values())[0].stdout
+                if '200' in status:
+                    cluster.log.debug(status)
+                    test_ingress_succeeded = True
+                else:
+                    cluster.log.debug(f'Dashboard ingress is not running yet... Retries left: {retries - i}')
+                    time.sleep(60)
+
+            # test results
+            if test_service_succeeded and test_ingress_succeeded:
+                tc.success(results="available")
             else:
-                test_succeeded = True
-                tc.success(results="skipped")
-        if not test_succeeded:
-            raise TestFailure("not available",
+                raise TestFailure("not available",
                               hint=f"Please verify the following Kubernetes Dashboard status and fix this issue:\n{status}")
 
 
@@ -844,6 +879,54 @@ def etcd_health_status(cluster: KubernetesCluster) -> None:
         tc.success(results='healthy')
 
 
+def container_runtime_configuration_check(cluster: KubernetesCluster) -> None:
+    cri_impl: str = cluster.inventory['services']['cri']['containerRuntime']
+    with TestCase(cluster, '204', "Services", f"{cri_impl.capitalize()} Configuration Check") as tc:
+        if cluster.inventory['services']['cri']['containerRuntime'] != 'containerd':
+            # Check for docker is not yet implemented
+            return tc.success(results='valid')
+
+        expected_config = containerd.get_config_as_toml(cluster.inventory['services']['cri']['containerdConfig'])
+        expected_registries = {registry: containerd.get_config_as_toml(registry_conf)
+                               for registry, registry_conf in
+                               cluster.inventory['services']['cri'].get('containerdRegistriesConfig', {}).items()}
+        kubernetes_nodes = cluster.make_group_from_roles(['control-plane', 'worker'])
+        actual_configs, actual_registries = containerd.fetch_containerd_config(kubernetes_nodes)
+
+        success = True
+        for node in kubernetes_nodes.get_ordered_members_list():
+            actual_config = actual_configs[node.get_host()]
+            diff = DeepDiff(actual_config, expected_config)
+            if diff:
+                cluster.log.debug(f"Configuration of containerd is not actual on {node.get_node_name()} node")
+                # Extra transformation to JSON is necessary,
+                # because DeepDiff.to_dict() returns custom nested classes that cannot be serialized to yaml by default.
+                cluster.log.debug(yaml.safe_dump(yaml.safe_load(diff.to_json())))
+                success = False
+
+            diff = DeepDiff(actual_registries.get(node.get_host(), {}), expected_registries)
+            if diff:
+                cluster.log.debug(f"Configuration of containerd registries is not actual on {node.get_node_name()} node")
+                # Extra transformation to JSON is necessary,
+                # because DeepDiff.to_dict() returns custom nested classes that cannot be serialized to yaml by default.
+                cluster.log.debug(yaml.safe_dump(yaml.safe_load(diff.to_json())))
+                success = False
+
+        if not success:
+            message = dedent(
+                """\
+                The configuration of the container runtime does not match
+                the effectively resolved configuration from the inventory.
+                Check DEBUG logs for details.
+                To have the check passed, you may need to call
+                `kubemarine install --tasks prepare.cri.configure`
+                or change the inventory file accordingly.
+                """.rstrip())
+            raise TestFailure('invalid', hint=message)
+        else:
+            tc.success(results='valid')
+
+
 def control_plane_configuration_status(cluster: KubernetesCluster) -> None:
     '''
     This test verifies the consistency of the configuration (image version, `extra_args`, `extra_volumes`) of static pods of Control Plain like `kube-apiserver`, `kube-controller-manager` and `kube-scheduler`
@@ -981,7 +1064,10 @@ def control_plane_health_status(cluster: KubernetesCluster) -> None:
 
 def default_services_configuration_status(cluster: KubernetesCluster) -> None:
     '''
-    In this test, the versions of the images of the default services, such as `kube-proxy`, `coredns`, `calico-node`, `calico-kube-controllers` and `ingress-nginx-controller`, are checked, and the `coredns` configmap is also checked.
+    In this test, the versions of the images of the default services, such as `kube-proxy`, `coredns`,
+    `calico-node`, `calico-kube-controllers`, `calico-apiserver` and `ingress-nginx-controller`, are checked,
+    and the `coredns` configmap is also checked.
+
     :param cluster: KubernetesCluster object
     :return: None
     '''
@@ -999,13 +1085,16 @@ def default_services_configuration_status(cluster: KubernetesCluster) -> None:
 
         coredns_version = first_control_plane.sudo("kubeadm config images list | grep coredns").get_simple_out().split(":")[1].rstrip()
         version = cluster.inventory['services']['kubeadm']['kubernetesVersion']
-        entities_to_check = {"kube-system": [{"DaemonSet": [{"calico-node": {"version": cluster.globals["compatibility_map"]["software"]["calico"][version]["version"]}},
-                                                            {"kube-proxy": {"version": cluster.inventory["services"]["kubeadm"]["kubernetesVersion"]}}]},
-                                             {"Deployment": [{"calico-kube-controllers": {"version": cluster.globals["compatibility_map"]["software"]["calico"][version]["version"]}},
+        calico_version = cluster.globals["compatibility_map"]["software"]["calico"][version]["version"]
+        nginx_ingress_version = cluster.globals["compatibility_map"]["software"]["nginx-ingress-controller"][version]["version"]
+        entities_to_check = {"kube-system": [{"DaemonSet": [{"calico-node": {"version": calico_version}},
+                                                            {"kube-proxy": {"version": version}}]},
+                                             {"Deployment": [{"calico-kube-controllers": {"version": calico_version}},
                                                              {"coredns": {"version": coredns_version}}]}],
-                             "ingress-nginx": [{"DaemonSet": [{"ingress-nginx-controller": {"version": cluster.globals["compatibility_map"]["software"]["nginx-ingress-controller"][version]["version"]}}]}]}
+                             "ingress-nginx": [{"DaemonSet": [{"ingress-nginx-controller": {"version": nginx_ingress_version}}]}]}
+        if calico.is_apiserver_enabled(cluster.inventory):
+            entities_to_check['calico-apiserver'] = [{"Deployment": [{"calico-apiserver": {"version": calico_version}}]}]
 
-        results = dict()
         for namespace, types_dict in entities_to_check.items():
             for type_dict in types_dict:
                 for type, services in type_dict.items():
@@ -1014,15 +1103,14 @@ def default_services_configuration_status(cluster: KubernetesCluster) -> None:
                             if service_name == "ingress-nginx-controller":
                                 if not cluster.inventory['plugins']['nginx-ingress-controller']['install']:
                                     break
-                            result = first_control_plane.sudo(f"kubectl get {type} {service_name} -n {namespace} -oyaml")
-                            content = yaml.safe_load(result.get_simple_out())
-                            if properties["version"] in content["spec"]["template"]["spec"]["containers"][0].get("image", ""):
-                                results[service_name] = True
-                            else:
-                                results[service_name] = False
-        for item, condition in results.items():
-            if not condition:
-                message += f"{item} has outdated image version\n"
+                            k8s_object = KubernetesObject(cluster, type, service_name, namespace)
+                            k8s_object.reload(control_plane=first_control_plane, suppress_exceptions=True)
+                            if not k8s_object.is_reloaded():
+                                message += f"failed to load {service_name}: {k8s_object}\n"
+                                continue
+
+                            if properties["version"] not in k8s_object.obj["spec"]["template"]["spec"]["containers"][0].get("image", ""):
+                                message += f"{service_name} has outdated image version\n"
 
         if message:
             raise TestFailure('invalid', hint=f"{message}")
@@ -1032,7 +1120,9 @@ def default_services_configuration_status(cluster: KubernetesCluster) -> None:
 
 def default_services_health_status(cluster: KubernetesCluster) -> None:
     '''
-    This test verifies the health of pods `kube-proxy`, `coredns`, `calico-node`, `calico-kube-controllers` and `ingress-nginx-controller`.
+    This test verifies the health of pods `kube-proxy`, `coredns`,
+    `calico-node`, `calico-kube-controllers`, `calico-apiserver` and `ingress-nginx-controller`.
+
     :param cluster: KubernetesCluster object
     :return: None
     '''
@@ -1040,6 +1130,8 @@ def default_services_health_status(cluster: KubernetesCluster) -> None:
         entities_to_check = {"kube-system": [{"DaemonSet": ["calico-node", "kube-proxy"]},
                                              {"Deployment": ["calico-kube-controllers", "coredns"]}],
                              "ingress-nginx": [{"DaemonSet": ["ingress-nginx-controller"]}]}
+        if calico.is_apiserver_enabled(cluster.inventory):
+            entities_to_check['calico-apiserver'] = [{"Deployment": ["calico-apiserver"]}]
 
         first_control_plane = cluster.nodes['control-plane'].get_first_member()
         not_ready_entities = []
@@ -1119,6 +1211,32 @@ def calico_config_check(cluster: KubernetesCluster) -> None:
             message += "ipam check indicates some problems," \
                        " for more info you can use `calicoctl ipam check --show-problem-ips`"
         if message:
+            raise TestFailure('invalid', hint=message)
+        else:
+            tc.success(results='valid')
+
+
+def calico_apiserver_health_status(cluster: KubernetesCluster) -> None:
+    """
+    This test verifies the Calico API server health.
+
+    :param cluster: KubernetesCluster object
+    :return: None
+    """
+    with TestCase(cluster, '230', "Calico", "API server health status") as tc:
+        if not calico.is_apiserver_enabled(cluster.inventory):
+            return tc.success(results='disabled')
+
+        control_planes = cluster.nodes["control-plane"]
+        with kubernetes.local_admin_config(control_planes) as kubeconfig:
+            result = control_planes.sudo(f"kubectl --kubeconfig {kubeconfig} get ippools.projectcalico.org", warn=True)
+
+        if result.is_any_failed():
+            message = "Calico API server is not ready:\n"
+            for host in result.get_failed_hosts_list():
+                stderr = result[host].stderr
+                if stderr:
+                    message += f"{host}: {stderr}"
             raise TestFailure('invalid', hint=message)
         else:
             tc.success(results='valid')
@@ -1360,6 +1478,7 @@ tasks = OrderedDict({
         'container_runtime': {
             'status': lambda cluster:
                 services_status(cluster, cluster.inventory['services']['cri']['containerRuntime']),
+            'configuration': container_runtime_configuration_check,
         },
         'kubelet': {
             'status': lambda cluster: services_status(cluster, 'kubelet'),
@@ -1416,7 +1535,10 @@ tasks = OrderedDict({
         "health_status": default_services_health_status
     },
     'calico': {
-        "config_check": calico_config_check
+        "config_check": calico_config_check,
+        "apiserver": {
+            "health_status": calico_apiserver_health_status,
+        }
     },
     'geo_check': geo_check,
 })
@@ -1430,7 +1552,7 @@ class PaasAction(Action):
         flow.run_tasks(res, tasks)
 
 
-def main(cli_arguments: List[str] = None) -> TestSuite:
+def create_context(cli_arguments: List[str] = None) -> dict:
     cli_help = '''
     Script for checking Kubernetes cluster PAAS layer.
     
@@ -1464,6 +1586,11 @@ def main(cli_arguments: List[str] = None) -> TestSuite:
     context['testsuite'] = TestSuite()
     context['preserve_inventory'] = False
 
+    return context
+
+
+def main(cli_arguments: List[str] = None) -> TestSuite:
+    context = create_context(cli_arguments)
     flow_ = flow.ActionsFlow([PaasAction()])
     result = flow_.run_flow(context, print_summary=False)
 

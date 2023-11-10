@@ -14,21 +14,20 @@
 
 from __future__ import annotations
 
-import argparse
 import io
 import re
 import threading
 import time
 from abc import ABC
 from copy import deepcopy
-from typing import List, Dict, Union, Any, Optional, Mapping, Iterable, IO, Tuple
+from typing import List, Dict, Union, Any, Optional, Mapping, Iterable, IO, Tuple, cast
 
 import fabric  # type: ignore[import]
 import invoke
 
-from kubemarine import system
+from kubemarine import system, procedures
 from kubemarine.core.cluster import KubernetesCluster, _AnyConnectionTypes
-from kubemarine.core import flow, connections, static
+from kubemarine.core import connections, static
 from kubemarine.core.connections import ConnectionPool
 from kubemarine.core.executor import RunnersResult, GenericResult, Token, CommandTimedOut
 from kubemarine.core.group import (
@@ -200,7 +199,8 @@ class FakeResources(DynamicResources):
         self.last_cluster: Optional[FakeKubernetesCluster] = None
         self.fake_shell = fake_shell if fake_shell else FakeShell()
         self.fake_fs = fake_fs if fake_fs else FakeFS()
-        self._nodes_context = nodes_context
+        # Let's do not assign self._nodes_context directly to make it more close to the real enrichment.
+        self.fake_nodes_context = nodes_context
         self._procedure_inventory = procedure_inventory
 
     def _load_inventory(self) -> None:
@@ -210,13 +210,22 @@ class FakeResources(DynamicResources):
     def _store_inventory(self) -> None:
         self.stored_inventory = deepcopy(self.formatted_inventory())
 
+    def _detect_nodes_context(self, light_cluster: KubernetesCluster) -> dict:
+        if self.fake_nodes_context is not None:
+            return self.fake_nodes_context
+
+        return super()._detect_nodes_context(light_cluster)
+
+    def _create_cluster(self, context: dict) -> KubernetesCluster:
+        self.last_cluster = cast(FakeKubernetesCluster, super()._create_cluster(context))
+        return self.last_cluster
+
     def _new_cluster_instance(self, context: dict) -> FakeKubernetesCluster:
-        self.last_cluster = FakeKubernetesCluster(
+        return FakeKubernetesCluster(
             self.raw_inventory(), context,
             procedure_inventory=self.procedure_inventory(), logger=self.logger(),
             fake_shell=self.fake_shell, fake_fs=self.fake_fs
         )
-        return self.last_cluster
 
 
 class FakeConnection(fabric.connection.Connection):  # type: ignore[misc]
@@ -372,18 +381,16 @@ class FakeConnectionPool(connections.ConnectionPool):
         )
 
 
-def create_silent_context(args: list = None, parser: argparse.ArgumentParser = None,
-                          procedure: str = 'install') -> dict:
+def create_silent_context(args: list = None, procedure: str = 'install') -> dict:
     args = list(args) if args else []
     # todo probably increase logging level to get rid of spam in logs.
-    if '--disable-dump' not in args:
-        args.append('--disable-dump')
 
-    if parser is None:
-        parser = flow.new_common_parser("Help text")
-    context = flow.create_context(parser, args, procedure=procedure)
-    del context['execution_arguments']['ansible_inventory_location']
+    context: dict = procedures.import_procedure(procedure).create_context(args)
     context['preserve_inventory'] = False
+
+    parsed_args: dict = context['execution_arguments']
+    parsed_args['disable_dump'] = True
+    del parsed_args['ansible_inventory_location']
 
     return context
 
@@ -517,6 +524,19 @@ def generate_inventory(balancer: _ROLE_SPEC = 1, master: _ROLE_SPEC = 1, worker:
     inventory['vrrp_ips'] = vrrp_ips
 
     return inventory
+
+
+def generate_procedure_inventory(procedure: str) -> dict:
+    procedure_inventory: dict = {}
+    # set some commonly required properties
+    if procedure == 'manage_psp':
+        procedure_inventory['psp'] = {}
+    if procedure == 'manage_pss':
+        procedure_inventory['pss'] = {'pod-security': 'enabled'}
+    if procedure == 'migrate_cri':
+        procedure_inventory['cri'] = {'containerRuntime': 'containerd'}
+
+    return procedure_inventory
 
 
 def create_nodegroup_result_by_hosts(cluster: KubernetesCluster, results: Dict[str, GenericResult]) -> NodeGroupResult:

@@ -96,7 +96,7 @@ class CriUpgradeAction(Action):
 
         # Only now the cluster is initialized and full enrichment is run.
         cluster = res.cluster()
-        if cri_impl not in cluster.context['packages']['upgrade_required']:
+        if cri_impl not in cluster.context["upgrade"]["required"]['packages']:
             res.logger().info(f"Nothing has changed in associations of {cri_impl!r}. Upgrade is not required.")
             return
 
@@ -185,7 +185,7 @@ class BalancerUpgradeAction(Action):
         # Only now the cluster is initialized and full enrichment is run.
         cluster = res.cluster()
         logger = res.logger()
-        if self.package_name not in cluster.context['packages']['upgrade_required']:
+        if self.package_name not in cluster.context["upgrade"]["required"]['packages']:
             logger.info(f"Nothing has changed in associations of {self.package_name!r}. Upgrade is not required.")
             return
 
@@ -499,9 +499,14 @@ def run(context: dict) -> None:
     flow.ActionsFlow(actions).run_flow(context)
 
 
-def main(cli_arguments: List[str] = None) -> None:
+def create_context(cli_arguments: List[str] = None) -> dict:
     parser = new_parser()
     context = flow.create_context(parser, cli_arguments, procedure="migrate_kubemarine")
+    return context
+
+
+def main(cli_arguments: List[str] = None) -> None:
+    context = create_context(cli_arguments)
     run(context)
 
 

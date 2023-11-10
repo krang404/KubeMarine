@@ -867,7 +867,7 @@ def install_tcp_listener(cluster: KubernetesCluster,
 def check_tcp_ports(cluster: KubernetesCluster) -> None:
     with TestCase(cluster, '011', 'Network', 'TCPPorts', default_results='Connected'),\
             suspend_firewalld(cluster):
-        tcp_ports = ["80", "443", "179", "5473", "6443", "8443", "2379", "2380", "9091", "9094", "10250", "10254",
+        tcp_ports = ["80", "443", "179", "5473", "6443", "8443", "2379", "2380", "9091", "9093", "9094", "10250", "10254",
                      "10257", "10259", "30001", "30002"]
         nodes = {node["connect_to"]: node
                  for node in cluster.inventory['nodes']}
@@ -948,7 +948,7 @@ class IaasAction(Action):
         flow.run_tasks(res, tasks)
 
 
-def main(cli_arguments: List[str] = None) -> TestSuite:
+def create_context(cli_arguments: List[str] = None) -> dict:
     cli_help = '''
     Script for checking Kubernetes cluster IAAS layer.
     
@@ -982,6 +982,11 @@ def main(cli_arguments: List[str] = None) -> TestSuite:
     context['testsuite'] = TestSuite()
     context['preserve_inventory'] = False
 
+    return context
+
+
+def main(cli_arguments: List[str] = None) -> TestSuite:
+    context = create_context(cli_arguments)
     flow_ = flow.ActionsFlow([IaasAction()])
     result = flow_.run_flow(context, print_summary=False)
 

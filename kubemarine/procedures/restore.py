@@ -24,7 +24,7 @@ from typing import List
 
 import yaml
 
-from kubemarine.core import utils, flow, defaults
+from kubemarine.core import utils, flow
 from kubemarine.core.action import Action
 from kubemarine.core.cluster import KubernetesCluster
 from kubemarine.core.resources import DynamicResources
@@ -45,8 +45,9 @@ def missing_or_empty(file: str) -> bool:
 def replace_config_from_backup_if_needed(procedure_inventory_filepath: str, config: str) -> None:
     if missing_or_empty(config):
         print('Config is missing or empty - retrieving config from backup archive...')
-        with utils.open_external(procedure_inventory_filepath, 'r') as stream:
-            procedure = yaml.safe_load(stream)
+        procedure = utils.load_yaml(procedure_inventory_filepath)
+        if not procedure:
+            procedure = {}
         backup_location = procedure.get("backup_location")
         if not backup_location:
             raise Exception('Backup location is not specified in procedure')
@@ -58,9 +59,11 @@ def replace_config_from_backup_if_needed(procedure_inventory_filepath: str, conf
             tar.close()
 
 
-def unpack_data(cluster: KubernetesCluster) -> None:
-    backup_tmp_directory = backup.prepare_backup_tmpdir(cluster)
-    backup_file_source = cluster.procedure_inventory.get('backup_location')
+def unpack_data(resources: DynamicResources) -> None:
+    logger = resources.logger()
+    context = resources.context
+    backup_tmp_directory = backup.prepare_backup_tmpdir(logger, context)
+    backup_file_source = resources.procedure_inventory().get('backup_location')
 
     if not backup_file_source:
         raise Exception('Backup source not specified in procedure')
@@ -69,13 +72,13 @@ def unpack_data(cluster: KubernetesCluster) -> None:
     if not os.path.isfile(backup_file_source):
         raise FileNotFoundError('Backup file "%s" not found' % backup_file_source)
 
-    cluster.log.debug('Unpacking all data...')
+    logger.debug('Unpacking all data...')
     with tarfile.open(backup_file_source, 'r:gz') as tar:
         for member in tar:
             if member.isdir():
                 continue
             fname = os.path.join(backup_tmp_directory, member.name)
-            cluster.log.debug(fname)
+            logger.debug(fname)
             fname_parts = fname.split('/')
             if len(fname_parts) > 1:
                 fname_dir = "/".join(fname_parts[:-1])
@@ -89,25 +92,7 @@ def unpack_data(cluster: KubernetesCluster) -> None:
         raise FileNotFoundError('Descriptor not found in backup file')
 
     with utils.open_external(descriptor_filepath, 'r') as stream:
-        cluster.context['backup_descriptor'] = yaml.safe_load(stream)
-
-
-def verify_backup_data(cluster: KubernetesCluster) -> None:
-    if not cluster.context['backup_descriptor'].get('kubernetes', {}).get('version'):
-        cluster.log.debug('Not possible to verify Kubernetes version, because descriptor do not contain such information')
-        return
-
-    if cluster.context['backup_descriptor']['kubernetes']['version'] != cluster.inventory['services']['kubeadm']['kubernetesVersion']:
-        cluster.log.warning('Installed kubernetes versions do not match version from backup')
-        cluster.log.verbose('Cluster re-parse required')
-        if not cluster.raw_inventory.get('services'):
-            cluster.raw_inventory['services'] = {}
-        if not cluster.raw_inventory['services'].get('kubeadm'):
-            cluster.raw_inventory['services']['kubeadm'] = {}
-        cluster.raw_inventory['services']['kubeadm']['kubernetesVersion'] = cluster.context['backup_descriptor']['kubernetes']['version']
-        cluster._inventory = defaults.enrich_inventory(cluster, cluster.raw_inventory)
-    else:
-        cluster.log.debug('Kubernetes version from backup is correct')
+        context['backup_descriptor'] = yaml.safe_load(stream)
 
 
 def stop_cluster(cluster: KubernetesCluster) -> None:
@@ -129,18 +114,7 @@ def stop_cluster(cluster: KubernetesCluster) -> None:
     cluster.log.verbose(result)
 
 
-def restore_thirdparties(cluster: KubernetesCluster) -> None:
-    custom_thirdparties = cluster.procedure_inventory.get('restore_plan', {}).get('thirdparties', {})
-    if custom_thirdparties:
-        for name, value in custom_thirdparties.items():
-            cluster.inventory['services']['thirdparties'][name]['source'] = value['source']
-            if value.get('sha1'):
-                cluster.inventory['services']['thirdparties'][name]['sha1'] = value['sha1']
-
-    install.system_prepare_thirdparties(cluster)
-
-
-def import_nodes(cluster: KubernetesCluster) -> None:
+def import_nodes_data(cluster: KubernetesCluster) -> None:
     with cluster.nodes['all'].new_executor() as exe:
         for node in exe.group.get_ordered_members_list():
             node_name = node.get_node_name()
@@ -148,13 +122,31 @@ def import_nodes(cluster: KubernetesCluster) -> None:
             node.put(os.path.join(cluster.context['backup_tmpdir'], 'nodes_data', '%s.tar.gz' % node_name),
                      '/tmp/kubemarine-backup.tar.gz')
 
-    cluster.log.debug('Unpacking backup...')
 
-    unpack_cmd = "sudo tar xzvf /tmp/kubemarine-backup.tar.gz -C / --overwrite"
+def restore_dns_resolv_conf(cluster: KubernetesCluster) -> None:
+    import_nodes_data(cluster)
+
+    unpack_cmd = "sudo tar xzvf /tmp/kubemarine-backup.tar.gz -C / --overwrite /etc/resolv.conf"
     result = cluster.nodes['all'].sudo(
         f"readlink /etc/resolv.conf ; "
         f"if [ $? -ne 0 ]; then sudo chattr -i /etc/resolv.conf; {unpack_cmd} && sudo chattr +i /etc/resolv.conf; "
-        f"else {unpack_cmd}; fi ")
+        f"fi ")
+
+    cluster.log.debug(result)
+
+
+def restore_thirdparties(cluster: KubernetesCluster) -> None:
+    install.system_prepare_thirdparties(cluster)
+
+
+def import_nodes(cluster: KubernetesCluster) -> None:
+    if not cluster.is_task_completed('restore.dns.resolv_conf'):
+        import_nodes_data(cluster)
+
+    cluster.log.debug('Unpacking backup...')
+
+    unpack_cmd = "sudo tar xzvf /tmp/kubemarine-backup.tar.gz -C / --overwrite --exclude /etc/resolv.conf"
+    result = cluster.nodes['all'].sudo(unpack_cmd)
 
     cluster.log.debug(result)
 
@@ -266,8 +258,7 @@ def import_etcd(cluster: KubernetesCluster) -> None:
         cluster.nodes['control-plane'].sudo(f"docker stop {container_name} && "
                                             f"sudo docker rm {container_name}")
     else:
-        cluster.nodes['control-plane'].sudo(f"ctr task kill -s 9 {container_name} && "
-                                            f"sudo ctr task rm {container_name} && "
+        cluster.nodes['control-plane'].sudo(f"ctr task rm -f {container_name} && "
                                             f"sudo ctr container rm {container_name}")
 
 
@@ -278,11 +269,12 @@ def reboot(cluster: KubernetesCluster) -> None:
 
 tasks = OrderedDict({
     "prepare": {
-        "unpack": unpack_data,
-        "verify_backup_data": verify_backup_data,
         "stop_cluster": stop_cluster,
     },
     "restore": {
+        "dns": {
+            "resolv_conf": restore_dns_resolv_conf,
+        },
         "thirdparties": restore_thirdparties,
     },
     "import": {
@@ -293,15 +285,22 @@ tasks = OrderedDict({
 })
 
 
+class RestoreFlow(flow.Flow):
+    def _run(self, resources: DynamicResources) -> None:
+        unpack_data(resources)
+        flow.run_actions(resources, [RestoreAction()])
+
+
 class RestoreAction(Action):
     def __init__(self) -> None:
-        super().__init__('restore')
+        super().__init__('restore', recreate_inventory=True)
 
     def run(self, res: DynamicResources) -> None:
         flow.run_tasks(res, tasks)
+        res.make_final_inventory()
 
 
-def main(cli_arguments: List[str] = None) -> None:
+def create_context(cli_arguments: List[str] = None) -> dict:
     cli_help = '''
     Script for restoring Kubernetes resources and nodes contents from backup file.
 
@@ -312,11 +311,18 @@ def main(cli_arguments: List[str] = None) -> None:
     parser = flow.new_procedure_parser(cli_help, tasks=tasks)
 
     context = flow.create_context(parser, cli_arguments, procedure='restore')
+    context['backup_descriptor'] = {}
+
+    return context
+
+
+def main(cli_arguments: List[str] = None) -> None:
+    context = create_context(cli_arguments)
     args = context['execution_arguments']
 
     replace_config_from_backup_if_needed(args['procedure_config'], args['config'])
 
-    flow.ActionsFlow([RestoreAction()]).run_flow(context)
+    RestoreFlow().run_flow(context)
 
 
 if __name__ == '__main__':

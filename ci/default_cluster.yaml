@@ -18,11 +18,11 @@ plugins:
 
   calico:
     install: true
+    apiserver:
+      enabled: true
 
   nginx-ingress-controller:
     install: true
-    config_map:
-      use-proxy-protocol: "false"
 
   kubernetes-dashboard:
     install: true

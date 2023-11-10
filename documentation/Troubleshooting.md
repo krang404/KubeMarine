@@ -18,6 +18,7 @@ This section provides troubleshooting information for Kubemarine and Kubernetes 
   - [`kube-controller-manager` Unable to Sync Caches for Garbage Collector](#kube-controller-manager-unable-to-sync-caches-for-garbage-collector)
   - [Etcdctl Compaction and Defragmentation](#etcdctl-compaction-and-defragmentation)
   - [Etcdctl Defrag Return Context Deadline Exceeded](#etcdctl-defrag-return-context-deadline-exceeded)
+  - [Etcdserver Request Timeout](#etcdserver-request-rimeout)
   - [Etcd Database Corruption](#etcd-database-corruption)
     - [Manual Restoration of Etcd Database](#manual-restoration-of-etcd-database)
   - [HTTPS Ingress Doesn't Work](#https-ingress-doesnt-work)
@@ -35,6 +36,7 @@ This section provides troubleshooting information for Kubemarine and Kubernetes 
   - [Failure During Installation on Ubuntu OS With Cloud-init](#failure-during-installation-on-ubuntu-os-with-cloud-init)
   - [Troubleshooting an Installation That Ended Incorrectly](#troubleshooting-an-installation-that-ended-incorrectly)
   - [Kubelet Has Conflict With Kubepods-burstable.slice and Kube-proxy Pods Stick in ContainerCreating Status](#kubelet-has-conflict-with-kubepods-burstableslice-and-kube-proxy-pods-stick-in-containercreating-status)
+  - [kubectl logs and kubectl exec fail](#kubectl-logs-and-kubectl-exec-fail)
 
 # Kubemarine Errors
 
@@ -467,6 +469,45 @@ Failed to defragment etcd member
 # etcdctl defrag --endpoints=ENDPOINT_IP:2379 --command-timeout=30s
 ```
 
+## Etcdserver Request Timeout
+
+**Symptoms**: there are such error messages in the `kubelet` logs:
+
+```commandline
+Apr 23 06:32:33 node-9 kubelet: 2023-04-23 06:32:33.378 [ERROR][9428] ipam_plugin.go 309: Failed to release address ContainerID="8938210a16212763148e8fcc3b4785440eea07e52ff82d1f0370495ed3315ffc" HandleID="k8s-pod-network.8938210a16212763148e8fcc3b4785440eea07e52ff82d1f0370495ed3315ffc" Workload="example-workload-name" error=etcdserver: request timed out
+```
+
+In etcd logs there are such messages:
+
+```commandline
+2023-04-29 06:06:16.087641 W | etcdserver: failed to send out heartbeat on time (exceeded the 100ms timeout for 6.102899ms, to fa4ddfec63d549fc)
+```
+
+**Root Cause**: Etcd database treats requests too slowly.
+
+**Solution**: to impove etcd performance.
+
+First of all it is necessary to check that the disk under `/var/lib/etcd` satisfies [the recommendations](/documentation/Installation.md#etcd-recommendation).
+
+Then add the following flags to the `/etc/kubernetes/manifests/etcd.yaml` manifest at all the control-plane nodes:
+
+```
+--heartbeat-interval=1000
+--election-timeout=5000
+```
+
+Also it is recommended to set different `snapshot-count` values at different control-plane nodes so they persist snapshots to the disk not simultaneously.
+Default value of `snapshot-count` is `10000`, so set it to a different value at the second and the third control-plane nodes in the `/etc/kubernetes/manifests/etcd.yaml` manifest, for example:
+
+```commandline
+# second master: 
+--snapshot-count=11210
+# third master:
+--snapshot-count=12210
+```
+
+Other general etcd tuning recommendations can be found in the [official etcd documentation](https://etcd.io/docs/v3.5/tuning/). 
+
 ## Etcd Database Corruption
 
 **Symptoms**: The etcd cluster is not healthy, some etcd pods cannot start with errors like:
@@ -715,26 +756,6 @@ and restart etcd:
 
 13. If necessary, remove backup files create at the step 3.
 
-## Ingress Doesn't Work with proxy
-
-**Symptoms**: 
-  * Requests using ingresses fails with `Empty reply from server` error for http or SSL error for https. Using `--haproxy-protocol` option in curl tool fixes your problem;
-  * Following errors exists in ingress-nginx-controller pod logs: `broken header: "<...>" while reading PROXY protocol, client: <...>, server: <...>`
-
-**Root cause**: `ingress-nginx-controller` works in proxy mode, but incoming requests don't apply it. Proxy protocol is applied to requests in load-balancers. For this reason such issue may occur in the following cases:
-  * You don't use balancers and take requests directly to some node (e.g. all-in-one setup);
-  * You use external load-balancers, that don't apply proxy protocol;
-  * You have balancer node, which `balancer` role is combined with others and your request don't pass through HAProxy. It will be fixed in KubeMarine soon.
-
-**Solution**: Redeploy `ingress-nginx-controller` plugin with disabled proxy-protocol:
-```yaml
-plugins:
-  nginx-ingress-controller:
-    install: true
-    config_map:
-      use-proxy-protocol: "false"
-```
-Or, if you use external load-balancer, you can enable proxy protocol from its site.
 
 ## HTTPS Ingress Doesn't Work
 
@@ -769,13 +790,13 @@ This is a known issue in the Kubernetes community (https://github.com/kubernetes
 
 **Solution**: In the `kube-controller-manager` pod logs, messages of the following type can be found:
 ```
-E1202 03:28:26.861927       1 reflector.go:138] k8s.io/client-go/metadata/metadatainformer/informer.go:90: Failed to watch *v1.PartialObjectMetadata: failed to list *v1.PartialObjectMetadata: conversion webhook for deployment.nrm.netcracker.com/v1alpha22, Kind=Scale-product-rebase-ci-1-billing failed: Post "https://nrm-deployments-webhook-service.product-rebase-ci-1-billing.svc:443/convertv1-96-0-rc3?timeout=30s": service "nrm-deployments-webhook-service" not found
+E1202 03:28:26.861927       1 reflector.go:138] k8s.io/client-go/metadata/metadatainformer/informer.go:90: Failed to watch *v1.PartialObjectMetadata: failed to list *v1.PartialObjectMetadata: conversion webhook for deployment.example.com/v1alpha22, Kind=example_kind failed: Post "https://example.svc:443/convertv1-96-0-rc3?timeout=30s": service "example-deployments-webhook-service" not found
 
 ```
 From this message you can find kind of CR. Use it to find broken CRD:
 ```
-# kubectl get crd -o custom-columns=CRD_Name:.metadata.name,CR_Kind:.spec.names.kind | grep Scale-product-rebase-ci-1-billing
-scales-product-rebase-ci-1-billing.deployment.nrm.netcracker.com                               Scale-product-rebase-ci-1-billing
+# kubectl get crd -o custom-columns=CRD_Name:.metadata.name,CR_Kind:.spec.names.kind | grep example_kind
+crd_example.com                               example_kind
 ```
 Next, you need to restore this webhook, or if this is not possible, delete this CRD. After that the GC should be restored.
 
@@ -1178,3 +1199,21 @@ The user can analyze these files and try to find the reason for the failed insta
 sudo systemctl stop kubepods-burstable.slice
 sudo systemctl restart containerd
 ```
+
+## kubectl logs and kubectl exec fail
+
+**Symptoms**: The attempt to get pod logs and execute a command inside the container fails with the following errors:
+
+```
+$ kubectl -n my-namespace logs my-pod
+Error from server: Get "https://192.168.1.1:10250/containerLogs/my-namespace/my-pod/controller": remote error: tls: internal error
+```
+
+```
+$ kubectl -n my-namespace exec my-pod -- id
+Error from server: error dialing backend: remote error: tls: internal error
+```
+
+**Root cause**: The `kubelet` server certificate is not approved, whereas the cluster has been configured not to use self-signed certificates for the `kubelet` server.
+
+**Solution**: Perform CSR approval steps from the maintenance guide. Refer to the [Kubelet Server Certificate Approval](https://github.com/Netcracker/KubeMarine/blob/main/documentation/Maintenance.md#kubelet-server-certificate-approval) section for details.

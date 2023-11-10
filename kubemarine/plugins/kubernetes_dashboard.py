@@ -11,11 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import List, Optional
+from typing import List, Optional, Dict
 
 from kubemarine.core import summary, utils, log
 from kubemarine.core.cluster import KubernetesCluster
-from kubemarine.plugins.manifest import Processor, EnrichmentFunction, Manifest
+from kubemarine.plugins.manifest import Processor, EnrichmentFunction, Manifest, Identity
 
 
 def enrich_inventory(inventory: dict, cluster: KubernetesCluster) -> dict:
@@ -43,7 +43,7 @@ def schedule_summary_report(cluster: KubernetesCluster) -> None:
 class DashboardManifestProcessor(Processor):
     def __init__(self, logger: log.VerboseLogger, inventory: dict,
                  original_yaml_path: Optional[str] = None, destination_name: Optional[str] = None) -> None:
-        super().__init__(logger, inventory, 'kubernetes-dashboard', original_yaml_path, destination_name)
+        super().__init__(logger, inventory, Identity('kubernetes-dashboard'), original_yaml_path, destination_name)
 
     def get_known_objects(self) -> List[str]:
         return [
@@ -70,12 +70,11 @@ class DashboardManifestProcessor(Processor):
             self.enrich_deployment_dashboard_metrics_scraper,
         ]
 
+    def get_namespace_to_necessary_pss_profiles(self) -> Dict[str, str]:
+        return {'kubernetes-dashboard': 'baseline'}
+
     def enrich_namespace_kubernetes_dashboard(self, manifest: Manifest) -> None:
-        key = "Namespace_kubernetes-dashboard"
-        rbac = self.inventory['rbac']
-        if rbac['admission'] == 'pss' and rbac['pss']['pod-security'] == 'enabled' \
-                and rbac['pss']['defaults']['enforce'] == 'restricted':
-            self.assign_default_pss_labels(manifest, key, 'baseline')
+        self.assign_default_pss_labels(manifest, 'kubernetes-dashboard')
 
     def enrich_deployment_kubernetes_dashboard(self, manifest: Manifest) -> None:
         key = "Deployment_kubernetes-dashboard"

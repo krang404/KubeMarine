@@ -13,13 +13,13 @@
 # limitations under the License.
 
 from textwrap import dedent
-from typing import List, Optional
+from typing import List, Optional, Dict
 
 import yaml
 
 from kubemarine.core import log
 from kubemarine.core.cluster import KubernetesCluster
-from kubemarine.plugins.manifest import Processor, EnrichmentFunction, Manifest
+from kubemarine.plugins.manifest import Processor, EnrichmentFunction, Manifest, Identity
 
 
 def enrich_inventory(inventory: dict, cluster: KubernetesCluster) -> dict:
@@ -37,7 +37,7 @@ def enrich_inventory(inventory: dict, cluster: KubernetesCluster) -> dict:
 class LocalPathProvisionerManifestProcessor(Processor):
     def __init__(self, logger: log.VerboseLogger, inventory: dict,
                  original_yaml_path: Optional[str] = None, destination_name: Optional[str] = None) -> None:
-        super().__init__(logger, inventory, 'local-path-provisioner', original_yaml_path, destination_name)
+        super().__init__(logger, inventory, Identity('local-path-provisioner'), original_yaml_path, destination_name)
 
     def get_known_objects(self) -> List[str]:
         return [
@@ -59,12 +59,11 @@ class LocalPathProvisionerManifestProcessor(Processor):
             self.enrich_configmap_local_path_config,
         ]
 
+    def get_namespace_to_necessary_pss_profiles(self) -> Dict[str, str]:
+        return {'local-path-storage': 'privileged'}
+
     def enrich_namespace_local_path_storage(self, manifest: Manifest) -> None:
-        key = "Namespace_local-path-storage"
-        rbac = self.inventory['rbac']
-        if rbac['admission'] == 'pss' and rbac['pss']['pod-security'] == 'enabled' \
-                and rbac['pss']['defaults']['enforce'] != 'privileged':
-            self.assign_default_pss_labels(manifest, key, 'privileged')
+        self.assign_default_pss_labels(manifest, 'local-path-storage')
 
     def add_clusterrolebinding_local_path_provisioner_privileged_psp(self, manifest: Manifest) -> None:
         # TODO add only if psp is enabled?

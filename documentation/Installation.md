@@ -180,14 +180,15 @@ The actual information about the supported versions can be found in `compatibili
 * Opened TCP-ports:
   * Internal communication:
     * 22 : SSH 
-    * 80 : HTTP
+    * 80 (or 20080, if balancers are presented): HTTP
     * 179 : Calico BGP
-    * 443 : HTTPS
+    * 443 (or 20443, if balancers are presented): HTTPS
     * 5473 : Calico netowrking with Typha enabled
     * 6443 : Kubernetes API server
     * 8443 : Kubernetes dashboard
     * 2379-2380 : ETCD server & client API
     * 9091 - Calico metric port
+    * 9093 - Calico Typha metric port
     * 9094 - Calico kube-controller metric port
     * 10250 : Kubelet API
     * 10257 : Kube-scheduler
@@ -786,14 +787,15 @@ with parameters.
 
 The `registry` parameter automatically completes the following parameters:
 
-|Path|Registry Type|Format|Example|Description|
-|---|---|---|---|---|
-|`services.kubeadm.imageRepository`|Docker|Address without protocol, where Kubernetes images are stored. It should be the full path to the repository.|```example.com:5443/registry.k8s.io```|Kubernetes Image Repository. The system container's images such as `kubeapi` or `etcd` is loaded from this registry.|
-|`services.cri.dockerConfig.insecure-registries`|Docker|List with addresses without a protocol.|```example.com:5443```|Docker Insecure Registries. It is necessary for the Docker to allow the connection to addresses unknown to it.|
-|`services.cri.dockerConfig.registry-mirrors`|Docker|List with addresses. Each address should contain a protocol.|```https://example.com:5443```|Docker Registry Mirrors. Additional image sources for the container's images pull.|
-|`services.cri.containerdConfig.{{containerd-specific name}}`|Docker|Toml-like section with endpoints according to the containerd docs.|```https://example.com:5443```||
-|`services.thirdparties.{{ thirdparty }}.source`|Plain|Address with protocol or absolute path on deploy node. It should be the full path to the file.|```https://example.com/kubeadm/v1.22.2/bin/linux/amd64/kubeadm```|Thridparty Source. Thirdparty file, such as binary, archive and so on, is loaded from this registry.|
-|`plugin_defaults.installation.registry`|Docker|Address without protocol, where plugins images are stored.|```example.com:5443```|Plugins Images Registry. All plugins container's images are loaded from this registry.|
+| Path                                                         |Registry Type| Format                                                                                                         |Example|Description|
+|--------------------------------------------------------------|---|----------------------------------------------------------------------------------------------------------------|---|---|
+| `services.kubeadm.imageRepository`                           |Docker| Address without protocol, where Kubernetes images are stored. It should be the full path to the repository.    |```example.com:5443/registry.k8s.io```|Kubernetes Image Repository. The system container's images such as `kubeapi` or `etcd` is loaded from this registry.|
+| `services.cri.dockerConfig.insecure-registries`              |Docker| List with addresses without a protocol.                                                                        |```example.com:5443```|Docker Insecure Registries. It is necessary for the Docker to allow the connection to addresses unknown to it.|
+| `services.cri.dockerConfig.registry-mirrors`                 |Docker| List with addresses. Each address should contain a protocol.                                                   |```https://example.com:5443```|Docker Registry Mirrors. Additional image sources for the container's images pull.|
+| `services.cri.containerdConfig.{{containerd-specific name}}` |Docker| Toml-like section with endpoints according to the containerd docs.                                             |```https://example.com:5443```||
+| `services.cri.containerdRegistriesConfig.{{registry}}`       |Docker| Toml-like section with hosts.toml content for specific registry according to the containerd docs. |```https://example.com:5443```||
+| `services.thirdparties.{{ thirdparty }}.source`              |Plain| Address with protocol or absolute path on deploy node. It should be the full path to the file.                 |```https://example.com/kubeadm/v1.22.2/bin/linux/amd64/kubeadm```|Thridparty Source. Thirdparty file, such as binary, archive and so on, is loaded from this registry.|
+| `plugin_defaults.installation.registry`                      |Docker| Address without protocol, where plugins images are stored.                                                     |```example.com:5443```|Plugins Images Registry. All plugins container's images are loaded from this registry.|
 
 **Note**: You can enter these parameters yourself, as well as override them, even if the `registry` parameter is set.
 
@@ -2275,7 +2277,8 @@ services:
 
 *Can restart service*: Always yes, `docker` or `containerd`
 
-*Overwrite files*: Yes, by default `/etc/docker/daemon.json` or `/etc/containerd/config.toml`, `/etc/crictl.yaml` and `/etc/containers/registries.conf`, backup is created
+*Overwrite files*: Yes, by default `/etc/docker/daemon.json` or `/etc/containerd/config.toml`, `/etc/crictl.yaml` and `/etc/containers/registries.conf`, backup is created. 
+Additionally, if  `plugins."io.containerd.grpc.v1.cri".registry.config_path` is defined in `services.cri.containerdConfig` specified directory will be created and filled according `services.cri.containerdRegistriesConfig`.
 
 *OS specific*: No
 
@@ -2291,6 +2294,9 @@ services:
         runtime_type: "io.containerd.runc.v2"
       plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options:
         SystemdCgroup: true
+      # This parameter is added, if no registry.mirrors and registry.configs.tls specified:
+      plugins."io.containerd.grpc.v1.cri".registry:
+        config_path: "/etc/containerd/certs.d"
     dockerConfig:
       ipv6: False
       log-driver: json-file
@@ -2319,30 +2325,71 @@ services:
     containerdConfig:
       plugins."io.containerd.grpc.v1.cri":
         sandbox_image: registry.k8s.io/pause:3.2
+```
+
+Also, it is possible to specify registries configuration in registries hosts format using `containerdRegistriesConfig` section:
+```yaml
+services:
+  cri:
+    containerRuntime: containerd
+    containerdRegistriesConfig:
+      artifactory.example.com:5443:
+        host."https://artifactory.example.com:544":
+          capabilities: [ "pull", "resolve" ]
+```
+
+If `containerdRegistriesConfig` is specified, registries hosts configuration is placed in `/etc/containerd/certs.d` directory by default.
+It's possible to override this value `plugins."io.containerd.grpc.v1.cri".registry.config_path` in `containerdConfig`:
+```yaml
+services:
+  cri:
+    containerRuntime: containerd
+    containerdConfig:
+      plugins."io.containerd.grpc.v1.cri".registry:
+        config_path: "/etc/containerd/registries"
+    containerdRegistriesConfig:
+      artifactory.example.com:5443:
+        host."https://artifactory.example.com:544":
+          capabilities: [ "pull", "resolve" ]
+```
+
+**Note**: it's possible to specify registries using `registry.mirrors` and `registries.configs.tls`, but it's not recommended, 
+because this approach is deprecated by containerd team since containerd v1.5.0:
+```yaml
+services:
+  cri:
+    containerRuntime: containerd
+    containerdConfig:
       plugins."io.containerd.grpc.v1.cri".registry.mirrors."artifactory.example.com:5443":
         endpoint:
         - https://artifactory.example.com:5443
+      plugins."io.containerd.grpc.v1.cri".registry.configs."artifactory.example.com:5443".tls:
+        insecure_skip_verify: true
 ```
 
-When the registry requires an authentication, `containerdConfig` should be similar to the following:
+**Note**: `registry.mirrors` and `registries.configs.tls` can't be used with `config_path` or `containerdRegistriesConfig`
+because it's restricted by containerd. In that case kubemarine fails with exception during enrichment.
+
+Although, `registry.mirrors` and `registries.configs` are deprecated, when the registry requires an authentication, 
+it should be specified using `registries.configs.auth`, as in following example:
 
 ```yaml
 services:
   cri:
     containerRuntime: containerd
     containerdConfig:
-      plugins."io.containerd.grpc.v1.cri".registry.configs."private-registry:5000".tls:
-        insecure_skip_verify: true
       plugins."io.containerd.grpc.v1.cri".registry.configs."private-registry:5000".auth:
         auth: "bmMtdXNlcjperfr="
-      plugins."io.containerd.grpc.v1.cri".registry.mirrors."private-registry:5000":
-        endpoint:
-        - https://private-registry:5000
+    containerdRegistriesConfig:
+      private-registry:5000:
+        host."https://private-registry:5000":
+          capabilities: [ "pull", "resolve" ]
+          skip_verify: true
 ```
 
 Where, `auth: "bmMtdXNlcjperfr="` field is `username:password` string in base64 encoding.
 
-Note how `containerdConfig` section reflects the toml format structure.
+Note how `containerdConfig` and `containerdRegistriesConfig.<registry>` sections reflect the toml format structure.
 For more details on containerd configuration, refer to the official containerd configuration file documentation at [https://github.com/containerd/containerd/blob/main/docs/cri/config.md](https://github.com/containerd/containerd/blob/main/docs/cri/config.md).
 By default, the following parameters are used for `containerdConfig`:
 
@@ -2355,6 +2402,9 @@ services:
         runtime_type: "io.containerd.runc.v2"
       plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options:
         SystemdCgroup: true
+      # This parameter is added, if no registry.mirrors and registry.configs.tls specified:
+      plugins."io.containerd.grpc.v1.cri".registry:
+        config_path: "/etc/containerd/certs.d"
 ```
 
 **Note**: When containerd is used, `crictl` binary is also installed and configured as required.
@@ -2508,15 +2558,24 @@ services:
 
 *Can restart service*: Always yes, container kube-apiserver.
 
-*OS specific*: No.
+*Overwrite files*: Yes, `/etc/kubernetes/audit-policy.yaml` backup is created.
 
-*Logging level*:
+*OS specific*: No
+
+For more information about Kubernetes auditing, refer to the official documentation at [https://kubernetes.io/docs/tasks/debug/debug-cluster/audit/](https://kubernetes.io/docs/tasks/debug/debug-cluster/audit/).
+
+**Logging level**:
 `None` - do not log;
 `Metadata` — log request metadata: user, request time, target resource (pod, namespace, etc.), action type (verb), etc.;
 `Request` — log metadata and request body;
 `RequestResponse` - log metadata, request body and response body.
 
-*omitStages*: To skip any stages.
+**omitStages**: The list of stages for which no events are created.
+
+By default, the following policy is installed:
+
+<details>
+  <summary>Default Policy</summary>
 
 ```yaml
 services:
@@ -2531,6 +2590,26 @@ services:
         # Don't log read-only requests
         - level: None
           verbs: ["watch", "get", "list"]
+        # Don't log checking access by internal services
+        - level: None
+          userGroups:
+            - "system:serviceaccounts:calico-apiserver"
+            - "system:nodes"
+          verbs: ["create"]
+          resources:
+            - group: "authorization.k8s.io"
+              resources: ["subjectaccessreviews"]
+            - group: "authentication.k8s.io"
+              resources: ["tokenreviews"]
+        # Don't log update of ingress-controller-leader ConfigMap by ingress-nginx.
+        # This reproduces only for v1.2.0 and can be removed after its support stop.
+        - level: None
+          users: ["system:serviceaccount:ingress-nginx:ingress-nginx"]
+          verbs: ["update"]
+          resources:
+            - group: ""
+              resources: ["configmaps"]
+              resourceNames: ["ingress-controller-leader"]
         # Log all other resources in core and extensions at the request level.
         - level: Metadata
           verbs: ["create", "update", "patch", "delete", "deletecollection"]
@@ -2587,6 +2666,69 @@ services:
           - group: "authentication.k8s.io"
             resources: ["tokenreviews"]
           - group: "authorization.k8s.io"
+          - group: "projectcalico.org"
+            resources:
+              - bgpconfigurations
+              - bgpfilters
+              - bgppeers
+              - blockaffinities
+              - caliconodestatuses
+              - clusterinformations
+              - felixconfigurations
+              - globalnetworkpolicies
+              - globalnetworksets
+              - hostendpoints
+              - ipamconfigurations
+              - ippools
+              - ipreservations
+              - kubecontrollersconfigurations
+              - networkpolicies
+              - networksets
+              - profiles
+          - group: "crd.projectcalico.org"
+            resources:
+              - bgpconfigurations
+              - bgpfilters
+              - bgppeers
+              - blockaffinities
+              - caliconodestatuses
+              - clusterinformations
+              - felixconfigurations
+              - globalnetworkpolicies
+              - globalnetworksets
+              - hostendpoints
+              - ipamblocks
+              - ipamconfigs
+              - ipamhandles
+              - ippools
+              - ipreservations
+              - kubecontrollersconfigurations
+              - networkpolicies
+              - networksets
+```
+</details>
+
+It is possible not only to redefine the default policy, but also to extend it. For more information, refer to [List Merge Strategy](#list-merge-strategy).
+
+For example, consider you have an [operator](https://kubernetes.io/docs/concepts/extend-kubernetes/operator/) that constantly updates some Pods' labels and some ConfigMap to maintain the leadership.
+If you do not see any benefit from logging of such events, they can be disabled by specifying the following in `cluster.yaml`:
+
+```yaml
+services:
+  audit:
+    cluster_policy:
+      rules:
+      - level: None
+        userGroups: ["system:serviceaccounts:operator-namespace"]
+        verbs: ["patch", "update"]
+        namespaces: ["operator-namespace"]
+        resources:
+        - group: ""
+          resources: [pods]
+        - group: ""
+          resources: [configmaps]
+          resourceNames: [controller-leader]
+      - '<<': merge
 ```
 
 ##### Audit Daemon
@@ -3048,6 +3190,47 @@ However, it is possible to add or modify any deployment parameters of the invent
 
 `loadbalancer` configures the balancers for the Kubernetes cluster. Currently, only the Haproxy configuration can be customized.
 
+###### target_ports
+
+This section describes the ports, which are used for http/https connections from balancer nodes to workers. 
+Those parameters are specified as backend ports in haproxy configuration and as host ports in ingress-nginx-controller plugin.
+
+Default values depend on balancer availability:  
+
+<table>
+<thead>
+  <tr>
+    <th>Parameter</th>
+    <th>Type<br></th>
+    <th>Default value if balancer is presented </th>
+    <th>Default value in no-balancer clusters </th>
+  </tr>
+</thead>
+<tbody>
+  <tr>
+    <td>target_ports.http</td>
+    <td>integer</td>
+    <td>20080</td>
+    <td>80</td>
+  </tr>
+  <tr>
+    <td>target_ports.https</td>
+    <td>integer</td>
+    <td>20443</td>
+    <td>443</td>
+  </tr>
+</tbody>
+</table>
+
+If it is needed, those parameters can be overriden in `cluster.yaml`, e.g.:
+```yaml
+services:
+  loadbalancer:
+    target_ports:
+      http: 80
+      https: 443
+```
+
 ##### haproxy
 
 This section describes the configuration parameters that are applied to the **haproxy.cfg** config file, and also some Kubemarine related parameters.
@@ -3160,6 +3343,47 @@ For more information on Haproxy-related parameters, refer to the official Haprox
 
 **Note**: you can use either `config` or `config_file` if you need to use custom config instead of default.
 
+Parameter `config` allows to specify your custom config file. The priority of this option is higher than that of `config_file`, and if both are specified, `config` will be used. Example:
+
+```yaml
+services:
+  loadbalancer:
+    haproxy:
+      keep_configs_updated: True
+      config: "global
+    log /dev/log    local0
+    log /dev/log    local1 notice
+    chroot /var/lib/haproxy
+    stats socket /run/haproxy/admin.sock mode 660 level admin expose-fd listeners
+    stats timeout 30s
+    user haproxy
+    group haproxy
+    daemon
+
+    ca-base /etc/ssl/certs
+    crt-base /etc/ssl/private
+
+    ssl-default-bind-ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384
+    ssl-default-bind-ciphersuites TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256
+    ssl-default-bind-options ssl-min-ver TLSv1.2 no-tls-tickets
+
+defaults
+    log     global
+    mode    http
+    option  httplog
+    option  dontlognull
+    timeout connect 5000
+    timeout client  50000
+    timeout server  50000
+    errorfile 400 /etc/haproxy/errors/400.http
+    errorfile 403 /etc/haproxy/errors/403.http
+    errorfile 408 /etc/haproxy/errors/408.http
+    errorfile 500 /etc/haproxy/errors/500.http
+    errorfile 502 /etc/haproxy/errors/502.http
+    errorfile 503 /etc/haproxy/errors/503.http
+    errorfile 504 /etc/haproxy/errors/504.http"
+```
+
 Parameter `config_file` allows to specify path to Jinja-compiled template. Example:
 ```yaml
 services:
@@ -3173,6 +3397,7 @@ This parameter use the following context options for template rendering:
 - nodes
 - bindings
 - config_options
+- target_ports
 
 As an example of a template, you can look at [default template](/kubemarine/templates/haproxy.cfg.j2).
 
@@ -3441,12 +3666,12 @@ rbac:
       namespaces: ["kube-system"]
 ```
 
-There are three parts of PSS configuration. 
-* `pod-security` enables or disables the PSS installation
-* default profile is described in the `defaults` section and `enforce` defines the policy standard that enforces the pods
-* `exemptions` describes exemptions from default rules
+There are three parts of PSS configuration: 
+* `pod-security` enables or disables the PSS installation.
+* The default profile is described in the `defaults` section and `enforce` defines the policy standard that enforces the pods.
+* `exemptions` describes the exemptions from default rules.
 
-The PSS enabling requires special labels for plugin namespaces such as `nginx-ingress-controller`, `kubernetes-dashboard`, and `local-path-provisioner`. For instance:
+PSS enabling requires special labels for plugin namespaces such as `nginx-ingress-controller`, `kubernetes-dashboard`, `local-path-provisioner`, and `calico` (relevant only for `calico-apiserver` namespace). For instance:
 
 ```yaml
 apiVersion: v1
@@ -3596,6 +3821,7 @@ After applying the plugin configurations, the plugin installation procedure wait
 * coredns
 * calico-kube-controllers
 * calico-node
+* calico-apiserver
 
 If the pods do not have time to start at a specific timeout, then the plugin configuration is incorrect. In this case, the installation is aborted.
 
@@ -3614,7 +3840,7 @@ plugins:
     node:
       image: calico/node:v3.10.1
     env:
-      FELIX_USAGEREPORTINGENABLED: true
+      FELIX_USAGEREPORTINGENABLED: 'true'
 
 ```
 
@@ -3678,18 +3904,21 @@ The plugin configuration supports the following parameters:
 | mode                   | string  | `ipip`                              | `ipip` / `vxlan`                                 | Network protocol to be used in network plugin                      |
 | crossSubnet            | boolean | `true`                              | true/false                                       | Enables crossing subnet boundaries to improve network performance  |
 | mtu                    | int     | `1440`                              | MTU size on interface - 50                       | MTU size for Calico interface                                      |
-| fullmesh               | boolean | true                                | true/false                                       | Enable of disable full mesh BGP topology                           |
+| fullmesh               | boolean | true                                | true/false                                       | Enable or disable full mesh BGP topology                           |
 | announceServices       | boolean | false                               | true/false                                       | Enable announces of ClusterIP services CIDR through BGP            |
-| defaultAsNumber        | int     | 64512                               |                                                  | AS Number to be used by default for this cluster                   |
+| defaultAsNumber        | int     | 64512                               |                                                  | AS Number to be used by default for the cluster                  |
 | globalBgpPeers         | list    | []                                  | list of (IP,AS) pairs                            | List of global BGP Peer (IP,AS) values                             |
 | typha.enabled          | boolean | `true` or `false`                   | If nodes < 4 then `false` else `true`            | Enables the [Typha Daemon](https://github.com/projectcalico/typha) |
-| typha.replicas         | int     | <code>{{ (((nodes&#124;length)/50) + 2) &#124; round(1) }}</code> | Starts from 2 replicas amd increments for every 50 nodes | Number of Typha running replicas |
+| typha.replicas         | int     | <code>{{ (((nodes&#124;length)/50) + 2) &#124; round(1) }}</code> | Starts from 2 replicas and increments for every 50 nodes | Number of Typha running replicas. |
 | typha.image            | string  | `calico/typha:{calico.version}`     | Should contain both image name and version       | Calico Typha image                                                 |
-| typha.tolerations      | list    | [Default Typha Tolerations](#default-typha-tolerations) | list of tolerations          | Additional custom tolerations for calico-typha pods                |
+| typha.tolerations      | list    | [Default Typha Tolerations](#default-typha-tolerations) | list of extra tolerations    | Additional custom tolerations for calico-typha pods                |
 | cni.image              | string  | `calico/cni:{calico.version}`                | Should contain both image name and version | Calico CNI image                                                |
 | node.image             | string  | `calico/node:{calico.version}`               | Should contain both image name and version | Calico Node image                                               |
 | kube-controllers.image | string  | `calico/kube-controllers:{calico.version}`   | Should contain both image name and version | Calico Kube Controllers image                                   |
+| kube-controllers.tolerations | list | Original kube-controllers tolerations     | list of extra tolerations                  | Additional custom toleration for calico-kube-controllers pods   |
 | flexvol.image          | string  | `calico/pod2daemon-flexvol:{calico.version}` | Should contain both image name and version | Calico Flexvol image                                            |
+| apiserver.image        | string  | `calico/apiserver:{calico.version}`          | Should contain both image name and version | Calico API server image                                         |
+| apiserver.tolerations  | list    | Original API server tolerations              | list of extra tolerations                  | Additional custom toleration for calico-apiserver pods          |
 
 ###### Default Typha Tolerations
 
@@ -3705,32 +3934,82 @@ The plugin configuration supports the following parameters:
 
 ###### Calico metrics configuration
 
-By default, no additional settings are required for metrics calico. It is enabled by default
+By default, no additional settings are required for Calico metrics. They are enabled by default.
 
-**Note**: By default, ports are used for `calico-node` : `9091` and `calico-kube-controllers` : `9094`
+**Note**: The following ports are opened for metrics: `calico-node` : `9091`, `calico-kube-controllers` : `9094`, and `calico-typha`: `9093`.
+The ports for `calico-node` and `calico-typha` are opened on the host.
+These ports are currently not configurable by means of Kubemarine.
 
-**Note**: If you want to verify how Prometheus or VictoriaMetrics will collect metrics from Calico you can use the following ServiceMonitor. For example:
+**Note**: If you use [prometheus-operator](https://github.com/prometheus-operator/prometheus-operator) or its resources in your monitoring solution,
+you can use the following ServiceMonitors to collect metrics from Calico:
+
+<details>
+  <summary>Click to expand</summary>
+
 ```yaml
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
   labels:
+    # If you use prometheus-operator,
+    # specify the custom label corresponding to the configuration of your Prometheus.serviceMonitorSelector.
+    # The same is for the other ServiceMonitors below.
     app.kubernetes.io/component: monitoring
-  name: monitoring-calico-metrics
+  name: calico-metrics
+  namespace: kube-system
+spec:
+  endpoints:
+    # You can configure custom scraping properties, but leave `port: metrics`.
+    # The same is for the other ServiceMonitors below.
+    - interval: 30s
+      port: metrics
+      scrapeTimeout: 10s
+  namespaceSelector:
+    matchNames:
+      - kube-system
+  selector:
+    matchLabels:
+      k8s-app: calico-node
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  labels:
+    app.kubernetes.io/component: monitoring
+  name: calico-kube-controllers-metrics
   namespace: kube-system
 spec:
   endpoints:
     - interval: 30s
       port: metrics
       scrapeTimeout: 10s
-  jobLabel: node-exporter
   namespaceSelector:
     matchNames:
       - kube-system
   selector:
     matchLabels:
-      k8s-app: calico
+      k8s-app: calico-kube-controllers
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  labels:
+    app.kubernetes.io/component: monitoring
+  name: calico-typha-metrics
+  namespace: kube-system
+spec:
+  endpoints:
+    - interval: 30s
+      port: metrics
+      scrapeTimeout: 10s
+  namespaceSelector:
+    matchNames:
+      - kube-system
+  selector:
+    matchLabels:
+      k8s-app: calico-typha-metrics
 ```
+</details>
 
 ###### Calico Environment Properties
 
@@ -3740,13 +4019,48 @@ It is possible to change the default Calico environment properties. To do that, 
 plugins:
   calico:
     env:
-      WAIT_FOR_DATASTORE: false
+      WAIT_FOR_DATASTORE: 'false'
       FELIX_DEFAULTENDPOINTTOHOSTACTION: DENY
 ```
 
 **Note**: In case of you use IPv6 you have to define `CALICO_ROUTER_ID` with value `hash` in `env` section. This uses a hash of the configured nodename for the router ID.
 
 For more information about the supported Calico environment variables, refer to the official Calico documentation at [https://docs.projectcalico.org/reference/node/configuration](https://docs.projectcalico.org/reference/node/configuration).
+
+###### Calico API server
+
+For details about the Calico API server, refer to the official documentation at [https://docs.tigera.io/calico/latest/operations/install-apiserver](https://docs.tigera.io/calico/latest/operations/install-apiserver).
+
+By default, the Calico API server is not installed. To install it during the Calico installation, specify the following:
+
+```yaml
+plugins:
+  calico:
+    apiserver:
+      enabled: true
+```
+
+**Note**: Calico API server requires its annual certificates' renewal.
+For more information, refer to [Configuring Certificate Renew Procedure for calico](/documentation/Maintenance.md#configuring-certificate-renew-procedure-for-calico).
+
+Kubemarine waits for the API server availability during the installation.
+If the default wait timeout does not fit, it can be extended in the same `apiserver` section of the `calico` plugin.
+
+```yaml
+plugins:
+  calico:
+    apiserver:
+      expect:
+        apiservice:
+          retries: 60
+```
+
+The following parameters are supported:
+
+| Name                                  | Type | Mandatory | Default Value | Example | Description                                          |
+|-------------------------------------- |------|-----------|---------------|---------|------------------------------------------------------|
+| `apiserver.expect.apiservice.timeout` | int  | no        | 5             | `10`    | Number of retries for the API service expect check.  |
+| `apiserver.expect.apiservice.retries` | int  | no        | 40            | `60`    | Timeout for the API service expect check in seconds. |
 
 ##### nginx-ingress-controller
 
@@ -3833,10 +4147,29 @@ For example:
       server-tokens: "False"
 ```
 Default config_map settings:
-```yaml
-  allow-snippet-annotations: "true"
-  use-proxy-protocol: "true"
-```
+
+<table>
+<thead>
+  <tr>
+    <th>Parameter</th>
+    <th>Default value if balancer is presented </th>
+    <th>Default value in no-balancer clusters </th>
+  </tr>
+</thead>
+<tbody>
+  <tr>
+    <td>allow-snippet-annotations</td>
+    <td>"true"</td>
+    <td>"true"</td>
+  </tr>
+  <tr>
+    <td>use-proxy-protocol</td>
+    <td>"true"</td>
+    <td>"false"</td>
+  </tr>
+</tbody>
+</table>
+
 **Warning**: Ingress-nginx and HAproxy use proxy protocol in the default configuration. If you are using a load balancer without a proxy protocol, it **must** also be disabled in ingress-nginx. To do this, specify `use-proxy-protocol: "false"` in configmap.
 
 * The `custom_headers` parameter sets specified custom headers before sending the traffic to backends. Before proceeding, refer to the official NGINX Ingress Controller documentation at [https://kubernetes.github.io/ingress-nginx/user-guide/nginx-configuration/configmap/](https://kubernetes.github.io/ingress-nginx/user-guide/nginx-configuration/configmap/).
@@ -4129,9 +4462,10 @@ The following table contains details about existing nodeSelector configuration o
         <td><ul>
             <li><code>typha.nodeSelector</code></li>
             <li><code>kube-controllers.nodeSelector</code></li>
+            <li><code>apiserver.nodeSelector</code></li>
         </ul></td>
         <td><code>kubernetes.io/os: linux</code></td>
-        <td>nodeSelector applicable only for calico <b>typha</b> <br> and calico <b>kube-controllers</b> containers, <br> but not for ordinary calico containers, <br> which should be deployed on all nodes</td>
+        <td>nodeSelector applicable only for calico <b>typha</b> <br>, calico <b>kube-controllers</b>, and calico <b>apiserver</b> containers, <br> but not for ordinary calico containers, <br> which should be deployed on all nodes</td>
     </tr>
     <tr>
         <td>nginx-ingress-controller</td>
@@ -4147,7 +4481,7 @@ The following table contains details about existing nodeSelector configuration o
             <li><code>dashboard.nodeSelector</code></li>
             <li><code>metrics-scraper.nodeSelector</code></li>
         </ul></td>
-        <td><code>beta.kubernetes.io/os: linux</code></td>
+        <td><code>kubernetes.io/os: linux</code></td>
         <td></td>
     </tr>
 </table>
@@ -4185,12 +4519,13 @@ The following table contains details about existing tolerations configuration op
     <tr><th>Plugin</th><th>YAML path (relative)</th><th>Default</th><th>Notes</th></tr>
     <tr>
         <td>calico</td>
-        <td>-</td>
-        <td>
-            <code>- effect: NoSchedule</code><br>
-            <code>  operator: Exists</code>
-        </td>
-        <td>tolerations are not configurable for network plugins</td>
+        <td><ul>
+            <li><code>typha.tolerations</code></li>
+            <li><code>kube-controllers.tolerations</code></li>
+            <li><code>apiserver.tolerations</code></li>
+        </ul></td>
+        <td>Delegates to default Calico tolerations except for extra <a href="#default-typha-tolerations">Default Typha Tolerations</a></td>
+        <td>tolerations are not configurable for calico-node pods</td>
     </tr>
     <tr>
         <td>nginx-ingress-controller</td>
@@ -4244,11 +4579,13 @@ The following table contains details about existing resources requests and limit
             <li><code>node.resources</code></li>
             <li><code>typha.resources</code></li>
             <li><code>kube-controllers.resources</code></li>
+            <li><code>apiserver.resources</code></li>
         </ul></td>
         <td><ul>
             <li><code>cpu=250m/None; memory=256Mi/None</code></li>
             <li><code>cpu=250m/None; memory=256Mi/None</code></li>
             <li><code>cpu=100m/None; memory=128Mi/None</code></li>
+            <li><code>cpu=50m/100m; memory=100Mi/200Mi</code></li>
         </ul></td>
     </tr>
     <tr>

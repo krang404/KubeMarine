@@ -45,6 +45,8 @@ services:
     kind: ClusterConfiguration
     kubernetesVersion: v1.26.7
     controlPlaneEndpoint: '{{ cluster_name }}:6443'
+    imageRepository: registry.k8s.io
+    dns: {}
     networking:
       podSubnet: '{% if nodes[0]["internal_address"]|isipv4 %}10.128.0.0/14{% else %}fd02::/48{% endif %}'
       serviceSubnet: '{% if nodes[0]["internal_address"]|isipv4 %}172.30.0.0/16{% else %}fd03::/112{% endif %}'
@@ -123,6 +125,7 @@ services:
     containerRuntime: containerd
     containerdConfig:
       version: 2
+      plugins."io.containerd.grpc.v1.cri": {}
       plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc:
         runtime_type: "io.containerd.runc.v2"
       plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options:
@@ -195,6 +198,26 @@ services:
         # Don't log read-only requests
         - level: None
           verbs: ["watch", "get", "list"]
+        # Don't log checking access by internal services
+        - level: None
+          userGroups:
+            - "system:serviceaccounts:calico-apiserver"
+            - "system:nodes"
+          verbs: ["create"]
+          resources:
+            - group: "authorization.k8s.io"
+              resources: ["subjectaccessreviews"]
+            - group: "authentication.k8s.io"
+              resources: ["tokenreviews"]
+        # Don't log update of ingress-controller-leader ConfigMap by ingress-nginx.
+        # This reproduces only for v1.2.0 and can be removed after its support stop.
+        - level: None
+          users: ["system:serviceaccount:ingress-nginx:ingress-nginx"]
+          verbs: ["update"]
+          resources:
+            - group: ""
+              resources: ["configmaps"]
+              resourceNames: ["ingress-controller-leader"]
         # Log all other resources in core and extensions at the request level.
         - level: Metadata
           verbs: ["create", "update", "patch", "delete", "deletecollection"]
@@ -251,6 +274,45 @@ services:
           - group: "authentication.k8s.io"
             resources: ["tokenreviews"]
           - group: "authorization.k8s.io"
+          - group: "projectcalico.org"
+            resources:
+              - bgpconfigurations
+              - bgpfilters
+              - bgppeers
+              - blockaffinities
+              - caliconodestatuses
+              - clusterinformations
+              - felixconfigurations
+              - globalnetworkpolicies
+              - globalnetworksets
+              - hostendpoints
+              - ipamconfigurations
+              - ippools
+              - ipreservations
+              - kubecontrollersconfigurations
+              - networkpolicies
+              - networksets
+              - profiles
+          - group: "crd.projectcalico.org"
+            resources:
+              - bgpconfigurations
+              - bgpfilters
+              - bgppeers
+              - blockaffinities
+              - caliconodestatuses
+              - clusterinformations
+              - felixconfigurations
+              - globalnetworkpolicies
+              - globalnetworksets
+              - hostendpoints
+              - ipamblocks
+              - ipamconfigs
+              - ipamhandles
+              - ippools
+              - ipreservations
+              - kubecontrollersconfigurations
+              - networkpolicies
+              - networksets
 
     rules:
       - '{% if services["cri"]["containerRuntime"] == "docker" %}-w /var/lib/docker -k docker{% endif %}'
@@ -359,6 +421,9 @@ services:
         maxconn: 10000
       keep_configs_updated: True
       mntc_config_location: '/etc/haproxy/haproxy_mntc.cfg'
+    target_ports:
+      http: '{% if nodes | select("has_role", "balancer") | reject("has_role", "remove_node") | first %}20080{% else %}80{% endif %}'
+      https: '{% if nodes | select("has_role", "balancer") | reject("has_role", "remove_node") | first %}20443{% else %}443{% endif %}'
 
   packages:
     cache_versions: true
@@ -436,15 +501,10 @@ plugins:
             deployments:
               - calico-kube-controllers
             pods:
-              list:
-                - coredns
-                - calico-kube-controllers
-                - calico-node
+              - coredns
+              - calico-kube-controllers
+              - calico-node
         - thirdparty: /usr/bin/calicoctl
-        - shell:
-            command: mkdir -p /etc/calico
-            groups: ['control-plane']
-            sudo: true
         - template:
             source: templates/plugins/calicoctl.cfg.j2
             destination: /etc/calico/calicoctl.cfg
@@ -457,9 +517,7 @@ plugins:
         - template:
             source: templates/plugins/calico-rr.sh.j2
             destination: /tmp/calico_rr.sh
-            apply_required: true
             apply_command: /bin/sh /tmp/calico_rr.sh
-            sudo: true
         - expect:
             daemonsets:
               - calico-node
@@ -469,6 +527,15 @@ plugins:
               - coredns
               - calico-kube-controllers
               - calico-node
+        - python:
+            module: plugins/builtin.py
+            method: apply_yaml
+            arguments:
+              plugin_name: calico
+              manifest_id: apiserver
+        - python:
+            module: plugins/calico.py
+            method: renew_apiserver_certificate
     mode: ipip
     crossSubnet: true
     natOutgoing: true
@@ -546,6 +613,25 @@ plugins:
           memory: 128Mi
     flexvol:
       image: 'calico/pod2daemon-flexvol:{{ plugins.calico.version }}'
+    apiserver:
+      image: 'calico/apiserver:{{ plugins.calico.version }}'
+      enabled: false
+      nodeSelector:
+        kubernetes.io/os: linux
+      resources:
+        requests:
+          cpu: 50m
+          memory: 100Mi
+        limits:
+          cpu: 100m
+          memory: 200Mi
+      expect:
+        apiservice:
+          timeout: 5
+          # Sometimes the container fails the liveness probe the first time for unknown reason, and restarted.
+          # The total expect timeout is set with respect to initialDelaySeconds of the livenessProbe,
+          # and current `renew_apiserver_certificate` implementation details.
+          retries: 40
 
   nginx-ingress-controller:
     version: '{{ globals.compatibility_map.software["nginx-ingress-controller"][services.kubeadm.kubernetesVersion].version }}'
@@ -572,7 +658,7 @@ plugins:
             pods:
               - ingress-nginx-controller
     config_map:
-      use-proxy-protocol: "true"
+      use-proxy-protocol: '{% if nodes | select("has_role", "balancer") | reject("has_role", "remove_node") | first %}true{% else %}false{% endif %}'
     webhook:
       image: 'ingress-nginx/kube-webhook-certgen:{{ globals.compatibility_map.software["nginx-ingress-controller"][services.kubeadm.kubernetesVersion]["webhook-version"] }}'
       # resources values are based on https://github.com/kubernetes/ingress-nginx/blob/helm-chart-4.7.1/charts/ingress-nginx/values.yaml#L598
@@ -600,11 +686,11 @@ plugins:
     ports:
       - name: http
         containerPort: 80
-        hostPort: 80
+        hostPort: '{{ services.loadbalancer.target_ports.http }}'
         protocol: TCP
       - name: https
         containerPort: 443
-        hostPort: 443
+        hostPort: '{{ services.loadbalancer.target_ports.https }}'
         protocol: TCP
       - name: prometheus
         containerPort: 10254

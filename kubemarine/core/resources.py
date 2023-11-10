@@ -63,7 +63,16 @@ class DynamicResources:
         return self._logger
 
     def raw_inventory(self) -> dict:
-        """Returns raw inventory, which does not preserve formatting and which should be read only."""
+        """
+        Returns raw inventory, that does not preserve formatting and which should be read only.
+
+        This inventory should be passed to the cluster instance.
+        It can also be used to check the user-supplied sections and values before running of the enrichment.
+
+        Note that this inventory is not compiled, so its values should be checked with care.
+
+        :return: raw inventory
+        """
         if self._raw_inventory is None:
             self._load_inventory()
 
@@ -77,10 +86,13 @@ class DynamicResources:
         return cast(dict, self._formatted_inventory)
 
     def procedure_inventory(self) -> dict:
+        """
+        :return: parsed procedure inventory that is **not yet** validated by JSON schema
+        """
         if self._procedure_inventory is None:
             if self.procedure_inventory_filepath:
                 self._procedure_inventory = utils.load_yaml(self.procedure_inventory_filepath)
-            else:
+            if not self._procedure_inventory:
                 self._procedure_inventory = {}
 
         return self._procedure_inventory
@@ -195,10 +207,13 @@ class DynamicResources:
                 # temporary cluster instance to detect initial nodes context.
                 light_cluster = self._new_cluster_instance(deepcopy(self.context))
                 light_cluster.enrich(custom_enrichment_fns=light_cluster.get_facts_enrichment_fns())
-                self._nodes_context = light_cluster.detect_nodes_context()
+                self._nodes_context = self._detect_nodes_context(light_cluster)
                 light_cluster.connection_pool.close()
 
         return self._nodes_context
+
+    def _detect_nodes_context(self, light_cluster: c.KubernetesCluster) -> dict:
+        return light_cluster.detect_nodes_context()
 
     def _new_cluster_instance(self, context: dict) -> c.KubernetesCluster:
         from kubemarine.core import flow

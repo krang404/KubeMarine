@@ -260,9 +260,9 @@ def release_calico_leaked_ips(cluster: KubernetesCluster) -> None:
 
 
 def edit_config(kubeadm_flags: str) -> str:
-    kubeadm_flags = kubernetes._config_changer(kubeadm_flags, "--container-runtime=remote")
-    return kubernetes._config_changer(kubeadm_flags,
-                           "--container-runtime-endpoint=unix:///run/containerd/containerd.sock")
+    kubeadm_flags = kubernetes.config_changer(kubeadm_flags, "--container-runtime=remote")
+    return kubernetes.config_changer(kubeadm_flags,
+                                     "--container-runtime-endpoint=unix:///run/containerd/containerd.sock")
 
 
 def migrate_cri_finalize_inventory(cluster: KubernetesCluster, inventory_to_finalize: dict) -> dict:
@@ -298,7 +298,7 @@ class MigrateCRIAction(Action):
         res.make_final_inventory()
 
 
-def main(cli_arguments: List[str] = None) -> None:
+def create_context(cli_arguments: List[str] = None) -> dict:
     cli_help = '''
         Script for automated migration from docker to containerd.
 
@@ -308,7 +308,11 @@ def main(cli_arguments: List[str] = None) -> None:
 
     parser = flow.new_procedure_parser(cli_help, tasks=tasks)
     context = flow.create_context(parser, cli_arguments, procedure="migrate_cri")
+    return context
 
+
+def main(cli_arguments: List[str] = None) -> None:
+    context = create_context(cli_arguments)
     flow.ActionsFlow([MigrateCRIAction()]).run_flow(context)
 
 
