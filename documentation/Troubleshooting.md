@@ -18,7 +18,7 @@ This section provides troubleshooting information for Kubemarine and Kubernetes 
   - [`kube-controller-manager` Unable to Sync Caches for Garbage Collector](#kube-controller-manager-unable-to-sync-caches-for-garbage-collector)
   - [Etcdctl Compaction and Defragmentation](#etcdctl-compaction-and-defragmentation)
   - [Etcdctl Defrag Return Context Deadline Exceeded](#etcdctl-defrag-return-context-deadline-exceeded)
-  - [Etcdserver Request Timeout](#etcdserver-request-rimeout)
+  - [Etcdserver Request Timeout](#etcdserver-request-timeout)
   - [Etcd Database Corruption](#etcd-database-corruption)
     - [Manual Restoration of Etcd Database](#manual-restoration-of-etcd-database)
   - [HTTPS Ingress Doesn't Work](#https-ingress-doesnt-work)
@@ -36,6 +36,7 @@ This section provides troubleshooting information for Kubemarine and Kubernetes 
   - [Failure During Installation on Ubuntu OS With Cloud-init](#failure-during-installation-on-ubuntu-os-with-cloud-init)
   - [Troubleshooting an Installation That Ended Incorrectly](#troubleshooting-an-installation-that-ended-incorrectly)
   - [Kubelet Has Conflict With Kubepods-burstable.slice and Kube-proxy Pods Stick in ContainerCreating Status](#kubelet-has-conflict-with-kubepods-burstableslice-and-kube-proxy-pods-stick-in-containercreating-status)
+  - [Upgrade Procedure to v1.28.3 Fails on ETCD Step](#upgrade-procedure-to-v1283-fails-on-etcd-step)
   - [kubectl logs and kubectl exec fail](#kubectl-logs-and-kubectl-exec-fail)
 
 # Kubemarine Errors
@@ -473,13 +474,13 @@ Failed to defragment etcd member
 
 **Symptoms**: there are such error messages in the `kubelet` logs:
 
-```commandline
+```bash
 Apr 23 06:32:33 node-9 kubelet: 2023-04-23 06:32:33.378 [ERROR][9428] ipam_plugin.go 309: Failed to release address ContainerID="8938210a16212763148e8fcc3b4785440eea07e52ff82d1f0370495ed3315ffc" HandleID="k8s-pod-network.8938210a16212763148e8fcc3b4785440eea07e52ff82d1f0370495ed3315ffc" Workload="example-workload-name" error=etcdserver: request timed out
 ```
 
 In etcd logs there are such messages:
 
-```commandline
+```bash
 2023-04-29 06:06:16.087641 W | etcdserver: failed to send out heartbeat on time (exceeded the 100ms timeout for 6.102899ms, to fa4ddfec63d549fc)
 ```
 
@@ -499,7 +500,7 @@ Then add the following flags to the `/etc/kubernetes/manifests/etcd.yaml` manife
 Also it is recommended to set different `snapshot-count` values at different control-plane nodes so they persist snapshots to the disk not simultaneously.
 Default value of `snapshot-count` is `10000`, so set it to a different value at the second and the third control-plane nodes in the `/etc/kubernetes/manifests/etcd.yaml` manifest, for example:
 
-```commandline
+```bash
 # second master: 
 --snapshot-count=11210
 # third master:
@@ -946,47 +947,6 @@ After the cause of the failure is fixed, you need to run the `upgrade` procedure
 For example, imagine you are doing the following upgrade: `1.16.12 -> 1.17.7 -> 1.18.8`. 
 In this case, if the upgrade fails on version `1.18.8`, but is completed for version `1.17.7`, you have to update `cluster.yaml` with the latest information available in the regenerated inventory (`cluster.yaml` is regenerated after each minor version upgrade) and also remove version `1.17.7` from the procedure inventory. It is absolutely fine to retry upgrades for version `X.Y.Z`, but only until the moment the upgrade starts for next version `X.Y+1.M`. It is incorrect to start upgrade to version `1.17.7` after the upgrade to version `1.18.8` is started.
 
-### Upgrade Procedure Failure, When Using Custom Kubernetes Audit Settings
-
-**Symptoms**: The `upgrade` procedure fails at some point, leaving the upgrade process incomplete. When the cluster has custom audit settings
-
-**Root cause**: Using custom audit settings without specifying them in cluster.yaml will cause the process to fail.
-
-**Solution**:  In order for the `upgrade` procedure to complete with custom audit settings, you need to specify them in cluster.yaml in the service section.
-
-**Example**:
-```yaml
-services:
-  kubeadm:
-    apiServer:
-      audit-log-path: /var/log/kubernetes/audit/audit.log
-      audit-policy-file: /etc/kubernetes/audit-policy.yaml
-      extraVolumes:
-      - name: audit
-        hostPath: /etc/kubernetes/audit-policy.yaml
-        mountPath: /etc/kubernetes/audit-policy.yaml
-        readOnly: True
-        pathType: File
-      - name: audit-log
-        hostPath: /var/log/kubernetes/audit/
-        mountPath: /var/log/kubernetes/audit/
-        readOnly: False
-        pathType: DirectoryOrCreate
-
-  audit:
-    cluster_policy:
-      apiVersion: audit.k8s.io/v1
-      kind: Policy
-      omitStages:
-        - "RequestReceived"
-      rules:
-        - level: Metadata
-          resources:
-            - group: "authentication.k8s.io"
-              resources: ["tokenreviews"]
-            - group: "authorization.k8s.io"
-            - group: "rbac.authorization.k8s.io"
-```
 ### Cannot Drain Node Because of PodDisruptionBudget
 
 **Symptoms**: The `upgrade` procedure fails during node drain because of PodDisruptionBudget (PDB) limits.
@@ -1104,6 +1064,87 @@ If other files except images and containers use the disk so that GC cannot free 
 ```
 KUBELET_KUBEADM_ARGS="--cgroup-driver=systemd --network-plugin=cni --pod-infra-container-image=registry.k8s.io/pause:3.1 --kube-reserved cpu=200m,memory=256Mi --system-reserved cpu=200m,memory=512Mi --max-pods 250 --image-gc-high-threshold 80 --image-gc-low-threshold 70"
 ```
+
+### Upgrade Procedure to v1.28.3 Fails on ETCD Step
+
+**Symptoms**:
+Upgrade procedure from v1.28.0(v1.28.1, v1.28.2 as well) to v1.28.3 fails with error message:
+
+```
+2023-11-10 11:56:44,465 CRITICAL        Command: "sudo kubeadm upgrade apply v1.28.3 -f --certificate-renewal=true --ignore-preflight-errors='Port-6443,CoreDNSUnsupportedPlugins' --patches=/etc/kubernetes/patches && sudo kubectl uncordon ubuntu && sudo systemctl restart kubelet"
+```
+
+and `debug.log` has the following message:
+
+```
+2023-11-10 11:56:44,441 140368685827904 DEBUG [__init__.upgrade_first_control_plane]    [upgrade/apply] FATAL: fatal error when trying to upgrade the etcd cluster, rolled the state back to pre-upgrade state: couldn't upgrade control plane. kubeadm has tried to recover everything into the earlier state. Errors faced: static Pod hash for component etcd on Node ubuntu did not change after 5m0s: timed out waiting for the condition
+```
+
+**Root cause**: `kubeadm v1.28.0` adds default fields that are not compatible with `kubeadm v1.28.3`
+
+**Solution**: 
+* Remove the following parts from the `etcd.yaml` manifest on each control plane node in the cluster one by one(lines are marked by `-`):
+
+```yaml
+apiVersion: v1
+kind: Pod
+...
+spec:
+  containers:
+  - command:
+      ...  
+    image: registry.k8s.io/etcd:3.5.9-0
+    imagePullPolicy: IfNotPresent
+    livenessProbe:
+      failureThreshold: 8
+      httpGet:
+        host: 127.0.0.1
+        path: /health?exclude=NOSPACE&serializable=true
+        port: 2381
+        scheme: HTTP
+      initialDelaySeconds: 10
+      periodSeconds: 10
+      successThreshold: 1
+      timeoutSeconds: 15
+    name: etcd
+    resources:
+      requests:
+        cpu: 100m
+        memory: 100Mi
+    startupProbe:
+      failureThreshold: 24
+      httpGet:
+        host: 127.0.0.1
+        path: /health?serializable=false
+        port: 2381
+        scheme: HTTP
+      initialDelaySeconds: 10
+      periodSeconds: 10
+      successThreshold: 1
+      timeoutSeconds: 15
+    terminationMessagePath: /dev/termination-log
+    terminationMessagePolicy: File
+    volumeMounts:
+    - mountPath: /var/lib/etcd
+      name: etcd-data
+    - mountPath: /etc/kubernetes/pki/etcd
+      name: etcd-certs
+  dnsPolicy: ClusterFirst
+  enableServiceLinks: true
+  hostNetwork: true
+  priority: 2000001000
+  priorityClassName: system-node-critical
+  restartPolicy: Always
+  schedulerName: default-scheduler
+  securityContext:
+    seccompProfile:
+      type: RuntimeDefault
+  terminationGracePeriodSeconds: 30
+...
+```
+
+* Wait for the ETCD restart.
+* Run upgrade procedure once again.
 
 ## Numerous Generation of `Auditd` System
 

@@ -21,8 +21,9 @@ import sys
 import time
 import tarfile
 
-from typing import Tuple, Callable, List, TextIO, cast, Union, TypeVar, Dict
+from typing import Tuple, Callable, List, TextIO, cast, Union, TypeVar, Dict, Sequence
 
+import deepdiff  # type: ignore[import-untyped]
 import yaml
 import ruamel.yaml
 from copy import deepcopy
@@ -40,8 +41,14 @@ from kubemarine.core.errors import pretty_print_error
 _T_contra = TypeVar("_T_contra", contravariant=True)
 
 
-class SupportsDunderLT(Protocol[_T_contra]):
+class SupportsAllComparisons(Protocol[_T_contra]):
     def __lt__(self, __other: _T_contra) -> bool: ...
+
+    def __gt__(self, __other: _T_contra) -> bool: ...
+
+    def __le__(self, __other: _T_contra) -> bool: ...
+
+    def __ge__(self, __other: _T_contra) -> bool: ...
 
 
 def do_fail(message: str = '', reason: Exception = None, hint: str = '', logger: log.EnhancedLogger = None) -> None:
@@ -381,7 +388,7 @@ def yaml_structure_preserver() -> ruamel.yaml.YAML:
     return ruamel_yaml
 
 
-def is_sorted(l: list, key: Callable = None) -> bool:
+def is_sorted(l: Sequence[str], key: Callable[[str], SupportsAllComparisons] = None) -> bool:
     """
     Check that the specified list is sorted.
 
@@ -394,7 +401,7 @@ def is_sorted(l: list, key: Callable = None) -> bool:
     return all(key(l[i]) <= key(l[i + 1]) for i in range(len(l) - 1))
 
 
-def map_sorted(map_: CommentedMap, key: Callable[[str], SupportsDunderLT] = None) -> CommentedMap:
+def map_sorted(map_: CommentedMap, key: Callable[[str], SupportsAllComparisons] = None) -> CommentedMap:
     """
     Check that the specified CommentedMap is sorted, or create new sorted map from it otherwise.
 
@@ -406,14 +413,14 @@ def map_sorted(map_: CommentedMap, key: Callable[[str], SupportsDunderLT] = None
         _key = key
     else:
         _key = lambda x: x
-    map_keys = list(map_)
+    map_keys: List[str] = list(map_)
     if not is_sorted(map_keys, key=_key):
         map_ = CommentedMap(sorted(map_.items(), key=lambda item: _key(item[0])))
 
     return map_
 
 
-def insert_map_sorted(map_: CommentedMap, k: str, v: object, key: Callable = None) -> None:
+def insert_map_sorted(map_: CommentedMap, k: str, v: object, key: Callable[[str], SupportsAllComparisons] = None) -> None:
     """
     Insert new item to the CommentedMap or update the value for the existing key.
     The map should be already sorted.
@@ -460,6 +467,12 @@ def true_or_false(value: Union[str, bool]) -> str:
     else:
         result = "undefined"
     return result
+
+
+def print_diff(logger: log.EnhancedLogger, diff: deepdiff.DeepDiff) -> None:
+    # Extra transformation to JSON is necessary,
+    # because DeepDiff.to_dict() returns custom nested classes that cannot be serialized to yaml by default.
+    logger.debug(yaml.safe_dump(yaml.safe_load(diff.to_json())))
 
 
 def get_version_filepath() -> str:
