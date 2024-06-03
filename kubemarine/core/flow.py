@@ -19,12 +19,13 @@ import sys
 import time
 from abc import abstractmethod, ABC
 from copy import deepcopy
-from types import FunctionType
-from typing import Type, Optional, List, Union, Sequence, Tuple, cast, Callable, Dict, Any
+from typing import Optional, List, Union, Sequence, Tuple, Dict, Any
 
-from kubemarine.core import utils, cluster as c, action, resources as res, errors, summary, log
+from kubemarine.core import utils, cluster as c, action, resources as res, errors, summary, log, defaults
 
-DEFAULT_CLUSTER_OBJ: Optional[Type[c.KubernetesCluster]] = None
+ERROR_UNRECOGNIZED_CUMULATIVE_POINT_EXCLUDE = "Unrecognized cumulative point to exclude: {point}"
+ERROR_UNRECOGNIZED_TASKS_FILTER = "Unrecognized tasks filter: {tasks}"
+
 TASK_DESCRIPTION_TEMPLATE = """
 tasks list:
     %s
@@ -46,15 +47,12 @@ class Flow(ABC):
         if isinstance(context, res.DynamicResources):
             resources = context
         else:
-            resources = res.DynamicResources(context)
+            resources = res.RESOURCES_FACTORY(context)
 
         context = resources.context
-        args: dict = context['execution_arguments']
 
         try:
-            if not args['disable_dump']:
-                utils.prepare_dump_directory(args['dump_location'],
-                                             reset_directory=not args['disable_dump_cleanup'])
+            utils.prepare_dump_directory(context)
             resources.logger()
             self._run(resources)
         except Exception as exc:
@@ -69,12 +67,12 @@ class Flow(ABC):
         logger = resources.logger()
 
         if print_summary:
-            summary.schedule_report(resources.working_context, summary.SummaryItem.EXECUTION_TIME,
+            summary.schedule_report(resources.result_context, summary.SummaryItem.EXECUTION_TIME,
                                     utils.get_elapsed_string(time_start, time_end))
-            summary.print_summary(resources.working_context, logger)
+            summary.print_summary(resources.result_context, logger)
             logger.info("SUCCESSFULLY FINISHED")
 
-        return FlowResult(resources.working_context, logger)
+        return FlowResult(resources.result_context, logger)
 
     @abstractmethod
     def _run(self, resources: res.DynamicResources) -> None:
@@ -92,16 +90,16 @@ class ActionsFlow(Flow):
 def run_actions(resources: res.DynamicResources, actions: Sequence[action.Action]) -> None:
     """
     Runs actions one by one, recreates inventory when necessary,
-    managing such resources as cluster object and raw inventory.
+    managing such resources as cluster object and inventory.
 
-    For each initialized cluster object, preserves inventory if any action is succeeded.
+    Preserve inventory each time it is recreated, or in the end if any actions are successful.
     """
 
     context = resources.context
     logger = resources.logger()
 
     successfully_performed: List[str] = []
-    last_cluster = None
+    cluster: Optional[c.KubernetesCluster] = None
     for act in actions:
         act.prepare_context(context)
 
@@ -114,18 +112,22 @@ def run_actions(resources: res.DynamicResources, actions: Sequence[action.Action
             if resources.procedure_inventory_filepath:
                 with utils.open_external(resources.procedure_inventory_filepath, "r") as stream:
                     utils.dump_file(context, stream, "procedure.yaml")
+
+        # Initialize connections early, in particular for inventory preservation.
+        resources.cluster(c.EnrichmentStage.LIGHT)
+
         try:
             logger.info(f"Running action '{act.identifier}'")
             act.run(resources)
-            act.reset_context(context)
+            resources.collect_action_result()
             successfully_performed.append(act.identifier)
         except Exception:
             if successfully_performed:
-                _post_process_actions_group(last_cluster, context, successfully_performed, failed=True)
+                _post_process_actions_group(resources, cluster, successfully_performed, failed=True)
 
             raise
 
-        last_cluster = resources.cluster_if_initialized()
+        cluster = resources.cluster_if_initialized()
 
         if act.recreate_inventory:
             if resources.inventory_filepath:
@@ -136,78 +138,129 @@ def run_actions(resources: res.DynamicResources, actions: Sequence[action.Action
                     utils.dump_file(context, stream, "%s_%s" % (inventory_file_basename, str(timestamp)))
 
             resources.recreate_inventory()
-            _post_process_actions_group(last_cluster, context, successfully_performed)
+            _post_process_actions_group(resources, cluster, successfully_performed)
             successfully_performed = []
-            last_cluster = None
+            cluster = None
 
     if successfully_performed:
-        _post_process_actions_group(last_cluster, context, successfully_performed)
+        _post_process_actions_group(resources, cluster, successfully_performed)
 
 
-def _post_process_actions_group(last_cluster: Optional[c.KubernetesCluster], context: dict,
-                                successfully_performed: list, failed: bool = False) -> None:
-    if last_cluster is None:
-        return
+def _post_process_actions_group(resources: res.DynamicResources, cluster: Optional[c.KubernetesCluster],
+                                successfully_performed: List[str],
+                                *,
+                                failed: bool = False) -> None:
+    previous_successful_cluster = cluster is not None
     try:
-        last_cluster.dump_finalized_inventory()
+        if previous_successful_cluster:
+            _dump_inventory(resources, failed)
     finally:
-        if context['preserve_inventory']:
-            last_cluster.context['successfully_performed'] = successfully_performed
-            last_cluster.context['status'] = 'failed' if failed else 'successful'
-            last_cluster.preserve_inventory()
+        _preserve_inventory(resources, successfully_performed, failed=failed, enriched=previous_successful_cluster)
 
 
-def run_tasks(resources: res.DynamicResources, tasks: dict, cumulative_points: dict = None,
-              tasks_filter: List[str] = None) -> None:
-    """
-    Filters and runs tasks.
-    """
+def _dump_inventory(resources: res.DynamicResources, failed: bool) -> None:
+    context = resources.context
 
-    if cumulative_points is None:
-        cumulative_points = {}
+    # If cluster is initialized, it is fully enriched at least to DEFAULT state.
+    # Use this state to dump all effective inventories.
+    # This is acceptable due to the following assumptions for the last action:
+    # * If successful, changes in the inventory should be moved to this state in DynamicResources.recreate_inventory().
+    # * If failed, switch to this state effectively restores the cluster to the state after previous action succeeded.
+    cluster = resources.cluster(c.EnrichmentStage.DEFAULT)
 
-    args: dict = resources.context['execution_arguments']
+    if failed:
+        # Preserve effective inventory for the last succeeded action.
+        # For debug aims, cluster_procedure.yaml can still be used.
+        defaults.dump_inventory(cluster, context, 'cluster.yaml')
 
-    tasks_filter = tasks_filter if tasks_filter is not None \
-        else [] if not args.get('tasks') else args['tasks'].split(",")
-    excluded_tasks = [] if not args.get('exclude') else args['exclude'].split(",")
-
-    logger = resources.logger()
-    logger.debug("Excluded tasks:")
-    filtered_tasks, final_list = filter_flow(tasks, tasks_filter, excluded_tasks, logger)
-    if filtered_tasks == tasks:
-        logger.debug("\tNo excluded tasks")
-
-    cluster = resources.cluster()
-
-    if args.get('without_act', False):
-        resources.context['preserve_inventory'] = False
-        cluster.log.debug('\nFurther acting manually disabled')
-        return
-
-    init_tasks_flow(cluster)
-    run_tasks_recursive(tasks, final_list, cluster, cumulative_points, [])
-    proceed_cumulative_point(cluster, cumulative_points, END_OF_TASKS,
-                             force=args.get('force_cumulative_points', False))
+    resources.dump_finalized_inventory(cluster)
 
 
-def create_empty_context(args: dict = None, procedure: str = None) -> dict:
-    if args is None:
-        args = {}
+def _preserve_inventory(resources: res.DynamicResources, successfully_performed: List[str],
+                        *,
+                        failed: bool, enriched: bool) -> None:
+    context = resources.context
+
+    context['successfully_performed'] = successfully_performed
+    context['status'] = 'failed' if failed else 'successful'
+
+    if (resources.context['preserve_inventory']
+            and not resources.context['execution_arguments'].get('without_act', False)):
+        # Light cluster is always pre-initialized before running of any action.
+        cluster = resources.cluster(c.EnrichmentStage.LIGHT)
+        cluster.preserve_inventory(context, enriched=enriched)
+
+
+class TasksAction(action.Action):
+    def __init__(self, identifier: str, tasks: dict,
+                 *,
+                 cumulative_points: dict = None,
+                 tasks_filter: List[str] = None,
+                 recreate_inventory: bool = False):
+        super().__init__(identifier, recreate_inventory=recreate_inventory)
+        self.tasks = deepcopy(tasks)
+        self.cumulative_points = cumulative_points or {}
+        self.tasks_filter = tasks_filter
+
+    def run(self, resources: res.DynamicResources) -> None:
+        """
+        Filters and runs tasks.
+        """
+
+        args: dict = resources.context['execution_arguments']
+
+        check_cumulative_points(args, self.cumulative_points)
+
+        joined_tasks_filter = ','.join(self.tasks_filter) if self.tasks_filter is not None else args.get('tasks')
+        excluded_tasks = args.get('exclude')
+
+        logger = resources.logger()
+        logger.debug("Excluded tasks:")
+        filtered_tasks, final_list = filter_flow(self.tasks, joined_tasks_filter, excluded_tasks, logger)
+        if filtered_tasks == self.tasks:
+            logger.debug("\tNo excluded tasks")
+
+        cluster = self.cluster(resources)
+
+        if args.get('without_act', False):
+            cluster.log.debug('\nFurther acting manually disabled')
+            return
+
+        init_tasks_flow(cluster)
+        run_tasks_recursive(self.tasks, final_list, cluster, self.cumulative_points, [])
+        proceed_cumulative_point(cluster, self.cumulative_points, END_OF_TASKS,
+                                 force=args.get('force_cumulative_points', False))
+
+    def cluster(self, _res: res.DynamicResources) -> c.KubernetesCluster:
+        return _res.cluster()
+
+
+def run_tasks(resources: res.DynamicResources, tasks: dict, cumulative_points: dict = None) -> None:
+    return TasksAction("", tasks, cumulative_points=cumulative_points).run(resources)
+
+
+def create_empty_context(args: dict, procedure: str) -> dict:
     return {
         "execution_arguments": deepcopy(args),
-        "nodes": {},
         'initial_procedure': procedure,
         'preserve_inventory': True,
-        'runtime_vars': {}
+        'make_finalized_inventory': True,
+        'load_inventory_silent': False,
+        'runtime_vars': {},
+        'result': ['summary_report'],
     }
 
 
-def get_task_list(tasks: dict, _task_path: str = '') -> List[str]:
+def get_task_list(tasks: dict, _task_path: str = '', leafs_only: bool = True) -> List[str]:
     result = []
     for task_name, task in tasks.items():
         __task_path = _task_path + "." + task_name if _task_path != '' else task_name
-        result.extend(get_task_list(task, __task_path) if not callable(task) else [__task_path])
+        if callable(task) or not leafs_only:
+            result.append(__task_path)
+
+        if not callable(task):
+            result.extend(get_task_list(task, __task_path, leafs_only))
+
     return result
 
 
@@ -219,22 +272,52 @@ def create_context(parser: argparse.ArgumentParser, cli_arguments: Optional[list
     parser.prog = procedure
     args = vars(parse_args(parser, args_list))
 
-    if args.get('exclude_cumulative_points_methods', '').strip() != '':
-        args['exclude_cumulative_points_methods'] = args['exclude_cumulative_points_methods'].strip().split(",")
-    else:
-        args['exclude_cumulative_points_methods'] = []
-
     context = create_empty_context(args=args, procedure=procedure)
     context["initial_cli_arguments"] = ' '.join(map(shlex.quote, args_list))
 
     return context
 
 
-def filter_flow(tasks: dict, tasks_filter: List[str], excluded_tasks: List[str],
+def split_strings_list(string_list: Optional[str]) -> List[str]:
+    if string_list is None:
+        string_list = ''
+
+    return [] if not string_list.strip() else \
+        list(filter(bool, map(str.strip, string_list.split(","))))
+
+
+def check_cumulative_points(args: dict, cumulative_points: dict) -> None:
+    exclude_points = args.get('exclude_cumulative_points_methods')
+    if not isinstance(exclude_points, list):
+        exclude_points = split_strings_list(exclude_points)
+
+    points_list = [point_method.__module__ + '.' + point_method.__qualname__ for point_method in cumulative_points]
+
+    for exclude_point in exclude_points:
+        if exclude_point not in points_list:
+            raise Exception(ERROR_UNRECOGNIZED_CUMULATIVE_POINT_EXCLUDE.format(point=exclude_point))
+
+    args['exclude_cumulative_points_methods'] = exclude_points
+
+
+def check_tasks_filter(tasks: dict, tasks_filter: List[str]) -> List[str]:
+    tasks_list = get_task_list(tasks, leafs_only=False)
+
+    for tasks_ in tasks_filter:
+        if tasks_ not in tasks_list:
+            raise Exception(ERROR_UNRECOGNIZED_TASKS_FILTER.format(tasks=tasks_))
+
+    return tasks_filter
+
+
+def filter_flow(tasks: dict, tasks_filter: Optional[str], excluded_tasks: Optional[str],
                 logger: log.EnhancedLogger = None) -> Tuple[dict, List[str]]:
     # Remove any whitespaces from filters, and split by '.'
-    tasks_path_filter = [tasks.split(".") for tasks in list(map(str.strip, tasks_filter))]
-    excluded_path_tasks = [tasks.split(".") for tasks in list(map(str.strip, excluded_tasks))]
+    tasks_path_filter = [tasks_.split(".") for tasks_ in check_tasks_filter(
+        tasks, split_strings_list(tasks_filter))]
+
+    excluded_path_tasks = [tasks_.split(".") for tasks_ in check_tasks_filter(
+        tasks, split_strings_list(excluded_tasks))]
 
     return _filter_flow_internal(tasks, tasks_path_filter, excluded_path_tasks, [], logger)
 
@@ -253,8 +336,8 @@ def _filter_flow_internal(tasks: dict, tasks_filter: List[List[str]], excluded_t
         # if task_filter is not empty - smb specified filter argument
         if tasks_filter:
             allowed = False
-            # Check if the iterable subpath is in allowed paths. For example we have to check if
-            # system_prepare.cri in allowed path system_prepare.cri.docker
+            # Check if the iterable subpath is in allowed paths. For example, we have to check if
+            # ['prepare'] is in allowed path ['prepare', 'cri']
             for task_path in tasks_filter:
                 # one of task_path, __task_path is a sublist of another
                 # check if current '__task_path' is a sublist only if 'task' is not a final task.
@@ -316,11 +399,11 @@ def new_common_parser(cli_help: str) -> argparse.ArgumentParser:
                         help='define main cluster configuration file')
 
     parser.add_argument('--ansible-inventory-location',
-                        default='./ansible-inventory.ini',
+                        default='ansible-inventory.ini',
                         help='auto-generated ansible-compatible inventory file location')
 
     parser.add_argument('--dump-location',
-                        default='./',
+                        default='.',
                         help='dump directory for intermediate files')
 
     parser.add_argument('--disable-dump',
@@ -399,30 +482,6 @@ def parse_args(parser: argparse.ArgumentParser, arguments: list) -> argparse.Nam
     return args
 
 
-def schedule_cumulative_point(cluster: c.KubernetesCluster, point_method: Callable) -> None:
-    _check_within_flow(cluster)
-
-    func = cast(FunctionType, point_method)
-    point_fullname = func.__module__ + '.' + func.__qualname__
-
-    if cluster.context['execution_arguments'].get('disable_cumulative_points', False):
-        cluster.log.verbose('Method %s not scheduled - cumulative points disabled' % point_fullname)
-        return
-
-    if point_fullname in cluster.context['execution_arguments']['exclude_cumulative_points_methods']:
-        cluster.log.verbose('Method %s not scheduled - it set to be excluded' % point_fullname)
-        return
-
-    scheduled_points = cluster.context.get('scheduled_cumulative_points', [])
-
-    if point_method not in scheduled_points:
-        scheduled_points.append(point_method)
-        cluster.context['scheduled_cumulative_points'] = scheduled_points
-        cluster.log.verbose('Method %s scheduled' % point_fullname)
-    else:
-        cluster.log.verbose('Method %s already scheduled' % point_fullname)
-
-
 def proceed_cumulative_point(cluster: c.KubernetesCluster, points_list: dict,
                              point_task_name: Union[str, object], force: bool = False) -> Dict[str, Any]:
     _check_within_flow(cluster)
@@ -459,14 +518,9 @@ def init_tasks_flow(cluster: c.KubernetesCluster) -> None:
 
 
 def add_task_to_proceeded_list(cluster: c.KubernetesCluster, task_path: str) -> None:
-    if not is_task_completed(cluster, task_path):
+    if not cluster.is_task_completed(task_path):
         cluster.context['proceeded_tasks'].append(task_path)
         utils.dump_file(cluster, "\n".join(cluster.context['proceeded_tasks'])+"\n", 'finished_tasks')
-
-
-def is_task_completed(cluster: c.KubernetesCluster, task_path: str) -> bool:
-    _check_within_flow(cluster)
-    return task_path in cluster.context['proceeded_tasks']
 
 
 def _check_within_flow(cluster: c.KubernetesCluster, check: bool = True) -> None:

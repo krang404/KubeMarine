@@ -15,8 +15,10 @@ from copy import deepcopy
 from typing import List
 
 from kubemarine.core import utils
-from . import SoftwareType, InternalCompatibility, CompatibilityMap, UpgradeConfig, UpgradeSoftware
+from . import SoftwareType, CompatibilityMap, UpgradeSoftware
 from ..tracker import SummaryTracker, ComposedTracker
+
+# pylint: disable=bad-builtin
 
 
 class UpgradePackages(UpgradeSoftware):
@@ -42,9 +44,6 @@ class UpgradePackages(UpgradeSoftware):
 
 
 class Packages(SoftwareType):
-    def __init__(self, compatibility: InternalCompatibility, upgrade_config: UpgradeConfig):
-        super().__init__(compatibility, upgrade_config)
-
     @property
     def name(self) -> str:
         return 'packages'
@@ -53,8 +52,7 @@ class Packages(SoftwareType):
         """
         Actualize compatibility_map of all packages.
         """
-        package_names = ['docker', 'containerd', 'containerdio',
-                         'haproxy', 'keepalived']
+        package_names = ['containerd', 'containerdio', 'haproxy', 'keepalived']
         k8s_versions = summary_tracker.all_k8s_versions
 
         upgrade_packages = UpgradePackages(self.upgrade_config, self.name, package_names)
@@ -93,6 +91,8 @@ def get_compatibility_version_keys(package_name: str) -> List[str]:
         keys.remove('version_rhel')
         keys.remove('version_rhel8')
         keys.remove('version_rhel9')
+    elif package_name == 'containerdio':
+        keys.remove('version_debian')
 
     return keys
 
@@ -125,6 +125,7 @@ def resolve_new_settings(compatibility_map: CompatibilityMap, package_name: str,
         package_settings = new_settings
         key = utils.version_key
         prev_k8s_version = max((v for v in package_mapping if key(v) < key(k8s_version)),
+                               key=key,
                                default=None)
         if prev_k8s_version is not None:
             print(f"Mapping for package {package_name!r} and Kubernetes {k8s_version} does not exist. "

@@ -20,6 +20,8 @@ from ruamel.yaml import CommentedMap
 from kubemarine.core import utils, static
 from .shell import info, run
 
+# pylint: disable=bad-builtin
+
 YAML = utils.yaml_structure_preserver()
 RESOURCE_PATH = utils.get_internal_resource_path("resources/configurations/compatibility/kubernetes_versions.yaml")
 
@@ -64,13 +66,19 @@ class KubernetesVersions:
         mandatory_fields.update(['crictl'])
         optional_fields = {
             'webhook', 'metrics-scraper', 'busybox',
-            # Although we are able to operate with pause image, custom version is not fully supported,
-            # because pause image version is not enriched when installing in public.
+            # To support custom pause image, it is necessary to implement software upgrade patch.
             # 'pause',
         }
 
         compatibility_map = self._kubernetes_versions['compatibility_map']
+        unique_version_keys = set()
         for k8s_version, software in compatibility_map.items():
+            version_key = utils.version_key(k8s_version)
+            if version_key in unique_version_keys:
+                raise Exception(f"Only one release or release candidate is supported "
+                                f"for v{'.'.join(map(str, version_key))}")
+
+            unique_version_keys.add(version_key)
             missing_mandatory = mandatory_fields - set(software)
             if missing_mandatory:
                 raise Exception(f"Missing {', '.join(map(repr, missing_mandatory))} software "

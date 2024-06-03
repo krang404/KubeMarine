@@ -12,30 +12,55 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import json
 import pathlib
+import urllib.request
+import urllib.error
+from collections.abc import Hashable
 from textwrap import dedent
-from typing import List, Dict, Callable, Union, Sequence, Hashable
+from typing import List, Dict, Union, cast
 
 import jsonschema
+import referencing
+import referencing.exceptions
+import referencing.retrieval
 from ordered_set import OrderedSet
 
 from kubemarine.core import utils, log, errors
-from kubemarine.core.cluster import KubernetesCluster
+from kubemarine.core.cluster import KubernetesCluster, EnrichmentStage, enrichment
 
 
-def verify_inventory(inventory: dict, cluster: KubernetesCluster) -> dict:
+@enrichment(EnrichmentStage.LIGHT)
+def verify_connections(cluster: KubernetesCluster) -> None:
+    inventory = utils.convert_native_yaml(cluster.inventory)
+    # Run restricted validation of sections that participate in the enrichment of connections.
+    # This is primarily needed for `do`, and `migrate_kubemarine` procedures.
+    _verify_inventory_by_schema(cluster, inventory, 'internal/connections')
+    context = cluster.context
+    args: dict = context['execution_arguments']
+    procedure = context["initial_procedure"]
+    if args.get('procedure_config') and procedure in ('add_node', 'remove_node'):
+        # Run full validation for add_node/remove_node
+        # It is currently not necessary to restrict validation to connections only as for inventory.
+        procedure_inventory = utils.convert_native_yaml(cluster.procedure_inventory)
+        _verify_inventory_by_schema(cluster, procedure_inventory, context["initial_procedure"])
+
+
+@enrichment(EnrichmentStage.FULL)
+def verify_inventory(cluster: KubernetesCluster) -> None:
+    inventory = utils.convert_native_yaml(cluster.inventory)
     _verify_inventory_by_schema(cluster, inventory, 'cluster')
     context = cluster.context
     args: dict = context['execution_arguments']
     # Skip validation if procedure inventory is optional and not provided
     if args.get('procedure_config'):
-        _verify_inventory_by_schema(cluster, cluster.procedure_inventory, context["initial_procedure"])
-    return inventory
+        procedure_inventory = utils.convert_native_yaml(cluster.procedure_inventory)
+        _verify_inventory_by_schema(cluster, procedure_inventory, context["initial_procedure"])
 
 
 def _verify_inventory_by_schema(cluster: KubernetesCluster, inventory: dict, schema_name: str) -> None:
-    for_procedure = "" if schema_name == 'cluster' else f" for procedure '{schema_name}'"
+    for_procedure = ("" if schema_name == 'cluster'
+                     else " for connections" if schema_name == 'internal/connections'
+                     else f" for procedure '{schema_name}'")
 
     root_schema_resource = f'resources/schemas/{schema_name}.json'
     root_schema_path = utils.get_internal_resource_path(root_schema_resource)
@@ -43,15 +68,10 @@ def _verify_inventory_by_schema(cluster: KubernetesCluster, inventory: dict, sch
     if not root_schema.exists():
         raise Exception(f"Failed to find schema to validate the inventory file{for_procedure}.")
 
-    with utils.open_internal(root_schema_resource) as f:
-        schema = json.load(f)
-
-    validator_cls = jsonschema.validators.validator_for(schema)
-    validator_cls.check_schema(schema)
-
     root_schema_uri = root_schema.as_uri()
-    resolver = jsonschema.RefResolver(base_uri=root_schema_uri, referrer=schema)
-    validator = validator_cls(schema, resolver=resolver)
+
+    registry = referencing.Registry(retrieve=retrieve_uri_filesystem)  # type: ignore[call-arg, var-annotated]
+    validator = jsonschema.Draft7Validator({"$ref": root_schema_uri}, registry=registry)
 
     errs = list(validator.iter_errors(inventory))
     if not errs:
@@ -82,8 +102,18 @@ def _verify_inventory_by_schema(cluster: KubernetesCluster, inventory: dict, sch
     raise errors.FailException(msg, hint=hint)
 
 
+@referencing.retrieval.to_cached_resource()  # type: ignore[arg-type]
+def retrieve_uri_filesystem(uri: str) -> str:
+    try:
+        with urllib.request.urlopen(uri) as url:
+            content: str = url.read().decode("utf-8")
+            return content
+    except urllib.error.URLError:
+        raise referencing.exceptions.NoSuchResource(ref=uri) from None  # type: ignore[call-arg]
+
+
 def _resolve_errors(errs: List[jsonschema.ValidationError]) -> List[jsonschema.ValidationError]:
-    key = _extended_relevance()
+    key = _extended_relevance
     for error in errs:
         _unnest_errors(error)
 
@@ -112,6 +142,7 @@ def _unnest_errors(error: jsonschema.ValidationError) -> None:
     subschemas_errors = list(errors_by_subschema.values())
     _unnest_type_subschema_errors(error, subschemas_errors)
     _unnest_enum_subschema_errors(error, subschemas_errors)
+    _unnest_required_subschema_errors(error, subschemas_errors)
 
 
 def _descend_errors(error: jsonschema.ValidationError) -> List[jsonschema.ValidationError]:
@@ -132,7 +163,7 @@ def _descend_errors(error: jsonschema.ValidationError) -> List[jsonschema.Valida
     for child in context:
         errors_by_subschema.setdefault(child.schema_path[0], []).append(child)
 
-    key = _extended_relevance()
+    key = _extended_relevance
 
     for errors in errors_by_subschema.values():
         errors.sort(key=key, reverse=True)
@@ -165,7 +196,7 @@ def _unnest_type_subschema_errors(error: jsonschema.ValidationError,
                 break
         else:  # not found error with "type" validation failed for root instance.
             break
-    else:  # not found subschema not containing the necessary error, i. e. all subschemas has necessary error
+    else:  # not found subschema not containing the necessary error, i.e. all subschemas have necessary error
         reprs = ", ".join(repr(type) for type in expected_types)
         for child in error.context:
             child.parent = None
@@ -190,7 +221,7 @@ def _unnest_enum_subschema_errors(error: jsonschema.ValidationError,
                 break
         else:  # not found error with "enum" validation failed for root instance.
             break
-    else:  # not found subschema not containing the necessary error, i. e. all subschemas has necessary error
+    else:  # not found subschema not containing the necessary error, i.e. all subschemas have necessary error
         for child in error.context:
             child.parent = None
         error.context = []
@@ -201,22 +232,71 @@ def _unnest_enum_subschema_errors(error: jsonschema.ValidationError,
         subschemas_errors.clear()
 
 
-def _extended_relevance() -> Callable[[jsonschema.ValidationError], tuple]:
+def _unnest_required_subschema_errors(error: jsonschema.ValidationError,
+                                      subschemas_errors: List[List[jsonschema.ValidationError]]) -> None:
+    if not error.context:
+        return
+
+    required_sets: List[List[str]] = []
+    for errs in subschemas_errors:
+        if len(errs) > 1:
+            # Support only the case when all subschema failed with the only 'required' validation.
+            # This is a common pattern if "at least one property from the set is required" requirement
+            # is moved to the separate "allOf (anyOf (required prop1, required prop2)) subschema.
+            break
+        for child in errs:
+            if (_validated_by(child, "required") and len(child.relative_path) == 0
+                    and list(child.schema_path)[1:] == ["required"] and len(child.validator_value) > 0
+                    and child.validator_value != ['<<']):
+                if isinstance(child.validator_value[0], str):
+                    required_sets.append(child.validator_value)
+                else:
+                    required_sets.extend(child.validator_value)
+                break
+        else:  # not found error with "required" validation failed for root instance.
+            break
+    # not found subschema not containing the only necessary error,
+    # i.e. all subschemas have the only necessary error
+    else:
+        initial_validator = cast(str, error.validator)
+
+        for child in error.context:
+            child.parent = None
+
+        error.context = []
+        error.validator = "required"  # type: ignore[assignment]
+        # This breaks original typing.
+        # Access to the validator_value should always be guarded with extra isinstance() checks.
+        error.validator_value = required_sets
+        error.schema_path[-1] = "required"
+        error.message = (f"{'One' if initial_validator == 'oneOf' else 'At least one'} "
+                         f"of the following property sets is required: {', '.join(map(str, required_sets))}")
+        subschemas_errors.clear()
+
+
+def _extended_relevance(error: jsonschema.ValidationError) -> tuple:
+    # jsonschema v4.22.0 introduced an improvement of default relevance for `anyOf` / `oneOf`.
+    # It solves the problem very partially, and we have own algorithm more suitable for our schemes.
+    # Pin algorithm of jsonschema.exceptions.relevance for jsonschema < 4.22.0
+    is_week = any(_validated_by(error, validator)
+                  for validator in jsonschema.exceptions.WEAK_MATCHES)
+    matches_type = error._matches_type()  # type: ignore[attr-defined] # pylint: disable=protected-access
+    relevance_value: tuple = (      # prefer errors which are ...
+        -len(error.path),           # 'deeper' and thereby more specific
+        not is_week,                # for a non-low-priority keyword
+        not matches_type,           # at least match the instance's type
+    )                               # otherwise we'll treat them the same
+
     # The extended relevance function is intended to improve heuristic for oneOf|anyOf,
     # when it is necessary to choose the most suitable branch.
-
-    def relevance(error: jsonschema.ValidationError) -> tuple:
-        relevance_value: tuple = jsonschema.exceptions.relevance(error)  # type: ignore[assignment]
-        if error.parent is None:
-            return relevance_value
-
-        relevance_value = _apply_property_names_heuristic(error, relevance_value)
-        relevance_value = _apply_list_merging_strong_heuristic(error, relevance_value)
-        relevance_value = _apply_required_and_optional_properties_heuristic(error, relevance_value)
-
+    if error.parent is None:
         return relevance_value
 
-    return relevance
+    relevance_value = _apply_property_names_heuristic(error, relevance_value)
+    relevance_value = _apply_list_merging_strong_heuristic(error, relevance_value)
+    relevance_value = _apply_required_and_optional_properties_heuristic(error, relevance_value)
+
+    return relevance_value
 
 
 def _apply_property_names_heuristic(error: jsonschema.ValidationError, relevance_value: tuple) -> tuple:
@@ -230,7 +310,7 @@ def _apply_property_names_heuristic(error: jsonschema.ValidationError, relevance
         # See jsonschema._validators.propertyNames. So type is always matched.
         type_matched = True
         mutate_relevance = list(relevance_value)
-        mutate_relevance[3] = not type_matched
+        mutate_relevance[2] = not type_matched
         return tuple(mutate_relevance)
 
     return relevance_value
@@ -251,7 +331,7 @@ def _apply_required_and_optional_properties_heuristic(error: jsonschema.Validati
     # Resolve oneOf|anyOf(object, object) ambiguity.
     # Currently only 'registry' section has such schema.
     # The chosen priority is:
-    # 1. If all required properties are present, than the error has lower relevance.
+    # 1. If all required properties are present, then the error has lower relevance.
     # 2. Otherwise, calculate proportion of matched properties.
 
     # By default, consider all required properties are present, and no properties are matched
@@ -280,31 +360,33 @@ def _error_msg(validator: jsonschema.Draft7Validator, error: jsonschema.Validati
     return dedent(
         f"""\
         {_friendly_msg(validator, error)}
-        On inventory{_convert_to_indices(error.absolute_path)}
+        On inventory{utils.pretty_path(error.absolute_path)}
         """.rstrip()
     )
 
 
 def _verbose_msg(validator: jsonschema.Draft7Validator, error: jsonschema.ValidationError) -> str:
-    schema_path = _convert_to_indices(list(error.absolute_schema_path)[:-1])
+    schema_path = utils.pretty_path(list(error.absolute_schema_path)[:-1])
     return dedent(
         f"""\
         {_friendly_msg(validator, error)}
         
         Failed validating {error.validator!r} in {schema_path}
-        On inventory{_convert_to_indices(error.absolute_path)}
+        On inventory{utils.pretty_path(error.absolute_path)}
         """.rstrip()
     )
 
 
 def _friendly_msg(validator: jsonschema.Draft7Validator, error: jsonschema.ValidationError) -> str:
+    # pylint: disable=too-many-return-statements
+
     if _validated_by(error, 'minProperties'):
         return f"Number of properties is less than the minimum of {error.validator_value!r}. " \
-               f"Property names: {[prop for prop in error.instance]!r}"
+               f"Property names: {list(error.instance)!r}"
 
     if _validated_by(error, 'maxProperties'):
         return f"Number of properties is greater than the maximum of {error.validator_value!r}. " \
-               f"Property names: {[prop for prop in error.instance]!r}"
+               f"Property names: {list(error.instance)!r}"
 
     if _validated_by(error, 'minItems'):
         return f"Number of items equal to {len(error.instance)} is less than the minimum of {error.validator_value!r}"
@@ -317,16 +399,16 @@ def _friendly_msg(validator: jsonschema.Draft7Validator, error: jsonschema.Valid
         expected_types = [value] if isinstance(value, str) else value
         reprs = ", ".join(repr(type) for type in expected_types)
         try:
-            for type in validator.TYPE_CHECKER._type_checkers:
-                if validator.is_type(error.instance, type):  # type: ignore[no-untyped-call]
-                    return f"Actual instance type is {type!r}. Expected: {reprs}."
+            for type_ in validator.TYPE_CHECKER._type_checkers:  # pylint: disable=protected-access
+                if validator.is_type(error.instance, type_):  # type: ignore[no-untyped-call]
+                    return f"Actual instance type is {type_!r}. Expected: {reprs}."
         except (AttributeError, TypeError, jsonschema.exceptions.UnknownType):
             # In current 3rd-party version the error should not appear, but let's still fall back to default behaviour
             pass
 
-    if _validated_by(error, 'not') and isinstance(error.validator_value, dict) \
-            and error.validator_value.get('enum', {}) == ['<<'] and "propertyNames" in error.schema_path:
-        return "Property name '<<' is unexpected"
+    if (_validated_by(error, 'not') and isinstance(error.validator_value, dict)
+            and set(error.validator_value) == {'enum'} and "propertyNames" in error.schema_path):
+        return f"Property name {error.instance!r} is unexpected"
 
     if _validated_by(error, 'enum'):
         if "propertyNames" not in error.schema_path:
@@ -339,9 +421,3 @@ def _friendly_msg(validator: jsonschema.Draft7Validator, error: jsonschema.Valid
 
 def _validated_by(error: jsonschema.ValidationError, expected: str) -> bool:
     return error.validator == expected  # type: ignore[comparison-overlap]
-
-
-def _convert_to_indices(path: Sequence[Union[str, int]]) -> str:
-    if not path:
-        return ""
-    return f"[{']['.join(repr(p) for p in path)}]"

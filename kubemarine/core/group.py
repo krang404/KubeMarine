@@ -14,27 +14,28 @@
 
 from __future__ import annotations
 
+import collections
 import io
+import itertools
 import os
 import random
-import uuid
 from abc import ABC, abstractmethod
 from types import FunctionType
 from typing import (
-    Callable, Dict, List, Union, Any, TypeVar, Mapping, Iterator, Optional, Iterable, Generic, Set, cast
+    Callable, Dict, List, Union, Any, TypeVar, Mapping, Iterator, Optional, Iterable, Generic, Set, cast, Sequence
 )
 
 from kubemarine.core import utils, log, errors
 from kubemarine.core.connections import ConnectionPool
 from kubemarine.core.executor import (
-    RawExecutor, Token, GenericResult, RunnersResult, HostToResult, Callback, TokenizedResult,
+    RawExecutor, Token, GenericResult, RunnersResult, HostToResult, Callback, TokenizedResult, UnexpectedExit,
 )
 
 NodeConfig = Dict[str, Any]
 GroupFilter = Union[Callable[[NodeConfig], bool], NodeConfig]
 
 _RESULT = TypeVar('_RESULT', bound=GenericResult, covariant=True)
-_T = TypeVar('_T')
+_T = TypeVar('_T', bound=Union['RunnersGroupResult', bool, None])
 
 
 class GenericGroupResult(Mapping[str, _RESULT]):
@@ -272,7 +273,7 @@ GROUP_SELF = TypeVar('GROUP_SELF', bound='AbstractGroup[Union[RunnersGroupResult
 
 class AbstractGroup(Generic[GROUP_RUN_TYPE], ABC):
     def __init__(self, ips: Iterable[Union[str, GROUP_SELF]], cluster: object):
-        from kubemarine.core.cluster import KubernetesCluster
+        from kubemarine.core.cluster import KubernetesCluster  # pylint: disable=cyclic-import
 
         self.cluster = cast(KubernetesCluster, cluster)
         self.nodes: Set[str] = set()
@@ -371,6 +372,7 @@ class AbstractGroup(Generic[GROUP_RUN_TYPE], ABC):
             local_stream = local_file
             group_to_upload = self._make_group(hosts_to_upload)
 
+        # pylint: disable-next=protected-access
         group_to_upload._put_with_mv(local_stream, remote_file,
                                      backup=backup, sudo=sudo, mkdir=mkdir, immutable=immutable)
 
@@ -396,7 +398,7 @@ class AbstractGroup(Generic[GROUP_RUN_TYPE], ABC):
             # for unknown reason fabric v2 can't put as sudo, and we should use WA via mv
             # also, if we need to backup the file first, then we also have to upload file to tmp first
 
-            temp_filepath = "/tmp/%s" % uuid.uuid4().hex
+            temp_filepath = utils.get_remote_tmp_path()
             self.cluster.log.verbose("Uploading to temporary file '%s'..." % temp_filepath)
 
         self._put(local_stream, temp_filepath)
@@ -450,7 +452,7 @@ class AbstractGroup(Generic[GROUP_RUN_TYPE], ABC):
         callable_path = "%s.%s" % (func.__module__, func.__name__)
         self.cluster.log.debug("Running %s: " % callable_path)
         result = action(self, **kwargs)
-        if result is not None:
+        if isinstance(result, RunnersGroupResult):
             self.cluster.log.debug(result)
 
         return result
@@ -460,17 +462,17 @@ class AbstractGroup(Generic[GROUP_RUN_TYPE], ABC):
             self.call(action)
 
     def get_online_nodes(self: GROUP_SELF, online: bool) -> GROUP_SELF:
-        online_hosts = [host for host, node_context in self.cluster.context['nodes'].items()
+        online_hosts = [host for host, node_context in self.cluster.nodes_context.items()
                         if node_context['access']['online'] == online]
         return self._make_group(online_hosts).intersection_group(self)
 
     def get_accessible_nodes(self: GROUP_SELF) -> GROUP_SELF:
-        accessible = [host for host, node_context in self.cluster.context['nodes'].items()
+        accessible = [host for host, node_context in self.cluster.nodes_context.items()
                       if node_context['access']['accessible']]
         return self._make_group(accessible).intersection_group(self)
 
     def get_sudo_nodes(self: GROUP_SELF) -> GROUP_SELF:
-        sudo = [host for host, node_context in self.cluster.context['nodes'].items()
+        sudo = [host for host, node_context in self.cluster.nodes_context.items()
                 if node_context['access']['sudo'] != "No"]
         return self._make_group(sudo).intersection_group(self)
 
@@ -480,41 +482,51 @@ class AbstractGroup(Generic[GROUP_RUN_TYPE], ABC):
 
     def get_ordered_members_configs_list(self, apply_filter: GroupFilter = None) -> List[NodeConfig]:
 
-        result = []
-        # we have to iterate strictly in order which was defined by user in config-file
-        for node in self.cluster.inventory['nodes']:
+        if self.is_empty():
+            return []
+
+        result = collections.OrderedDict()
+        # We have to iterate strictly in order which was defined by user in config-file.
+        # By iterative over `previous_inventory` first we ensure that all removed nodes are at the original position,
+        # Added nodes will be at the end thus reproducing the procedure enrichment.
+        for node in itertools.chain(self.cluster.previous_inventory['nodes'], self.cluster.inventory['nodes']):
+            host = node['connect_to']
             # is iterable node from inventory is part of current NodeGroup?
-            if node['connect_to'] in self.nodes:
+            if host not in self.nodes:
+                continue
 
-                # apply filters
-                suitable = True
-                if apply_filter is not None:
-                    if callable(apply_filter):
-                        if not apply_filter(node):
+            if apply_filter is None:
+                result[host] = node
+                continue
+
+            # apply filters
+            suitable = True
+            if callable(apply_filter):
+                if not apply_filter(node):
+                    suitable = False
+            else:
+                # here intentionally there is no way to filter by values in lists field,
+                # for this you need to use custom functions.
+                # Current solution implemented in this way because the filtering strategy is
+                # unclear - do I need to include when everything matches or is partial matching enough?
+                for key, value in apply_filter.items():
+                    if node.get(key) is None:
+                        suitable = False
+                        break
+                    if isinstance(value, list):
+                        if node[key] not in value:
                             suitable = False
-                    else:
-                        # here intentionally there is no way to filter by values in lists field,
-                        # for this you need to use custom functions.
-                        # Current solution implemented in this way because the filtering strategy is
-                        # unclear - do I need to include when everything matches or is partial matching enough?
-                        for key, value in apply_filter.items():
-                            if node.get(key) is None:
-                                suitable = False
-                                break
-                            if isinstance(value, list):
-                                if node[key] not in value:
-                                    suitable = False
-                                    break
-                            # elif should definitely be here, not if
-                            elif node[key] != value:
-                                suitable = False
-                                break
+                            break
+                    # elif should definitely be here, not if
+                    elif node[key] != value:
+                        suitable = False
+                        break
 
-                # if not filtered
-                if suitable:
-                    result.append(node)
+            # if not filtered
+            if suitable:
+                result[host] = node
 
-        return result
+        return list(result.values())
 
     def get_first_member(self: GROUP_SELF, apply_filter: GroupFilter = None) -> GROUP_SELF:
         results = self.get_ordered_members_list(apply_filter)
@@ -546,21 +558,16 @@ class AbstractGroup(Generic[GROUP_RUN_TYPE], ABC):
         return self._make_group(ips)
 
     def get_nodes_names(self) -> List[str]:
-        result = []
         members = self.get_ordered_members_configs_list()
-        for node in members:
-            result.append(node['name'])
-        return result
+        return [node['name'] for node in members]
 
     def get_node_name(self) -> str:
-        if len(self.nodes) != 1:
-            raise Exception("Cannot get the only name from not a single node")
-
-        return self.get_nodes_names()[0]
+        name: str = self.get_config()['name']
+        return name
 
     def get_hosts(self) -> List[str]:
-        members = self.get_ordered_members_list()
-        return [node.get_host() for node in members]
+        members = self.get_ordered_members_configs_list()
+        return [node['connect_to'] for node in members]
 
     def get_host(self) -> str:
         if len(self.nodes) != 1:
@@ -580,29 +587,19 @@ class AbstractGroup(Generic[GROUP_RUN_TYPE], ABC):
     def has_node(self, node_name: str) -> bool:
         return node_name in self.get_nodes_names()
 
-    def get_new_nodes(self: GROUP_SELF) -> GROUP_SELF:
-        return self.new_group(lambda node: 'add_node' in node['roles'])
+    def having_roles(self: GROUP_SELF, roles: Sequence[str]) -> GROUP_SELF:
+        candidate_hosts = set()
+        for role in roles:
+            candidate_nodes = (self.cluster.previous_nodes, self.cluster.nodes)
+            if not any(role in nodes for nodes in candidate_nodes):
+                self.cluster.log.verbose(f'Group {role!r} is requested for usage, but this group does not exist.')
+                continue
 
-    def get_new_nodes_or_self(self: GROUP_SELF) -> GROUP_SELF:
-        new_nodes = self.get_new_nodes()
-        if not new_nodes.is_empty():
-            return new_nodes
-        return self
+            for nodes in candidate_nodes:
+                if role in nodes:
+                    candidate_hosts.update(nodes[role].nodes)
 
-    def get_nodes_for_removal(self: GROUP_SELF) -> GROUP_SELF:
-        return self.new_group(lambda node: 'remove_node' in node['roles'])
-
-    def get_changed_nodes(self: GROUP_SELF) -> GROUP_SELF:
-        return self.get_new_nodes().include_group(self.get_nodes_for_removal())
-
-    def get_unchanged_nodes(self: GROUP_SELF) -> GROUP_SELF:
-        return self.exclude_group(self.get_changed_nodes())
-
-    def get_final_nodes(self: GROUP_SELF) -> GROUP_SELF:
-        return self.new_group(lambda node: 'remove_node' not in node['roles'])
-
-    def get_initial_nodes(self: GROUP_SELF) -> GROUP_SELF:
-        return self.new_group(lambda node: 'add_node' not in node['roles'])
+        return self.intersection_group(self._make_group(candidate_hosts))
 
     def nodes_amount(self) -> int:
         """
@@ -615,7 +612,8 @@ class AbstractGroup(Generic[GROUP_RUN_TYPE], ABC):
         """
         Returns the detected operating system family for group.
 
-        :return: Detected OS family, possible values: "debian", "rhel", "rhel8", "rhel9", "multiple", "unknown", "unsupported".
+        :return: Detected OS family, possible values: "debian", "rhel", "rhel8", "rhel9",
+                 "multiple", "unknown", "unsupported", "<undefined>".
         """
         return self.cluster.get_os_family_for_nodes(self.nodes)
 
@@ -626,18 +624,22 @@ class AbstractGroup(Generic[GROUP_RUN_TYPE], ABC):
         """
         return self.get_nodes_os() == 'multiple'
 
-    def get_subgroup_with_os(self: GROUP_SELF, os_family: str) -> GROUP_SELF:
+    def get_subgroup_with_os(self: GROUP_SELF, os_families: Union[str, List[str]]) -> GROUP_SELF:
         """
         Forms and returns a new group from the nodes of the original group that have a specific OS family
-        :param os_family: The name of required OS family
+        :param os_families: The name of or list of names of required OS families
         :return: NodeGroup
         """
-        if os_family not in ['debian', 'rhel', 'rhel8', 'rhel9']:
-            raise Exception('Unsupported OS family provided')
+        if not isinstance(os_families, list):
+            os_families = [os_families]
+
+        for os_family in os_families:
+            if os_family not in ['debian', 'rhel', 'rhel8', 'rhel9']:
+                raise Exception('Unsupported OS family provided')
         hosts = []
         for host in self.nodes:
             node_os_family = self.cluster.get_os_family_for_node(host)
-            if node_os_family == os_family:
+            if node_os_family in os_families:
                 hosts.append(host)
         return self._make_group(hosts)
 
@@ -649,11 +651,11 @@ class NodeGroup(AbstractGroup[RunnersGroupResult]):
     def _make_defer(self, executor: RemoteExecutor) -> DeferredGroup:
         return DeferredGroup(self.nodes, self.cluster, executor)
 
-    def new_defer(self, timeout: int = None) -> DeferredGroup:
-        return self.new_executor(timeout).group
+    def new_defer(self) -> DeferredGroup:
+        return self.new_executor().group
 
-    def new_executor(self, timeout: int = None) -> RemoteExecutor:
-        return RemoteExecutor(self, timeout=timeout)
+    def new_executor(self) -> RemoteExecutor:
+        return RemoteExecutor(self)
 
     def get(self, remote_file: str, local_file: str) -> None:
         self._do_exec("get", remote_file, local_file)
@@ -681,7 +683,7 @@ class NodeGroup(AbstractGroup[RunnersGroupResult]):
     def _do_exec(self, do_type: str, *args: object, **kwargs: Any) -> HostToResult:
         callback: Callback = kwargs.pop('callback', None)
 
-        executor = RawExecutor(self.cluster, timeout=kwargs.get('timeout'))
+        executor = RawExecutor(self.cluster)
         executor.queue(self.get_hosts(), (do_type, args, kwargs), callback=callback)
         executor.flush()
 
@@ -709,6 +711,62 @@ class NodeGroup(AbstractGroup[RunnersGroupResult]):
 
         executor = RawExecutor(self.cluster)
         return executor.wait_for_boot(self.get_hosts(), timeout, initial_boot_history)
+
+    def wait_command_successful(self, command: str,
+                                *,
+                                retries: int = 15, timeout: int = 5,
+                                hide: bool = False) -> None:
+        logger = self.cluster.log
+
+        def attempt() -> bool:
+            result = self.sudo(command, warn=True, hide=hide)
+            if hide:
+                logger.verbose(result)
+                for host in result.get_failed_hosts_list():
+                    stderr = result[host].stderr.rstrip('\n')
+                    if stderr:
+                        logger.debug(f"{host}: {stderr}")
+
+            return not result.is_any_failed()
+
+        utils.wait_command_successful(logger, attempt, retries, timeout)
+
+    def wait_commands_successful(self, commands: List[str],
+                                 *,
+                                 retries: int = 15, timeout: int = 5,
+                                 sudo: bool = True) -> None:
+        if len(self.nodes) != 1:
+            raise Exception("Waiting for few commands is currently supported only for single node")
+
+        logger = self.cluster.log
+        remained_commands = list(commands)
+
+        def attempt() -> bool:
+            defer = self.new_defer()
+            for command in remained_commands:
+                if sudo:
+                    defer.sudo(command)
+                else:
+                    defer.run(command)
+
+            try:
+                defer.flush()
+            except RemoteGroupException as e:
+                results = e.results[self.get_host()]
+                for result in results:
+                    if isinstance(result, UnexpectedExit):
+                        logger.debug(result.result.stderr)
+                        break
+                    if isinstance(result, Exception):
+                        raise
+
+                    del remained_commands[0]
+
+                return False
+
+            return True
+
+        utils.wait_command_successful(logger, attempt, retries, timeout)
 
     def get_local_file_sha1(self, filename: str) -> str:
         return utils.get_local_file_sha1(filename)
@@ -766,13 +824,13 @@ class DeferredGroup(AbstractGroup[Token]):
         return AbstractGroup.intersection_group(self, group)
 
     def _check_same_bound_executor(self, group: DeferredGroup) -> None:
-        if self._executor is not group._executor:
+        if self._executor is not group._executor:  # pylint: disable=protected-access
             raise ValueError("Trying to apply set operation on deferred groups bound to different executors")
 
 
 class RemoteExecutor(RawExecutor):
-    def __init__(self, group: NodeGroup, connection_pool: ConnectionPool = None, timeout: int = None) -> None:
-        super().__init__(group.cluster, connection_pool, timeout)
+    def __init__(self, group: NodeGroup, connection_pool: ConnectionPool = None) -> None:
+        super().__init__(group.cluster, connection_pool)
         self.group: DeferredGroup = group._make_defer(self)
         self.cluster = group.cluster
 
@@ -785,7 +843,7 @@ class RemoteExecutor(RawExecutor):
         """
         super().flush()
 
-        for host, results in self._last_results.items():
+        for results in self._last_results.values():
             if any(isinstance(result, Exception) for _, result in results.items()):
                 raise RemoteGroupException(self.cluster, self._last_results)
 
@@ -793,7 +851,7 @@ class RemoteExecutor(RawExecutor):
 class GroupException(Exception):
     def __init__(self, cluster: object, results: Dict[str, List[GenericResult]]):
         self.cluster = cluster
-        self._results = results
+        self.results = results
 
     def _make_group(self, hosts: Iterable[str]) -> NodeGroup:
         return NodeGroup(hosts, self.cluster)
@@ -813,7 +871,7 @@ class GroupException(Exception):
         :return: List with hosts
         """
         excepted_hosts: List[str] = []
-        for host, results in self._results.items():
+        for host, results in self.results.items():
             if any(isinstance(result, Exception) for result in results):
                 excepted_hosts.append(host)
         return excepted_hosts
@@ -834,7 +892,7 @@ class GroupException(Exception):
         :return: List with hosts
         """
         exited_hosts: List[str] = []
-        for host, results in self._results.items():
+        for host, results in self.results.items():
             if all(isinstance(result, RunnersResult) for result in results):
                 exited_hosts.append(host)
         return exited_hosts
@@ -853,7 +911,7 @@ class GroupException(Exception):
         # for the reason that the user code might want to print output of some commands in the batch,
         # but failed to do that because of the exception.
         host_outputs = []
-        for host, results in self._results.items():
+        for host, results in self.results.items():
             output = f"{host}:"
 
             # filter out transfer results and the last exception if present
@@ -884,4 +942,3 @@ class GroupResultException(GroupException):
 class RemoteGroupException(GroupException):
     def __init__(self, cluster: object, results: Dict[str, TokenizedResult]):
         super().__init__(cluster, {host: list(res.values()) for host, res in results.items()})
-        self.results = results

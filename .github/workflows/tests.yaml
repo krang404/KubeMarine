@@ -44,8 +44,12 @@ jobs:
           python-version: "3.9"
       # Install pylint and kubemarine with all dependencies except ansible.
       # Then uninstall only kubemarine to avoid ambiguity and to surely run pylint on sources.
-      - run: pip install pylint . && pip uninstall -y kubemarine
-      - run: pylint kubemarine scripts test --disable fixme || exit 0
+      - run: pip install .[pylint] && pip install -r requirements-pyinstaller.txt && pip uninstall -y kubemarine
+      - run: |
+          if ! pylint kubemarine scripts test ; then
+            echo -e "\033[91mCheck [tool.pylint.main] in pyproject.toml for how to fix pylint check\033[0m"
+            exit 1
+          fi
   radon:
     runs-on: ubuntu-latest
     steps:
@@ -61,11 +65,21 @@ jobs:
           xenon -a A kubemarine scripts
   mypy:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version:
+          - "3.8"
+          - "3.9"
+          - "3.10"
+          - "3.11"
+          - "3.12"
     steps:
       - uses: actions/checkout@v3
-      - uses: actions/setup-python@v4
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v4
         with:
-          python-version: "3.9"
+          python-version: ${{ matrix.python-version }}
       # Install kubemarine with all dependencies except ansible but including mypy and library stubs.
       # Then uninstall only kubemarine to avoid ambiguity and to surely run mypy on sources.
       - run: pip install .[mypy] && pip uninstall -y kubemarine

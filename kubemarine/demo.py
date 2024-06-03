@@ -15,19 +15,24 @@
 from __future__ import annotations
 
 import io
+import itertools
 import re
+import sys
 import threading
 import time
 from abc import ABC
 from copy import deepcopy
-from typing import List, Dict, Union, Any, Optional, Mapping, Iterable, IO, Tuple, cast
+from typing import List, Dict, Union, Any, Optional, Mapping, Iterable, IO, Tuple, cast, Callable
 
 import fabric  # type: ignore[import-untyped]
 import invoke
+import yaml
 
 from kubemarine import system, procedures
-from kubemarine.core.cluster import KubernetesCluster, _AnyConnectionTypes
-from kubemarine.core import connections, static
+from kubemarine.core.cluster import (
+    KubernetesCluster, _AnyConnectionTypes, EnrichmentStage, EnrichmentFunction, enrichment
+)
+from kubemarine.core import connections, static, errors, utils
 from kubemarine.core.connections import ConnectionPool
 from kubemarine.core.executor import RunnersResult, GenericResult, Token, CommandTimedOut
 from kubemarine.core.group import (
@@ -104,9 +109,19 @@ class FakeShell:
         :param args: Required command arguments
         :return: Boolean
         """
+        return self.called_times(host, do_type, args) > 0
+
+    def called_times(self, host: str, do_type: str, args: List[str]) -> int:
+        """
+        Returns number of times the specified command was executed in FakeShell for the specified connection.
+        :param host: host to check, for which the desirable command should have been executed.
+        :param do_type: The type of required command
+        :param args: Required command arguments
+        :return: number of calls
+        """
         found_entries = self.history_find(host, do_type, args)
         total_used_times: int = sum(found_entry['used_times'] for found_entry in found_entries)
-        return total_used_times > 0
+        return total_used_times
 
 
 class FakeFS:
@@ -168,64 +183,119 @@ class FakeFS:
         return result
 
 
+class FakeClusterStorage(utils.ClusterStorage):
+    def make_dir(self) -> None:
+        pass
+
+    def upload_and_rotate(self) -> None:
+        cluster = cast(FakeKubernetesCluster, self.cluster)
+        cluster.uploaded_archives.append(self.local_archive_path)
+
+    def upload_info_new_control_planes(self) -> None:
+        pass
+
+
 class FakeKubernetesCluster(KubernetesCluster):
 
     def __init__(self, *args: Any, **kwargs: Any):
-        self.fake_shell = kwargs.pop("fake_shell", FakeShell())
-        self.fake_fs = kwargs.pop("fake_fs", FakeFS())
+        self.resources: FakeClusterResources = kwargs.pop("resources")
+        self.fake_shell = self.resources.fake_shell
+        self.fake_fs = self.resources.fake_fs
+        self.uploaded_archives: List[str] = []
         super().__init__(*args, **kwargs)
 
-    def create_connection_pool(self, hosts: List[str]) -> ConnectionPool:
-        return FakeConnectionPool(self.inventory, hosts, self.fake_shell, self.fake_fs)
+    def _create_connection_pool(self, nodes: Dict[str, dict], gateway_nodes: Dict[str, dict], hosts: List[str]) -> ConnectionPool:
+        return FakeConnectionPool(nodes, gateway_nodes, hosts, self.fake_shell, self.fake_fs)
+
+    def _create_cluster_storage(self, context: dict) -> utils.ClusterStorage:
+        return FakeClusterStorage(self, context)
 
     def make_group(self, ips: Iterable[_AnyConnectionTypes]) -> FakeNodeGroup:
         return FakeNodeGroup(ips, self)
 
-    def dump_finalized_inventory(self) -> None:
-        return
 
-    def preserve_inventory(self) -> None:
-        return
-
-
-class FakeResources(DynamicResources):
-    def __init__(self, context: dict, raw_inventory: dict, procedure_inventory: dict = None,
-                 nodes_context: dict = None,
+class FakeClusterResources(DynamicResources):
+    def __init__(self, context: dict,
+                 *,
+                 nodes_context: Dict[str, Any] = None,
                  fake_shell: FakeShell = None, fake_fs: FakeFS = None):
-        super().__init__(context, True)
-        self.inventory_filepath = None
-        self.procedure_inventory_filepath = None
-        self.stored_inventory = raw_inventory
-        self.last_cluster: Optional[FakeKubernetesCluster] = None
+        super().__init__(context)
         self.fake_shell = fake_shell if fake_shell else FakeShell()
         self.fake_fs = fake_fs if fake_fs else FakeFS()
+
+        self.finalized_inventory: dict = {}
+
+        self._enrichment_functions = super().enrichment_functions()
         # Let's do not assign self._nodes_context directly to make it more close to the real enrichment.
-        self.fake_nodes_context = nodes_context
-        self._procedure_inventory = procedure_inventory
+        if nodes_context is not None:
+            fn_idx = self._enrichment_functions.index(system.detect_nodes_context)
+            self._enrichment_functions[fn_idx] = enrichment(EnrichmentStage.LIGHT)\
+                (lambda c: c.nodes_context.update(nodes_context))
 
-    def _load_inventory(self) -> None:
-        self._raw_inventory = deepcopy(self.stored_inventory)
-        self._formatted_inventory = deepcopy(self.stored_inventory)
+    @property
+    def working_inventory(self) -> dict:
+        cluster = self.cluster_if_initialized()
+        if cluster is not None:
+            return cluster.inventory
 
-    def _store_inventory(self) -> None:
-        self.stored_inventory = deepcopy(self.formatted_inventory())
+        return {}
 
-    def _detect_nodes_context(self, light_cluster: KubernetesCluster) -> dict:
-        if self.fake_nodes_context is not None:
-            return self.fake_nodes_context
+    def _store_finalized_inventory(self, finalized_inventory: dict, finalized_filename: str) -> None:
+        self.finalized_inventory = finalized_inventory
+        super()._store_finalized_inventory(finalized_inventory, finalized_filename)
 
-        return super()._detect_nodes_context(light_cluster)
+    def cluster_if_initialized(self) -> Optional[FakeKubernetesCluster]:
+        cluster = super().cluster_if_initialized()
+        return None if cluster is None else cast(FakeKubernetesCluster, cluster)
 
-    def _create_cluster(self, context: dict) -> KubernetesCluster:
-        self.last_cluster = cast(FakeKubernetesCluster, super()._create_cluster(context))
-        return self.last_cluster
+    def cluster(self, stage: EnrichmentStage = EnrichmentStage.PROCEDURE) -> FakeKubernetesCluster:
+        return cast(FakeKubernetesCluster, super().cluster(stage))
 
     def _new_cluster_instance(self, context: dict) -> FakeKubernetesCluster:
         return FakeKubernetesCluster(
-            self.raw_inventory(), context,
-            procedure_inventory=self.procedure_inventory(), logger=self.logger(),
-            fake_shell=self.fake_shell, fake_fs=self.fake_fs
+            self.inventory(), context, self.procedure_inventory(),
+            self.logger(),
+            connection_pool=self._connection_pool, nodes_context=self._nodes_context,
+            resources=self,
         )
+
+    def insert_enrichment_function(self, near: EnrichmentFunction, stages: EnrichmentStage,
+                                   fn: Callable[[KubernetesCluster], Optional[dict]],
+                                   *,
+                                   procedure: str = None,
+                                   after: bool = False) -> None:
+
+        enrichment_fn = enrichment(stages, procedures=None if procedure is None else [procedure])(fn)
+
+        idx = self._enrichment_functions.index(near)
+        if after:
+            idx += 1
+        self._enrichment_functions.insert(idx, enrichment_fn)
+
+        self._skip_default_enrichment = None
+
+    def enrichment_functions(self) -> List[EnrichmentFunction]:
+        return self._enrichment_functions
+
+
+class FakeResources(FakeClusterResources):
+    def __init__(self, context: dict, inventory: dict = None,
+                 *,
+                 procedure_inventory: dict = None,
+                 nodes_context: Dict[str, Any] = None,
+                 fake_shell: FakeShell = None, fake_fs: FakeFS = None):
+        super().__init__(context, nodes_context=nodes_context, fake_shell=fake_shell, fake_fs=fake_fs)
+        self.inventory_filepath = None
+        self.procedure_inventory_filepath = None
+        self._inventory = inventory
+        self._procedure_inventory = procedure_inventory
+
+    def _store_inventory(self, inventory: dict) -> None:
+        pass
+
+    def _store_finalized_inventory(self, finalized_inventory: dict, finalized_filename: str) -> None:
+        self.finalized_inventory = finalized_inventory
+        utils.dump_file(self, yaml.dump(finalized_inventory), finalized_filename)
 
 
 class FakeConnection(fabric.connection.Connection):  # type: ignore[misc]
@@ -256,10 +326,10 @@ class FakeConnection(fabric.connection.Connection):  # type: ignore[misc]
         return self._do("sudo", command, **kwargs)
 
     # not implemented
-    def get(self, remote_file: str, local_file: str, **kwargs: Any) -> None:
+    def get(self, remote_file: str, local_file: str, **kwargs: Any) -> None:  # pylint: disable=arguments-differ
         raise NotImplementedError("Stub for fabric Connection.get() is not implemented")
 
-    def put(self, data: Union[io.BytesIO, str], filename: str, **kwargs: Any) -> None:
+    def put(self, data: Union[io.BytesIO, str], filename: str, **kwargs: Any) -> None:  # pylint: disable=arguments-differ
         # It should return fabric.transfer.Result, but currently returns None.
         # Transfer Result is currently never handled.
         self.fake_fs.write(self.host, filename, data)
@@ -288,13 +358,25 @@ class FakeConnection(fabric.connection.Connection):  # type: ignore[misc]
                 else:
                     raise found_result
 
+            hide = kwargs.get('hide', False)
+            if found_result.hide != hide:
+                raise Exception(f"Fake result has hide={found_result.hide} while hide={hide} was requested")
+
             if i > 0:
                 final_res.stdout += command_sep + '\n' + str(prev_exited) + '\n' + command_sep + '\n'
                 final_res.stderr += command_sep + '\n'
             i += 1
 
-            final_res.stdout += found_result.stdout
-            final_res.stderr += found_result.stderr
+            for stream_t in ('stdout', 'stderr'):
+                output = getattr(found_result, stream_t)
+                if output and not hide:
+                    stream = getattr(sys, stream_t)
+                    stream.write(output)
+                    stream.flush()
+
+                final_output = getattr(final_res, stream_t)
+                setattr(final_res, stream_t, final_output + output)
+
             final_res.exited = prev_exited = found_result.exited
 
             if timeout_exception is not None:
@@ -366,16 +448,17 @@ class FakeDeferredGroup(DeferredGroup, FakeAbstractGroup[Token]):
 
 
 class FakeConnectionPool(connections.ConnectionPool):
-    def __init__(self, inventory: dict, hosts: List[str], fake_shell: FakeShell, fake_fs: FakeFS):
+    def __init__(self, nodes: Dict[str, dict], gateway_nodes: Dict[str, dict], hosts: List[str],
+                 fake_shell: FakeShell, fake_fs: FakeFS):
         self.fake_shell = fake_shell
         self.fake_fs = fake_fs
-        super().__init__(inventory, hosts)
+        super().__init__(nodes, gateway_nodes, hosts)
 
     def _create_connection_from_details(self, ip: str, conn_details: dict,
                                         gateway: fabric.connection.Connection = None,
                                         inline_ssh_env: bool = True) -> fabric.connection.Connection:
         return FakeConnection(
-            ip, self.fake_shell, self.fake_fs,
+            ip, self.fake_shell, self.fake_fs, gateway=gateway,
             user=conn_details.get('username', static.GLOBALS['connection']['defaults']['username']),
             port=conn_details.get('connection_port', static.GLOBALS['connection']['defaults']['port'])
         )
@@ -387,6 +470,8 @@ def create_silent_context(args: list = None, procedure: str = 'install') -> dict
 
     context: dict = procedures.import_procedure(procedure).create_context(args)
     context['preserve_inventory'] = False
+    context['make_finalized_inventory'] = False
+    context['load_inventory_silent'] = True
 
     parsed_args: dict = context['execution_arguments']
     parsed_args['disable_dump'] = True
@@ -395,54 +480,81 @@ def create_silent_context(args: list = None, procedure: str = 'install') -> dict
     return context
 
 
-def new_cluster(inventory: dict, procedure_inventory: dict = None, context: dict = None,
-                fake: bool = True) -> Union[KubernetesCluster, FakeKubernetesCluster]:
+def new_resources(inventory: dict, procedure_inventory: dict = None, context: dict = None,
+                  nodes_context: dict = None) -> FakeResources:
     if context is None:
         context = create_silent_context()
 
-    nodes_context = generate_nodes_context(inventory)
-    nodes_context.update(context['nodes'])
-    context['nodes'] = nodes_context
+    nds_context = generate_nodes_context(inventory, procedure_inventory, context)
+    if nodes_context is not None:
+        nds_context.update(nodes_context)
 
-    # It is possible to disable FakeCluster and create real cluster Object for some business case
-    cluster: KubernetesCluster
-    if fake:
-        cluster = FakeKubernetesCluster(inventory, context, procedure_inventory=procedure_inventory)
-    else:
-        cluster = KubernetesCluster(inventory, context, procedure_inventory=procedure_inventory)
-
-    cluster.enrich()
-    return cluster
+    return FakeResources(context, inventory,
+                         procedure_inventory=procedure_inventory, nodes_context=nds_context)
 
 
-def generate_nodes_context(inventory: dict, os_name: str = 'centos', os_version: str = '7.9',
-                           net_interface: str = 'eth0') -> dict:
+def new_cluster(inventory: dict, procedure_inventory: dict = None, context: dict = None,
+                nodes_context: dict = None) -> FakeKubernetesCluster:
+    res = new_resources(inventory, procedure_inventory, context, nodes_context)
+    try:
+        return res.cluster()
+    except errors.FailException as exc:
+        if exc.reason is not None:
+            raise exc.reason
+
+        raise
+
+
+def generate_node_context(*,
+                          online: bool = True, accessible: bool = True, sudo: str = 'Root',
+                          os_name: str = 'centos', os_version: str = '7.9',
+                          net_interface: str = 'eth0') -> dict:
     os_family = system.detect_os_family_by_name_version(os_name, os_version)
 
-    context = {}
-    for node in inventory['nodes']:
-        node_context = {
-            'access': {
-                'online': True,
-                'accessible': True,
-                'sudo': 'Root'
-            },
-            'active_interface': net_interface,
-            'os': {
-                'name': os_name,
-                'family': os_family,
-                'version': os_version
-            }
+    if not online:
+        accessible = False
+    if not accessible:
+        sudo = 'No'
+        os_name, os_version, os_family, net_interface = tuple('<undefined>' for _ in range(4))
+
+    return {
+        'access': {
+            'online': online,
+            'accessible': accessible,
+            'sudo': sudo
+        },
+        'active_interface': net_interface,
+        'os': {
+            'name': os_name,
+            'family': os_family,
+            'version': os_version
         }
+    }
+
+
+def generate_nodes_context(inventory: dict, procedure_inventory: dict = None, context: dict = None,
+                           *,
+                           os_name: str = 'centos', os_version: str = '7.9',
+                           net_interface: str = 'eth0') -> dict:
+    procedure = 'install' if context is None else context['initial_procedure']
+    if procedure_inventory is None:
+        procedure_inventory = {}
+
+    nodes = inventory['nodes']
+    if procedure == 'add_node':
+        nodes = itertools.chain(nodes, procedure_inventory.get('nodes', []))
+
+    context = {}
+    for node in nodes:
         connect_to = node['internal_address']
         if node.get('address'):
             connect_to = node['address']
-        context[connect_to] = node_context
+        context[connect_to] = generate_node_context(os_name=os_name, os_version=os_version, net_interface=net_interface)
 
     return context
 
 
-def generate_inventory(balancer: _ROLE_SPEC = 1, master: _ROLE_SPEC = 1, worker: _ROLE_SPEC = 1,
+def generate_inventory(balancer: _ROLE_SPEC = 1, control_plane: _ROLE_SPEC = 1, worker: _ROLE_SPEC = 1,
                        keepalived: _ROLE_SPEC = 0, haproxy_mntc: _ROLE_SPEC = 0) -> dict:
     inventory: dict = {
         'node_defaults': {
@@ -458,30 +570,19 @@ def generate_inventory(balancer: _ROLE_SPEC = 1, master: _ROLE_SPEC = 1, worker:
 
     id_roles_map: Dict[str, List[str]] = {}
 
-    for role_name in ['balancer', 'master', 'worker']:
-
-        item = locals()[role_name]
+    for role_name, item in (('balancer', balancer), ('control-plane', control_plane), ('worker', worker)):
 
         if isinstance(item, int):
-            ids = []
-            if item > 0:
-                for i in range(0, item):
-                    ids.append('%s-%s' % (role_name, i + 1))
-            item = ids
+            item = [f'{role_name}-{i + 1}' for i in range(item)]
 
-        if item:
-            for id_ in item:
-                roles = id_roles_map.get(id_)
-                if roles is None:
-                    roles = []
-                roles.append(role_name)
-                id_roles_map[id_] = roles
+        for id_ in item:
+            id_roles_map.setdefault(id_, []).append(role_name)
 
     ip_i = 0
 
     for id_, roles in id_roles_map.items():
         ip_i = ip_i + 1
-        if "master" in roles and worker == 0:
+        if "control-plane" in roles and worker == 0:
             roles.append('worker')
         inventory['nodes'].append({
             'name': id_,
@@ -529,12 +630,8 @@ def generate_inventory(balancer: _ROLE_SPEC = 1, master: _ROLE_SPEC = 1, worker:
 def generate_procedure_inventory(procedure: str) -> dict:
     procedure_inventory: dict = {}
     # set some commonly required properties
-    if procedure == 'manage_psp':
-        procedure_inventory['psp'] = {}
     if procedure == 'manage_pss':
         procedure_inventory['pss'] = {'pod-security': 'enabled'}
-    if procedure == 'migrate_cri':
-        procedure_inventory['cri'] = {'containerRuntime': 'containerd'}
 
     return procedure_inventory
 
@@ -552,21 +649,22 @@ def create_hosts_exception_result(hosts: List[str], exception: Exception) -> Dic
     return {host: exception for host in hosts}
 
 
-def create_nodegroup_result(group_: AbstractGroup[RunResult], stdout: str = '', stderr: str = '',
+def create_nodegroup_result(group_: AbstractGroup[RunResult], stdout: str = '', stderr: str = '', hide: bool = True,
                             code: int = 0, timeout: int = None) -> NodeGroupResult:
-    hosts_to_result = create_hosts_result(group_.get_hosts(), stdout, stderr, code, timeout)
+    hosts_to_result = create_hosts_result(group_.get_hosts(), stdout, stderr, hide, code, timeout)
     return create_nodegroup_result_by_hosts(group_.cluster, hosts_to_result)
 
 
-def create_hosts_result(hosts: List[str], stdout: str = '', stderr: str = '',
+def create_hosts_result(hosts: List[str], stdout: str = '', stderr: str = '', hide: bool = True,
                         code: int = 0, timeout: int = None) -> Dict[str, GenericResult]:
     # each host should have its own result instance.
-    return {host: create_result(stdout, stderr, code, timeout) for host in hosts}
+    return {host: create_result(stdout, stderr, hide, code, timeout) for host in hosts}
 
 
-def create_result(stdout: str = '', stderr: str = '', code: int = 0, timeout: int = None) -> GenericResult:
+def create_result(stdout: str = '', stderr: str = '', hide: bool = True,
+                  code: int = 0, timeout: int = None) -> GenericResult:
     # command and 'hide' option will be later replaced with actual
-    result = RunnersResult(["fake command"], [code], stdout=stdout, stderr=stderr)
+    result = RunnersResult(["fake command"], [code], stdout=stdout, stderr=stderr, hide=hide)
     if timeout is None:
         return result
 
@@ -579,11 +677,17 @@ def new_scheme(scheme: dict, role: str, number: int) -> dict:
     return scheme
 
 
-FULLHA: Dict[str, _ROLE_SPEC] = {'balancer': 1, 'master': 3, 'worker': 3}
-FULLHA_KEEPALIVED: Dict[str, _ROLE_SPEC] = {'balancer': 2, 'master': 3, 'worker': 3, 'keepalived': 1}
-FULLHA_NOBALANCERS: Dict[str, _ROLE_SPEC] = {'balancer': 0, 'master': 3, 'worker': 3}
-ALLINONE: Dict[str, _ROLE_SPEC] = {'master': 1, 'balancer': ['master-1'], 'worker': ['master-1'], 'keepalived': 1}
-MINIHA: Dict[str, _ROLE_SPEC] = {'master': 3}
-MINIHA_KEEPALIVED: Dict[str, _ROLE_SPEC] = {'master': 3, 'balancer': ['master-1', 'master-2', 'master-3'],
-                                            'worker': ['master-1', 'master-2', 'master-3'], 'keepalived': 1}
-NON_HA_BALANCER: Dict[str, _ROLE_SPEC] = {'balancer': 1, 'master': 3, 'worker': ['master-1', 'master-2', 'master-3']}
+FULLHA: Dict[str, _ROLE_SPEC] = {'balancer': 1, 'control_plane': 3, 'worker': 3}
+FULLHA_KEEPALIVED: Dict[str, _ROLE_SPEC] = {'balancer': 2, 'control_plane': 3, 'worker': 3, 'keepalived': 1}
+FULLHA_NOBALANCERS: Dict[str, _ROLE_SPEC] = {'balancer': 0, 'control_plane': 3, 'worker': 3}
+ALLINONE: Dict[str, _ROLE_SPEC] = {
+    'control_plane': 1, 'balancer': ['control-plane-1'], 'worker': ['control-plane-1'],
+    'keepalived': 1}
+MINIHA: Dict[str, _ROLE_SPEC] = {'control_plane': 3}
+MINIHA_KEEPALIVED: Dict[str, _ROLE_SPEC] = {
+    'control_plane': 3,
+    'balancer': ['control-plane-1', 'control-plane-2', 'control-plane-3'],
+    'worker': ['control-plane-1', 'control-plane-2', 'control-plane-3'],
+    'keepalived': 1}
+NON_HA_BALANCER: Dict[str, _ROLE_SPEC] = {
+    'balancer': 1, 'control_plane': 3, 'worker': ['control-plane-1', 'control-plane-2', 'control-plane-3']}

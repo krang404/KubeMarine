@@ -22,9 +22,13 @@ This section provides information about the Kubecheck functionality.
       - [007 RAM Amount - Control-planes](#007-ram-amount---control-planes)
       - [007 RAM Amount - Workers](#007-ram-amount---workers)
     - [008 Distributive](#008-distributive)
-    - [009 PodSubnet](#009-podsubnet)
-    - [010 ServiceSubnet](#010-servicesubnet)
-    - [011 TCPPorts](#011-tcpports)
+    - [018 FS mount options](#018-fs-mount-options)
+    - Network
+      - [009 PodSubnet](#009-podsubnet)
+      - [010 ServiceSubnet](#010-servicesubnet)
+      - [011 TCP & UDP Ports](#011-tcp--udp-ports)
+      - [016 VRRP IPs](#016-vrrp-ips)
+      - [017 IP in IP Encapsulation](#017-ip-in-ip-encapsulation)
     - [012 Thirdparties Availability](#012-thirdparties-availability)
     - [013 Package Repositories](#013-package-repositories)
     - [014 Package Availability](#014-package-availability)
@@ -38,6 +42,8 @@ This section provides information about the Kubecheck functionality.
       - [201 Kubelet Status](#201-kubelet-status)
         - [202 Nodes pid_max](#202-nodes-pid_max)
         - [203 Kubelet Version](#203-kubelet-version)
+        - [233 Kubelet Configuration](#233-kubelet-configuration)
+      - [234 kube-proxy Configuration](#234-kube-proxy-configuration)
     - [205 System Packages Versions](#205-system-packages-version)
       - [205 CRI Versions](#205-cri-versions)
       - [205 HAproxy Version](#205-haproxy-version)
@@ -156,8 +162,9 @@ The task tree is as follows:
 * network
   * pod_subnet_connectivity
   * service_subnet_connectivity
-  * check_tcp_ports
-  * thirdparties_available
+  * ports_connectivity
+  * vips_connectivity
+  * ipip_connectivity
 * hardware
   * members_amount
     * vips
@@ -175,8 +182,15 @@ The task tree is as follows:
     * workers
 * system
   * distributive
-* thirdparties
-  * availability
+  * fs_mount_options 
+* software
+  * kernel
+    * version
+  * thirdparties
+    * availability
+  * packages
+    * repositories
+    * availability
 
 ##### 001 Connectivity
 
@@ -285,11 +299,18 @@ This test checks the amount of RAM on nodes with the `control-plane` role.
 
 This test checks the amount of RAM on nodes with the `worker` role.
 
+
 ##### 008 Distributive
 
 *Task*: `system.distributive`
 
 This test checks the family and release version of the operating system on the hosts.
+
+##### 018 FS mount options
+
+*Task*: `system.fs_mount_options`
+
+This test checks the presence of filesystem mount option that affects contatiner functionality
 
 ##### 009 PodSubnet
 
@@ -303,11 +324,23 @@ This test checks the connectivity between nodes inside a pod's subnetwork.
 
 This test checks the connectivity between nodes inside the service's subnetwork.
 
-##### 011 TCPPorts
+##### 011 TCP & UDP Ports
 
-*Task*: `network.check_tcp_ports`
+*Task*: `network.ports_connectivity`
 
-This test checks if necessary ports are opened on the nodes.
+This test checks the connectivity between nodes for the predefined set of ports inside the nodes' internal subnetwork.
+
+##### 016 VRRP IPs
+
+*Task*: `network.vips_connectivity`
+
+This test checks the connectivity between nodes and the VRRP IPs when they are assigned to the balancer nodes.
+
+##### 017 IP in IP Encapsulation 
+
+*Task*: `network.ipip_connectivity`
+
+This test checks the connectivity between nodes by IP in IP encapsulation.
 
 ##### 012 Thirdparties Availability
 
@@ -367,8 +400,11 @@ The task tree is as follows:
     * configuration
   * kubelet
     * status
-    * configuration
+    * pid_max
     * version
+    * configuration
+  kube-proxy:
+    * configuration
   * packages
     * system
       * recommended_versions
@@ -431,7 +467,7 @@ This test checks the status of the Keepalived service on all hosts in the cluste
 
 *Task*: `services.container_runtime.status`
 
-This test checks the status of the Container Runtime (docker/containerd) service on all hosts in the cluster where this service is expected.
+This test checks the status of the Container Runtime (containerd) service on all hosts in the cluster where this service is expected.
 
 ###### 201 Kubelet Status
 
@@ -441,7 +477,7 @@ This test checks the status of the Kubelet service on all hosts in the cluster w
 
 ##### 202 Nodes pid_max
 
-*Task*: `services.kubelet.configuration`
+*Task*: `services.kubelet.pid_max`
 
 This test checks that kubelet `maxPods` and `podPidsLimit` are correctly aligned with kernel `pid_max`.
 
@@ -450,6 +486,19 @@ This test checks that kubelet `maxPods` and `podPidsLimit` are correctly aligned
 *Task*: `services.kubelet.version`
 
 This test checks the Kubelet version on all hosts in a cluster.
+
+##### 233 Kubelet Configuration
+
+*Task*: `services.kubelet.configuration`
+
+This test checks the consistency of the /var/lib/kubelet/config.yaml configuration
+with `kubelet-config` ConfigMap and with the inventory.
+
+##### 234 kube-proxy Configuration
+
+*Task*: `services.kube-proxy.configuration`
+
+This test checks the consistency of the `kube-proxy` ConfigMap with the inventory.
 
 ##### 204 Container Runtime Configuration Check
 
@@ -626,13 +675,15 @@ This test verifies ETCD health.
 
 *Task*: `control_plane.configuration_status`
 
-This test verifies the consistency of the configuration (image version, `extra_args`, `extra_volumes`) of static pods of Control Plain like `kube-apiserver`, `kube-controller-manager` and `kube-scheduler`.
+This test verifies the consistency of the configuration of static pods of Control Plain
+for `kube-apiserver`, `kube-controller-manager`, `kube-scheduler`, and `etcd`.
 
 ##### 221 Control Plane Health Status
 
 *Task*: `control_plane.health_status`
 
-This test verifies the health of static pods `kube-apiserver`, `kube-controller-manager` and `kube-scheduler`.
+This test verifies the health of static pods `kube-apiserver`, `kube-controller-manager`,
+`kube-scheduler`, and `etcd`.
 
 ##### 222 Default Services Configuration Status
 

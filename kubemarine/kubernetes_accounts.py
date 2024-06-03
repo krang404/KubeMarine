@@ -18,13 +18,15 @@ from typing import Optional
 import yaml
 
 from kubemarine.core import utils, summary
-from kubemarine.core.cluster import KubernetesCluster
+from kubemarine.core.cluster import KubernetesCluster, EnrichmentStage, enrichment
 
 
-def enrich_inventory(inventory: dict, _: KubernetesCluster) -> dict:
+@enrichment(EnrichmentStage.FULL)
+def enrich_inventory(cluster: KubernetesCluster) -> None:
+    inventory = cluster.inventory
     rbac = inventory['rbac']
     if not rbac.get("accounts"):
-        return inventory
+        return
 
     for i, account in enumerate(rbac["accounts"]):
         if account['configs'][0]['metadata'].get('name') is None:
@@ -42,26 +44,14 @@ def enrich_inventory(inventory: dict, _: KubernetesCluster) -> dict:
         if account['configs'][1]['subjects'][0].get('namespace') is None:
             rbac["accounts"][i]['configs'][1]['subjects'][0]['namespace'] = account['namespace']
 
-        # For Kubernetes v1.23 and lower are used legacy enrichment
-        # It has only 'ServiceAccount' and 'ClusterRoleBinding'
-        minor_version = int(inventory["services"]["kubeadm"]["kubernetesVersion"].split('.')[1])
-        if minor_version < 24:
-            if len(rbac["accounts"][i]['configs']) > 2:
-                rbac["accounts"][i]['configs'].pop(2)
-            if rbac["accounts"][i]['configs'][0].get('secrets') is not None:
-                rbac["accounts"][i]['configs'][0].pop('secrets')
-        else:
-           # This part is applicable for Kubernetes v1.24 and higher
-           # It has 'Secret' in addition 
-            if account['configs'][2]['metadata'].get('name') is None:
-                rbac["accounts"][i]['configs'][2]['metadata']['annotations']['kubernetes.io/service-account.name'] = account['name']
-                rbac["accounts"][i]['configs'][2]['metadata']['name'] = f"{account['name']}-token"
-                rbac["accounts"][i]['configs'][0]['secrets'].append({})
-                rbac["accounts"][i]['configs'][0]['secrets'][0]['name'] = f"{account['name']}-token"
-            if account['configs'][2]['metadata'].get('namespace') is None:
-                rbac["accounts"][i]['configs'][2]['metadata']['namespace'] = account['namespace']
-
-    return inventory
+        if account['configs'][2]['metadata'].get('name') is None:
+            rbac["accounts"][i]['configs'][2]['metadata']['annotations']['kubernetes.io/service-account.name'] \
+                = account['name']
+            rbac["accounts"][i]['configs'][2]['metadata']['name'] = f"{account['name']}-token"
+            rbac["accounts"][i]['configs'][0]['secrets'].append({})
+            rbac["accounts"][i]['configs'][0]['secrets'][0]['name'] = f"{account['name']}-token"
+        if account['configs'][2]['metadata'].get('namespace') is None:
+            rbac["accounts"][i]['configs'][2]['metadata']['namespace'] = account['namespace']
 
 
 def install(cluster: KubernetesCluster) -> None:
@@ -98,7 +88,7 @@ def install(cluster: KubernetesCluster) -> None:
 
         token: Optional[str] = None
         retries = cluster.globals['accounts']['retries']
-        # Token creation in Kubernetes 1.24 is not syncronus, therefore retries are necessary
+        # Token creation is not synchronous, therefore retries are necessary
         while retries > 0:
             result = cluster.nodes['control-plane'].get_first_member().sudo(load_tokens_cmd)
             token = list(result.values())[0].stdout

@@ -14,39 +14,55 @@
 
 import json
 import os
-import tempfile
 import unittest
 from typing import List, Dict
-
-from kubemarine import demo
-from kubemarine.core import flow, utils
-from kubemarine.procedures import remove_node
 from test.unit import utils as test_utils
 
+from kubemarine import demo
+from kubemarine.core import utils, flow
+from kubemarine.procedures import remove_node, install
 
-class EnrichmentAndFinalization(unittest.TestCase):
+
+class EnrichmentAndFinalization(test_utils.CommonTest):
     def setUp(self) -> None:
-        self.tmpdir = tempfile.TemporaryDirectory()
         self.context = demo.create_silent_context(['fake_path.yaml', '--without-act'], procedure='remove_node')
 
         self.nodes_context = {}
         self.inventory = {}
         self.remove_node = demo.generate_procedure_inventory('remove_node')
 
-    def tearDown(self) -> None:
-        self.tmpdir.cleanup()
-
     def _generate_inventory(self, scheme: Dict[str, demo._ROLE_SPEC]) -> dict:
         self.inventory = demo.generate_inventory(**scheme)
         self.nodes_context = demo.generate_nodes_context(self.inventory)
         return self.inventory
 
+    def _new_resources(self) -> demo.FakeResources:
+        return test_utils.FakeResources(self.context, self.inventory,
+                                        procedure_inventory=self.remove_node,
+                                        nodes_context=self.nodes_context)
+
+    def _new_cluster(self) -> demo.FakeKubernetesCluster:
+        return self._new_resources().cluster()
+
     def _run(self) -> demo.FakeResources:
-        resources = demo.FakeResources(self.context, self.inventory,
-                                       procedure_inventory=self.remove_node,
-                                       nodes_context=self.nodes_context)
-        flow.ActionsFlow([remove_node.RemoveNodeAction()]).run_flow(resources)
+        resources = self._new_resources()
+        flow.run_actions(resources, [remove_node.RemoveNodeAction()])
         return resources
+
+    def test_previous_nodes(self):
+        self._generate_inventory(demo.MINIHA_KEEPALIVED)
+        hosts = [node['address'] for node in self.inventory['nodes']]
+        node_name_remove = self.inventory['nodes'][0]['name']
+        self.remove_node['nodes'] = [{'name': node_name_remove}]
+
+        cluster = self._new_cluster()
+        self.assertIs(cluster, cluster.previous_nodes['all'].cluster,
+                      "Cluster of previous group should be the same as the main cluster")
+
+        self.assertEqual(hosts, cluster.previous_nodes['all'].get_hosts())
+
+        self.assertIs(cluster, cluster.get_nodes_for_removal().cluster)
+        self.assertEqual([node_name_remove], cluster.get_nodes_for_removal().get_nodes_names())
 
     def test_allow_omitted_name(self):
         self._generate_inventory(demo.MINIHA_KEEPALIVED)
@@ -54,22 +70,21 @@ class EnrichmentAndFinalization(unittest.TestCase):
             del node['name']
         self.remove_node['nodes'] = [{'name': 'control-plane-2'}]
 
-        resources = self._run()
-        cluster = resources.last_cluster
+        cluster = self._new_cluster()
 
-        nodes_for_removal = cluster.nodes['all'].get_nodes_for_removal()
+        nodes_for_removal = cluster.get_nodes_for_removal()
         self.assertEqual(['control-plane-2'], nodes_for_removal.get_nodes_names())
 
-        test_utils.stub_associations_packages(cluster, {})
-        finalized_inventory = cluster.make_finalized_inventory()
+        finalized_inventory = test_utils.make_finalized_inventory(cluster)
 
         self.assertEqual(['control-plane-1', 'control-plane-3'], [node['name'] for node in finalized_inventory['nodes']])
 
-        self.assertEqual(['control-plane-1', 'control-plane-3'], [node['name'] for node in resources.stored_inventory['nodes']])
+        self.assertEqual(['control-plane-1', 'control-plane-3'], [node['name'] for node in cluster.formatted_inventory['nodes']])
 
+    @test_utils.temporary_directory
     def test_ansible_inventory_no_removed_node(self):
         args = self.context['execution_arguments']
-        ansible_inventory_location = os.path.join(self.tmpdir.name, 'ansible-inventory.ini')
+        ansible_inventory_location = os.path.join(self.tmpdir, 'ansible-inventory.ini')
         args['ansible_inventory_location'] = ansible_inventory_location
 
         self._generate_inventory(demo.MINIHA_KEEPALIVED)
@@ -86,35 +101,39 @@ class EnrichmentAndFinalization(unittest.TestCase):
             self.assertEqual(should_present, node['name'] in ansible_inventory)
 
     def test_remove_turned_off_balancer_maintenance_mode(self):
-        scheme = {'balancer': 3, 'master': 3, 'worker': 3, 'keepalived': 1, 'haproxy_mntc': 1}
+        scheme = {'balancer': 3, 'control_plane': 3, 'worker': 3, 'keepalived': 1, 'haproxy_mntc': 1}
         self._generate_inventory(scheme)
 
         balancers = [node for node in self.inventory['nodes'] if 'balancer' in node['roles']]
-        balancer_names = [node['name'] for node in balancers]
-        self.nodes_context[balancers[0]['address']] = {'access': {
-            'online': False,
-            'accessible': False,
-            'sudo': 'No'
-        }}
+        self.nodes_context[balancers[0]['address']] = demo.generate_node_context(online=False)
         self.remove_node['nodes'] = [balancers[0], balancers[1]]
         removed_balancer_names = [node['name'] for node in self.remove_node['nodes']]
         online_balancer_names = [balancers[1]['name']]
 
-        cluster = self._run().last_cluster
+        cluster = self._new_cluster()
 
-        self.assertEqual(removed_balancer_names, cluster.nodes['all'].get_nodes_for_removal().get_nodes_names(),
+        self.assertEqual(removed_balancer_names, cluster.get_nodes_for_removal().get_nodes_names(),
                          "Unexpected nodes for removal")
 
         for role in ('balancer', 'keepalived'):
-            self.assertEqual(balancer_names, cluster.make_group_from_roles([role]).get_nodes_names(),
-                             f"Node for removal should be present among {role!r} group")
+            self.assertEqual([balancers[2]['name']], cluster.make_group_from_roles([role]).get_nodes_names(),
+                             f"Unexpected final nodes for {role!r} group")
+
+            self.assertEqual(removed_balancer_names, cluster.get_nodes_for_removal().having_roles([role]).get_nodes_names(),
+                             f"Node for removal should present among {role!r} group to be removed")
 
             self.assertEqual(online_balancer_names, remove_node.get_active_nodes(role, cluster).get_nodes_names(),
-                             f"Node for removal should be present among {role!r} group")
+                             f"Node for removal should present among {role!r} active group")
 
+        self.assertEqual([balancers[2]['name']], install.get_keepalived_configure_group(cluster).get_nodes_names(),
+                         "Unexpected nodes to reconfigure keepalived")
+        self.assertEqual([], install.get_haproxy_configure_group(cluster).get_nodes_names(),
+                         "Unexpected nodes to reconfigure haproxy")
+
+    @test_utils.temporary_directory
     def test_enrich_certsans_with_custom(self):
         args = self.context['execution_arguments']
-        ansible_inventory_location = os.path.join(self.tmpdir.name, 'ansible-inventory.ini')
+        ansible_inventory_location = os.path.join(self.tmpdir, 'ansible-inventory.ini')
         args['ansible_inventory_location'] = ansible_inventory_location
 
         self._generate_inventory(demo.MINIHA_KEEPALIVED)
@@ -129,17 +148,15 @@ class EnrichmentAndFinalization(unittest.TestCase):
             self.assertIn(self.inventory['nodes'][2]['name'], certsans)
             self.assertIn('custom', certsans)
 
-        resources = self._run()
-        cluster = resources.last_cluster
+        cluster = self._new_cluster()
         certsans = cluster.inventory["services"]["kubeadm"]['apiServer']['certSANs']
         check_enriched_certsans(certsans)
 
-        test_utils.stub_associations_packages(cluster, {})
-        finalized_inventory = cluster.make_finalized_inventory()
+        finalized_inventory = test_utils.make_finalized_inventory(cluster)
         certsans = finalized_inventory["services"]["kubeadm"]['apiServer']['certSANs']
         check_enriched_certsans(certsans)
 
-        certsans = resources.stored_inventory["services"]["kubeadm"]['apiServer']['certSANs']
+        certsans = cluster.formatted_inventory["services"]["kubeadm"]['apiServer']['certSANs']
         self.assertIn(self.inventory['nodes'][0]['name'], certsans)
         self.assertNotIn(self.inventory['nodes'][1]['name'], certsans)
         self.assertNotIn(self.inventory['nodes'][2]['name'], certsans)

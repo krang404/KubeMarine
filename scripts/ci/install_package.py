@@ -20,7 +20,9 @@ import sys
 from importlib.metadata import version
 from typing import Tuple
 
-expected_pip_version = '23.0'
+# pylint: disable=bad-builtin,wrong-import-position
+
+expected_pip_version = '24.0'
 pip_version = version('pip')
 assert pip_version == expected_pip_version,\
     f"The script relies on internal implementation of pip and was tested on pip=={expected_pip_version}. " \

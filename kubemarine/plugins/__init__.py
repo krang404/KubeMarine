@@ -15,6 +15,7 @@
 
 import glob
 import importlib.util
+import inspect
 import io
 import os
 import re
@@ -26,18 +27,13 @@ import tarfile
 import time
 import urllib.request
 import zipfile
-from copy import deepcopy
-from distutils.dir_util import copy_tree
-from distutils.dir_util import remove_tree
-from distutils.dir_util import mkpath
 from itertools import chain
 from types import ModuleType, FunctionType
 from typing import Dict, List, Tuple, Callable, Union, no_type_check, Set, Any, cast, TextIO, Optional
 
 import yaml
-import inspect
 
-from kubemarine.core.cluster import KubernetesCluster
+from kubemarine.core.cluster import KubernetesCluster, EnrichmentStage, enrichment
 from kubemarine import jinja, thirdparties
 from kubemarine.core import utils, static, errors, os as kos, log
 from kubemarine.core.yaml_merger import default_merger
@@ -51,18 +47,21 @@ from kubemarine.kubernetes.statefulset import StatefulSet
 oob_plugins = list(static.DEFAULTS["plugins"].keys())
 LOADED_MODULES: Dict[str, ModuleType] = {}
 
+ERROR_PODS_NOT_READY = 'In the expected time, the pods did not become ready'
 
-def verify_inventory(inventory: dict, cluster: KubernetesCluster) -> dict:
-    for plugin_name, plugin_item in inventory["plugins"].items():
+
+@enrichment(EnrichmentStage.FULL)
+def verify_inventory(cluster: KubernetesCluster) -> None:
+    for plugin_name, plugin_item in cluster.inventory["plugins"].items():
         for step in plugin_item.get('installation', {}).get('procedures', []):
             for procedure_type, configs in step.items():
                 if procedure_types()[procedure_type].get('verify') is not None:
                     procedure_types()[procedure_type]['verify'](cluster, configs, plugin_name)
 
-    return inventory
 
-
-def enrich_inventory(inventory: dict, cluster: KubernetesCluster) -> dict:
+@enrichment(EnrichmentStage.FULL)
+def enrich_inventory(cluster: KubernetesCluster) -> None:
+    inventory = cluster.inventory
     # it is necessary to convert URIs from quay.io/xxx:v1 to example.com:XXXX/xxx:v1
     plugins_default_registry = inventory['plugin_defaults']['installation'].get('registry')
 
@@ -74,66 +73,74 @@ def enrich_inventory(inventory: dict, cluster: KubernetesCluster) -> dict:
                 plugin_item.setdefault('installation', {})['registry'] = plugins_default_registry
 
     for plugin_name, plugin_item in inventory["plugins"].items():
-        for i, step in enumerate(plugin_item.get('installation', {}).get('procedures', [])):
+        for step in plugin_item.get('installation', {}).get('procedures', []):
             for procedure_type, configs in step.items():
                 if procedure_types()[procedure_type].get('convert') is not None:
                     step[procedure_type] = procedure_types()[procedure_type]['convert'](cluster, configs)
-    return inventory
 
 
 def _get_upgrade_plan(cluster: KubernetesCluster) -> List[Tuple[str, dict]]:
     context = cluster.context
-    if context.get("initial_procedure") == "upgrade":
-        upgrade_version = context["upgrade_version"]
-        upgrade_plan = []
-        for version in cluster.procedure_inventory['upgrade_plan']:
-            if utils.version_key(version) < utils.version_key(upgrade_version):
-                continue
+    procedure = context["initial_procedure"]
+    procedure_inventory = cluster.procedure_inventory
+    upgrade_plan = []
+    if procedure == "upgrade":
+        kubernetes_version = cluster.inventory['services']['kubeadm']['kubernetesVersion']
+        for i, v in enumerate(procedure_inventory['upgrade_plan'][context['upgrade_step']:]):
+            # Take the target (probably) compiled version and the remained not yet compiled
+            version = kubernetes_version if i == 0 else v
+            upgrade_plan.append((version, procedure_inventory.get(v, {}).get("plugins", {})))
 
-            upgrade_plan.append((version, cluster.procedure_inventory.get(version, {}).get("plugins", {})))
-
-    elif context.get("initial_procedure") == "migrate_kubemarine" and 'upgrading_plugin' in context:
-        upgrade_plugins = cluster.procedure_inventory.get('upgrade', {}).get("plugins", {})
-        upgrade_plugins = dict(item for item in upgrade_plugins.items()
-                               if item[0] == context['upgrading_plugin'])
+    elif 'upgrading_plugin' in context:
+        upgrade_plugins = procedure_inventory.get('upgrade', {}).get("plugins", {})
+        upgrade_plugins = utils.subdict_yaml(upgrade_plugins, [context['upgrading_plugin']])
         upgrade_plan = [("", upgrade_plugins)]
-    else:
-        upgrade_plan = []
 
     return upgrade_plan
 
 
-def enrich_upgrade_inventory(inventory: dict, cluster: KubernetesCluster) -> dict:
+@enrichment(EnrichmentStage.PROCEDURE, procedures=['upgrade', 'migrate_kubemarine'])
+def enrich_upgrade_inventory(cluster: KubernetesCluster) -> None:
+    upgrade_plan = _get_upgrade_plan(cluster)
+    upgrade_plugins = {} if not upgrade_plan else upgrade_plan[0][1]
+
+    if upgrade_plugins:
+        default_merger.merge(cluster.inventory.setdefault("plugins", {}), utils.deepcopy_yaml(upgrade_plugins))
+
+
+@enrichment(EnrichmentStage.PROCEDURE, procedures=['upgrade', 'migrate_kubemarine'])
+def verify_upgrade_inventory(cluster: KubernetesCluster) -> None:
     upgrade_plan = _get_upgrade_plan(cluster)
     if not upgrade_plan:
-        return inventory
+        return
 
     context = cluster.context
     if context.get("initial_procedure") == "upgrade":
-        previous_version = context['initial_kubernetes_version']
+        previous_version = cluster.previous_inventory['services']['kubeadm']['kubernetesVersion']
         plugins_verify = oob_plugins
     else:  # migrate_kubemarine procedure
         previous_version = ""
         plugins_verify = [context['upgrading_plugin']]
 
-    _verify_upgrade_plan(cluster.raw_inventory, previous_version, plugins_verify, upgrade_plan)
-
-    return generic_upgrade_inventory(cluster, inventory)
+    _verify_upgrade_plan(cluster, previous_version, plugins_verify, upgrade_plan)
 
 
-def _verify_upgrade_plan(raw_inventory: dict, previous_version: str,
+def _verify_upgrade_plan(cluster: KubernetesCluster, previous_version: str,
                          plugins_verify: List[str], upgrade_plan: List[Tuple[str, dict]]) -> None:
-    raw_plugins = deepcopy(raw_inventory.get('plugins', {}))
+    raw_plugins = utils.deepcopy_yaml(cluster.previous_raw_inventory.get('plugins', {}))
 
     # validate all plugin sections in procedure inventory
     for version, upgrade_plugins in upgrade_plan:
+        if version != '' and jinja.is_template(version):
+            break
+
         for plugin_name in plugins_verify:
             verify_image_redefined(plugin_name,
                                    previous_version,
                                    version,
                                    raw_plugins.get(plugin_name, {}),
                                    upgrade_plugins.get(plugin_name, {}))
-        default_merger.merge(raw_plugins, upgrade_plugins)
+        default_merger.merge(raw_plugins, utils.deepcopy_yaml(upgrade_plugins))
         previous_version = version
 
 
@@ -160,22 +167,6 @@ def verify_image_redefined(plugin_name: str, previous_version: str, next_version
                              previous_version_spec=f" for version {previous_version}" if previous_version else "",
                              next_version_spec=f" for next version {next_version}" if next_version else ""
             )
-
-
-def upgrade_finalize_inventory(cluster: KubernetesCluster, inventory: dict) -> dict:
-    return generic_upgrade_inventory(cluster, inventory)
-
-
-def generic_upgrade_inventory(cluster: KubernetesCluster, inventory: dict) -> dict:
-    upgrade_plan = _get_upgrade_plan(cluster)
-    if not upgrade_plan:
-        return inventory
-
-    _, upgrade_plugins = upgrade_plan[0]
-    if upgrade_plugins:
-        default_merger.merge(inventory.setdefault("plugins", {}), upgrade_plugins)
-
-    return inventory
 
 
 def _get_plugin_priority(plugin_item: dict, default: int) -> int:
@@ -215,7 +206,7 @@ def install(cluster: KubernetesCluster, plugins_: Dict[str, dict] = None) -> Non
 def install_plugin(cluster: KubernetesCluster, plugin_name: str, installation_procedure: List[dict]) -> None:
     cluster.log.debug("**** INSTALLING PLUGIN %s ****" % plugin_name)
 
-    for current_step_i, step in enumerate(installation_procedure):
+    for step in installation_procedure:
         for apply_type, configs in step.items():
             procedure_types()[apply_type]['apply'](cluster, configs)
 
@@ -269,7 +260,10 @@ def expect_daemonset(cluster: KubernetesCluster,
             cluster.log.debug(f"DaemonSets are not up to date yet... ({retries * timeout}s left)")
             time.sleep(timeout)
 
-    raise Exception('In the expected time, the DaemonSets did not become ready. Try to increase number of retries in expect.daemonsets: https://github.com/Netcracker/KubeMarine/blob/main/documentation/Installation.md#expect-deploymentsdaemonsetsreplicasetsstatefulsets')
+    raise Exception('In the expected time, the DaemonSets did not become ready. '
+                    'Try to increase number of retries in expect.daemonsets: '
+                    # pylint: disable-next=line-too-long
+                    'https://github.com/Netcracker/KubeMarine/blob/main/documentation/Installation.md#expect-deploymentsdaemonsetsreplicasetsstatefulsets')
 
 
 def expect_replicaset(cluster: KubernetesCluster,
@@ -321,7 +315,10 @@ def expect_replicaset(cluster: KubernetesCluster,
             cluster.log.debug(f"ReplicaSets are not up to date yet... ({retries * timeout}s left)")
             time.sleep(timeout)
 
-    raise Exception('In the expected time, the ReplicaSets did not become ready. Try to increase number of retries in expect.replicasets: https://github.com/Netcracker/KubeMarine/blob/main/documentation/Installation.md#expect-deploymentsdaemonsetsreplicasetsstatefulsets')
+    raise Exception('In the expected time, the ReplicaSets did not become ready. '
+                    'Try to increase number of retries in expect.replicasets: '
+                    # pylint: disable-next=line-too-long
+                    'https://github.com/Netcracker/KubeMarine/blob/main/documentation/Installation.md#expect-deploymentsdaemonsetsreplicasetsstatefulsets')
 
 
 def expect_statefulset(cluster: KubernetesCluster,
@@ -373,7 +370,10 @@ def expect_statefulset(cluster: KubernetesCluster,
             cluster.log.debug(f"StatefulSets are not up to date yet... ({retries * timeout}s left)")
             time.sleep(timeout)
 
-    raise Exception('In the expected time, the StatefulSets did not become ready. Try to increase number of retries in expect.statefulsets: https://github.com/Netcracker/KubeMarine/blob/main/documentation/Installation.md#expect-deploymentsdaemonsetsreplicasetsstatefulsets')
+    raise Exception('In the expected time, the StatefulSets did not become ready. '
+                    'Try to increase number of retries in expect.statefulsets: '
+                    # pylint: disable-next=line-too-long
+                    'https://github.com/Netcracker/KubeMarine/blob/main/documentation/Installation.md#expect-deploymentsdaemonsetsreplicasetsstatefulsets')
 
 
 def expect_deployment(cluster: KubernetesCluster,
@@ -425,12 +425,15 @@ def expect_deployment(cluster: KubernetesCluster,
             cluster.log.debug(f"Deployments are not up to date yet... ({retries * timeout}s left)")
             time.sleep(timeout)
 
-    raise Exception('In the expected time, the Deployments did not become ready. Try to increase number of retries in expect.deployments: https://github.com/Netcracker/KubeMarine/blob/main/documentation/Installation.md#expect-deploymentsdaemonsetsreplicasetsstatefulsets')
+    raise Exception('In the expected time, the Deployments did not become ready. '
+                    'Try to increase number of retries in expect.deployments: '
+                    # pylint: disable-next=line-too-long
+                    'https://github.com/Netcracker/KubeMarine/blob/main/documentation/Installation.md#expect-deploymentsdaemonsetsreplicasetsstatefulsets')
 
 
 def expect_pods(cluster: KubernetesCluster, pods: List[str], namespace: str = None,
                 timeout: int = None, retries: int = None,
-                node: NodeGroup = None, apply_filter: str = None) -> None:
+                control_plane: NodeGroup = None, node_name: str = None) -> None:
 
     if timeout is None:
         timeout = cluster.inventory['globals']['expect']['pods']['plugins']['timeout']
@@ -444,20 +447,20 @@ def expect_pods(cluster: KubernetesCluster, pods: List[str], namespace: str = No
 
     failures = 0
 
-    if node is None:
-        node = cluster.nodes['control-plane'].get_first_member()
+    if control_plane is None:
+        control_plane = cluster.nodes['control-plane'].get_first_member()
 
     namespace_filter = '-A'
     if namespace is not None:
         namespace_filter = "-n " + namespace
 
     command = f"kubectl get pods {namespace_filter} -o=wide"
-    if apply_filter is not None:
-        command += ' | grep %s' % apply_filter
+    if node_name is not None:
+        command += ' | grep %s' % node_name
 
     while retries > 0:
 
-        result = node.sudo(command, warn=True)
+        result = control_plane.sudo(command, warn=True)
 
         stdout = list(result.values())[0].stdout
         running_pods_stdout = ''
@@ -466,15 +469,12 @@ def expect_pods(cluster: KubernetesCluster, pods: List[str], namespace: str = No
 
         for stdout_line in iter(stdout.splitlines()):
 
-            stdout_line_allowed = False
-
             # is current line has requested pod for verification?
             # we do not have to fail on pods with bad status which was not requested
             for pod in pods:
-                if pod + "-" in stdout_line:
-                    stdout_line_allowed = True
+                if pod + "-" not in stdout_line:
+                    continue
 
-            if stdout_line_allowed:
                 if is_critical_state_in_stdout(cluster, stdout_line):
                     cluster.log.verbose("Failed pod detected: %s\n" % stdout_line)
 
@@ -486,8 +486,10 @@ def expect_pods(cluster: KubernetesCluster, pods: List[str], namespace: str = No
                     if failures > cluster.globals['pods']['allowed_failures']:
                         raise Exception('Pod entered a state of error, further proceeding is impossible')
                 else:
-                # we have to take into account any pod in not a critical state
+                    # we have to take into account any pod in not a critical state
                     running_pods_stdout += stdout_line + '\n'
+
+                break
 
         pods_ready = False
         if running_pods_stdout and running_pods_stdout != "" and "0/1" not in running_pods_stdout:
@@ -508,7 +510,7 @@ def expect_pods(cluster: KubernetesCluster, pods: List[str], namespace: str = No
             cluster.log.debug(running_pods_stdout)
             time.sleep(timeout)
 
-    raise Exception('In the expected time, the pods did not become ready')
+    raise Exception(ERROR_PODS_NOT_READY)
 
 
 def is_critical_state_in_stdout(cluster: KubernetesCluster, stdout: str) -> bool:
@@ -524,7 +526,7 @@ def convert_template(_: KubernetesCluster, config: Union[str, dict]) -> dict:
     return _convert_file(config)
 
 
-def verify_template(_: KubernetesCluster, config: dict, plugin_name: Optional[str] = None) -> None:
+def verify_template(_: KubernetesCluster, config: dict, _plugin_name: Optional[str] = None) -> None:
     _verify_file(config, "Template")
 
 
@@ -561,7 +563,7 @@ def convert_expect(_: KubernetesCluster, config: dict) -> dict:
 def apply_expect(cluster: KubernetesCluster, config: dict) -> None:
     # TODO: Add support for expect services and expect nodes
 
-    for expect_type, expect_conf in config.items():
+    for expect_type in config:
         if expect_type == 'daemonsets':
             expect_daemonset(cluster, config['daemonsets']['list'],
                              timeout=config['daemonsets'].get('timeout'),
@@ -601,7 +603,7 @@ def get_python_module(module_path: str) -> ModuleType:
         spec.loader.exec_module(module)
         LOADED_MODULES[module_path] = module
     except Exception as e:
-        raise ValueError(f"Could not import module {module_path}: {e}")
+        raise ValueError(f"Could not import module {module_path}: {e}") from None
     return module 
 
 
@@ -632,7 +634,8 @@ def verify_python(cluster: KubernetesCluster, step: dict, plugin_name: Optional[
     try:
         signature.bind(cluster, **method_arguments)
     except TypeError as e:
-        raise ValueError(f"Invalid arguments for python method {method.__name__} for {plugin_name!r} plugin: {e}")
+        raise ValueError(f"Invalid arguments for python method {method.__name__} for {plugin_name!r} plugin: {e}") \
+            from None
 
 
 def apply_python(cluster: KubernetesCluster, step: dict) -> None:
@@ -643,7 +646,7 @@ def apply_python(cluster: KubernetesCluster, step: dict) -> None:
 
 # **** THIRDPARTIES ****
 
-def verify_thirdparty(cluster: KubernetesCluster, thirdparty: str, plugin_name: Optional[str] = None) -> None:
+def verify_thirdparty(cluster: KubernetesCluster, thirdparty: str, _plugin_name: Optional[str] = None) -> None:
     defined_thirdparties = list(cluster.inventory['services'].get('thirdparties', {}).keys())
     if thirdparty not in defined_thirdparties:
         raise Exception('Specified thirdparty %s not found in thirdpartirs definition. Expected any of %s.'
@@ -664,7 +667,7 @@ def convert_shell(_: KubernetesCluster, config: Union[str, dict]) -> dict:
     return config
 
 
-def verify_shell(cluster: KubernetesCluster, config: dict, plugin_name: Optional[str] = None) -> None:
+def verify_shell(cluster: KubernetesCluster, config: dict, _plugin_name: Optional[str] = None) -> None:
     out_vars = config.get('out_vars', [])
     groups = config.get('groups', [])
     nodes = config.get('nodes', [])
@@ -673,7 +676,7 @@ def verify_shell(cluster: KubernetesCluster, config: dict, plugin_name: Optional
         raise Exception('Shell output variables could be used for single-node groups, but multi-node group was found')
 
     in_vars = config.get('in_vars', [])
-    words_splitter = re.compile('\W')
+    words_splitter = re.compile(r'\W')
     for var in chain(in_vars, out_vars):
         var_name = var['name']
         if len(words_splitter.split(var_name)) > 1:
@@ -759,7 +762,7 @@ def _get_absolute_playbook(config: dict) -> str:
     return utils.determine_resource_absolute_file(config['playbook'])[0]
 
 
-def verify_ansible(cluster: KubernetesCluster, config: dict, plugin_name: Optional[str] = None) -> None:
+def verify_ansible(cluster: KubernetesCluster, config: dict, _plugin_name: Optional[str] = None) -> None:
     _get_absolute_playbook(config)
     if cluster.is_deploying_from_windows():
         raise Exception("Executing of playbooks on Windows deployer is currently not supported")
@@ -790,7 +793,7 @@ def apply_ansible(cluster: KubernetesCluster, step: dict) -> None:
 
     cluster.log.verbose("Running shell \"%s\"" % command)
 
-    result = subprocess.run(command, stdout=sys.stdout, stderr=sys.stderr, shell=True)
+    result = subprocess.run(command, stdout=sys.stdout, stderr=sys.stderr, shell=True, check=False)
     if result.returncode != 0:
         raise Exception("Failed to apply ansible plugin, see error above")
 
@@ -799,7 +802,7 @@ def apply_helm(cluster: KubernetesCluster, config: dict) -> None:
     chart_path = get_local_chart_path(cluster.log, config)
     process_chart_values(config, chart_path)
 
-    from kubemarine import kubernetes
+    from kubemarine import kubernetes  # pylint: disable=cyclic-import
     local_config_path = kubernetes.fetch_admin_config(cluster)
 
     with utils.open_external(os.path.join(chart_path, 'Chart.yaml'), 'r') as stream:
@@ -896,8 +899,8 @@ def get_local_chart_path(logger: log.EnhancedLogger, config: dict) -> str:
 
     local_chart_folder = "local_chart_folder"
     if os.path.isdir(local_chart_folder):
-        remove_tree(local_chart_folder)
-    mkpath(local_chart_folder)
+        shutil.rmtree(local_chart_folder)
+    os.makedirs(local_chart_folder)
     if is_curl:
         logger.verbose('Chart download via curl detected')
         destination = os.path.basename(chart_path)
@@ -921,7 +924,7 @@ def get_local_chart_path(logger: log.EnhancedLogger, config: dict) -> str:
                 tf.extractall(local_chart_folder)
     else:
         logger.debug("Create copy of chart to work with")
-        copy_tree(chart_path, local_chart_folder)
+        shutil.copytree(chart_path, local_chart_folder, dirs_exist_ok=True)
 
     # Find all Chart.yaml files in the chart.
     glob_search = os.path.join(local_chart_folder, '**', 'Chart.yaml')
@@ -947,7 +950,7 @@ def convert_config(_: KubernetesCluster, config: Union[str, dict]) -> dict:
     return _convert_file(config)
 
 
-def verify_config(_: KubernetesCluster, config: dict, plugin_name: Optional[str] = None) -> None:
+def verify_config(_: KubernetesCluster, config: dict, _plugin_name: Optional[str] = None) -> None:
     _verify_file(config, "Config")
 
 
@@ -994,6 +997,8 @@ def _apply_file(cluster: KubernetesCluster, config: dict, file_type: str) -> Non
         Apply yamls as is or
         renders and applies templates that match the config 'source' key.
     """
+    from kubemarine.core import defaults  # pylint: disable=cyclic-import
+
     log = cluster.log
     do_render = config.get('do_render', True)
 
@@ -1012,9 +1017,10 @@ def _apply_file(cluster: KubernetesCluster, config: dict, file_type: str) -> Non
             if split_extension[1] == ".j2":
                 source_filename = split_extension[0]
 
-            render_vars = {**cluster.inventory, 'runtime_vars': cluster.context['runtime_vars'], 'env': kos.Environ()}
+            render_vars = {'runtime_vars': cluster.context['runtime_vars'], 'env': kos.Environ()}
             with utils.open_utf8(file, 'r') as template_stream:
-                generated_data = jinja.new(log).from_string(template_stream.read()).render(**render_vars)
+                env = defaults.Environment(log, cluster.inventory)
+                generated_data = env.from_string(template_stream.read()).render(**render_vars)
 
             utils.dump_file(cluster, generated_data, source_filename)
             source = io.StringIO(generated_data)

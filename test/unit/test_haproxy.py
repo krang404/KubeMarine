@@ -18,7 +18,6 @@ import unittest
 
 from kubemarine import haproxy, yum
 from kubemarine import demo
-from kubemarine.core.group import NodeGroupResult
 
 
 class HAProxyDefaultsEnrichment(unittest.TestCase):
@@ -36,7 +35,6 @@ class HAProxyDefaultsEnrichment(unittest.TestCase):
                     schema = demo.new_scheme(schema, 'haproxy_mntc', 1)
 
                 inventory = demo.generate_inventory(**schema)
-                print("Inventory: " + str(inventory))
                 # enrichment should not fail
                 demo.new_cluster(inventory)
 
@@ -50,16 +48,15 @@ class HAProxyDefaultsEnrichment(unittest.TestCase):
                 if try_mntc:
                     schema = demo.new_scheme(schema, 'haproxy_mntc', 1)
                 inventory = demo.generate_inventory(**schema)
-                print("Inventory: " + str(inventory))
 
                 with self.assertRaises(Exception) as cm:
                     demo.new_cluster(inventory)
 
                 if try_mntc:
-                    self.assertEqual(haproxy.ERROR_NO_BOUND_VRRP_CONFIGURED_MNTC % 'master-1', str(cm.exception),
+                    self.assertEqual(haproxy.ERROR_NO_BOUND_VRRP_CONFIGURED_MNTC % 'control-plane-1', str(cm.exception),
                                      "Invalid exception message")
                 else:
-                    self.assertEqual(haproxy.ERROR_VRRP_IS_NOT_CONFIGURED % 'master-1', str(cm.exception),
+                    self.assertEqual(haproxy.ERROR_VRRP_IS_NOT_CONFIGURED % 'control-plane-1', str(cm.exception),
                                      "Invalid exception message")
 
 

@@ -11,117 +11,160 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
 import re
-from importlib import import_module
-from copy import deepcopy
-from typing import Optional, Dict, Any, Tuple, List
+from typing import Optional, Dict, Any, Tuple, List, Callable, Union, Sequence, cast, Type
 
 import yaml
 
-from kubemarine.core.cluster import KubernetesCluster
-from kubemarine.core.errors import KME
-from kubemarine import jinja, keepalived, haproxy
+from kubemarine.core.cluster import KubernetesCluster, EnrichmentStage, enrichment
+from kubemarine import jinja, keepalived, haproxy, kubernetes, thirdparties
 from kubemarine.core import utils, static, log, os
+from kubemarine.core.proxytypes import Primitive, Index, Node
 from kubemarine.core.yaml_merger import default_merger
 from kubemarine.cri.containerd import contains_old_format_properties
 
-# All enrichment procedures should not connect to any node.
-# The information about nodes should be collected within KubernetesCluster#detect_nodes_context().
-DEFAULT_ENRICHMENT_FNS = [
-    "kubemarine.core.schema.verify_inventory",
-    "kubemarine.core.defaults.merge_defaults",
-    "kubemarine.kubernetes.verify_initial_version",
-    "kubemarine.admission.enrich_default_admission",
-    "kubemarine.kubernetes.add_node_enrichment",
-    "kubemarine.core.defaults.calculate_node_names",
-    "kubemarine.kubernetes.remove_node_enrichment",
-    "kubemarine.controlplane.controlplane_node_enrichment",
-    "kubemarine.core.defaults.append_controlplain",
-    "kubemarine.kubernetes.enrich_upgrade_inventory",
-    "kubemarine.kubernetes.enrich_restore_inventory",
-    "kubemarine.core.defaults.compile_inventory",
-    "kubemarine.core.defaults.manage_true_false_values",
-    "kubemarine.plugins.enrich_upgrade_inventory",
-    "kubemarine.packages.enrich_inventory",
-    "kubemarine.packages.enrich_upgrade_inventory",
-    "kubemarine.packages.enrich_migrate_cri_inventory",
-    "kubemarine.packages.enrich_inventory_apply_defaults",
-    "kubemarine.thirdparties.enrich_upgrade_inventory",
-    "kubemarine.thirdparties.enrich_restore_inventory",
-    "kubemarine.thirdparties.enrich_migrate_cri_inventory",
-    "kubemarine.admission.manage_enrichment",
-    "kubemarine.cri.containerd.enrich_migrate_cri_inventory",
-    "kubemarine.core.defaults.apply_registry",
-    "kubemarine.cri.enrich_upgrade_inventory",
-    "kubemarine.core.defaults.verify_node_names",
-    "kubemarine.core.defaults.apply_defaults",
-    "kubemarine.keepalived.enrich_inventory_apply_defaults",
-    "kubemarine.haproxy.enrich_inventory",
-    "kubemarine.kubernetes.enrich_inventory",
-    "kubemarine.admission.enrich_inventory",
-    "kubemarine.kubernetes_accounts.enrich_inventory",
-    "kubemarine.plugins.calico.enrich_inventory",
-    "kubemarine.plugins.nginx_ingress.cert_renew_enrichment",
-    "kubemarine.plugins.nginx_ingress.enrich_inventory",
-    "kubemarine.plugins.local_path_provisioner.enrich_inventory",
-    "kubemarine.plugins.kubernetes_dashboard.enrich_inventory",
-    "kubemarine.core.defaults.calculate_nodegroups",
-    "kubemarine.keepalived.enrich_inventory_calculate_nodegroup",
-    "kubemarine.thirdparties.enrich_inventory_apply_defaults",
-    "kubemarine.system.verify_inventory",
-    "kubemarine.system.enrich_etc_hosts",
-    "kubemarine.packages.enrich_inventory_include_all",
-    "kubemarine.audit.verify_inventory",
-    "kubemarine.plugins.enrich_inventory",
-    "kubemarine.plugins.verify_inventory",
-    "kubemarine.plugins.builtin.verify_inventory",
-    "kubemarine.k8s_certs.renew_verify",
-    "kubemarine.cri.enrich_inventory",
-    "kubemarine.system.enrich_kernel_modules"
-]
+
+supported_connection_defaults = {
+    'node_defaults': 'nodes',
+}
 
 supported_defaults = {
     'rbac': {
         'account_defaults': 'accounts'
     },
-    'node_defaults': 'nodes',
 }
 
+connection_sections = [
+    'nodes', 'node_defaults', 'gateway_nodes',
+    'procedure_history',  # Required to preserve inventory
+    'values', 'cluster_name'  # May be referred to in jinja expressions
+]
+
+ssh_access_default_properties = [
+    'keyfile', 'password', 'username', 'connection_port', 'connection_timeout', 'gateway',
+    'boot'  # Participates in workarounds and reboot. This dependency can potentially be avoided
+]
+
+ssh_access_node_properties = ssh_access_default_properties + [
+    'address', 'internal_address', 'connect_to',
+    'name',  # In context of connections, the name is used only in logging. This dependency can potentially be avoided.
+    'roles'  # Required to distinguish control planes to preserve inventory.
+]
+
+
 invalid_node_name_regex = re.compile("[^a-z-.\\d]", re.M)
-escaped_expression_regex = re.compile('({%[\\s*|]raw[\\s*|]%}.*?{%[\\s*|]endraw[\\s*|]%})', re.M)
-jinja_query_regex = re.compile("{{ .* }}", re.M)
 
 
-def apply_defaults(inventory: dict, cluster: KubernetesCluster) -> dict:
-    recursive_apply_defaults(supported_defaults, inventory)
+@enrichment(EnrichmentStage.LIGHT, procedures=['add_node'])
+def add_node_enrich_roles(cluster: KubernetesCluster) -> None:
+    # At LIGHT stage, we should mark the nodes with `add_node` service role to find them after compilation.
+    # This is for optimization to avoid two-staged enrichment even for connections only.
+    for node in cluster.procedure_inventory['nodes']:
+        # deepcopy is necessary, otherwise role append will happen in procedure_inventory too
+        node = utils.deepcopy_yaml(node)
+        node["roles"].append("add_node")
+        cluster.inventory["nodes"].append(node)
 
-    for i, node in enumerate(inventory["nodes"]):
+
+@enrichment(EnrichmentStage.LIGHT, procedures=['remove_node'])
+def remove_node_enrich_roles(cluster: KubernetesCluster) -> None:
+    # At LIGHT stage, we should mark the nodes with `remove_node` service role to find them after compilation.
+    # This is for optimization to avoid two-staged enrichment even for connections only.
+    node_names_to_remove = [node['name'] for node in cluster.procedure_inventory["nodes"]]
+    for node_remove in node_names_to_remove:
+        for node in cluster.inventory['nodes']:
+            # Inventory is not compiled at this step.
+            # Expecting that the names are not jinja, or the same jinja expressions.
+            if node['name'] == node_remove:
+                node['roles'].append('remove_node')
+                break
+        else:
+            raise Exception(f"Failed to find node to remove {node_remove} among existing nodes")
+
+
+@enrichment(EnrichmentStage.PROCEDURE, procedures=['add_node'])
+def enrich_add_nodes(cluster: KubernetesCluster) -> None:
+    # Unlike at LIGHT stage (add_node_enrich_roles), at PROCEDURE stage we add the nodes without service roles.
+    for new_node in cluster.procedure_inventory["nodes"]:
+        node = utils.deepcopy_yaml(new_node)
+        cluster.inventory["nodes"].append(node)
+
+
+@enrichment(EnrichmentStage.PROCEDURE, procedures=['remove_node'])
+def enrich_remove_nodes(cluster: KubernetesCluster) -> None:
+    # Unlike at LIGHT stage (remove_node_enrich_roles), at PROCEDURE stage we remove the nodes completely.
+    node_names_to_remove = [node['name'] for node in cluster.procedure_inventory["nodes"]]
+    for node_remove in node_names_to_remove:
+        for i, node in enumerate(cluster.inventory['nodes']):
+            if node['name'] == node_remove:
+                del cluster.inventory['nodes'][i]
+                break
+
+
+@enrichment(EnrichmentStage.LIGHT, procedures=['add_node', 'remove_node'])
+def remove_service_roles(cluster: KubernetesCluster) -> None:
+    for node in cluster.inventory['nodes']:
+        roles = node['roles']
+        for role in ('add_node', 'remove_node'):
+            if role in roles:
+                roles.remove(role)
+
+
+@enrichment(EnrichmentStage.ALL)
+def apply_connection_defaults(cluster: KubernetesCluster) -> None:
+    recursive_apply_defaults(supported_connection_defaults, cluster.inventory)
+
+
+@enrichment(EnrichmentStage.FULL)
+def apply_defaults(cluster: KubernetesCluster) -> None:
+    recursive_apply_defaults(supported_defaults, cluster.inventory)
+
+
+@enrichment(EnrichmentStage.ALL)
+def calculate_connect_to(cluster: KubernetesCluster) -> None:
+    for node in cluster.inventory["nodes"]:
         address = cluster.get_access_address_from_node(node)
-
         # we definitely know how to connect
-        cluster.inventory["nodes"][i]["connect_to"] = address
-
-        if not cluster.context["nodes"].get(address):
-            cluster.context["nodes"][address] = {}
-
-        if address not in cluster.ips["all"]:
-            cluster.ips['all'].append(address)
-
-        for role in node.get("roles"):
-            if role not in cluster.roles:
-                cluster.roles.append(role)
-                cluster.ips[role] = []
-            if address not in cluster.ips[role]:
-                cluster.ips[role].append(address)
-
-    return inventory
+        node["connect_to"] = address
 
 
-def apply_registry(inventory: dict, cluster: KubernetesCluster) -> dict:
+@enrichment(EnrichmentStage.ALL)
+def calculate_nodegroups(cluster: KubernetesCluster) -> None:
+    for nodes, skip_role in (
+            (cluster.previous_nodes, 'add_node'),
+            (cluster.nodes, 'remove_node'),
+    ):
+        if nodes:
+            # Since this is the first enrichment procedure that fills the nodes,
+            # having non-empty nodes means they are externally provided (e.g. at PROCEDURE stage).
+            continue
+
+        ips: Dict[str, List[str]] = {
+            "all": []
+        }
+
+        for node in cluster.inventory["nodes"]:
+            if skip_role in node['roles']:
+                continue
+
+            address = node['connect_to']
+            ips['all'].append(address)
+            for role in node['roles']:
+                if role not in ('remove_node', 'add_node'):
+                    ips.setdefault(role, []).append(address)
+
+        for role, hosts in ips.items():
+            nodes[role] = cluster.make_group(hosts)
+
+
+@enrichment(EnrichmentStage.FULL)
+def apply_registry(cluster: KubernetesCluster) -> None:
+    inventory = cluster.inventory
 
     if not inventory.get('registry'):
         cluster.log.verbose('Unified registry is not used')
-        return inventory
+        return
 
     thirdparties_address = None
     containerd_endpoints = None
@@ -148,51 +191,26 @@ def apply_registry(inventory: dict, cluster: KubernetesCluster) -> dict:
         inventory['services']['kubeadm']["imageRepository"] = registry_mirror_address
     inventory['plugin_defaults']['installation'].setdefault('registry', registry_mirror_address)
 
-    cri_impl = inventory['services']['cri']['containerRuntime']
+    if not containerd_endpoints:
+        containerd_endpoints = ["%s://%s" % (protocol, registry_mirror_address)]
 
-    if cri_impl == "docker" and inventory['registry'].get('endpoints'):
-        raise KME('KME0007')
-
-    if cri_impl == "docker":
-
-        if protocol == 'http':
-            if inventory['services']['cri']['dockerConfig'].get("insecure-registries") is None:
-                inventory['services']['cri']['dockerConfig']["insecure-registries"] = []
-            insecure_registries = inventory['services']['cri']['dockerConfig']["insecure-registries"]
-            insecure_registries.append(registry_mirror_address)
-            inventory['services']['cri']['dockerConfig']["insecure-registries"] = list(set(insecure_registries))
-
-        if inventory['services']['cri']['dockerConfig'].get("registry-mirrors") is None:
-            inventory['services']['cri']['dockerConfig']["registry-mirrors"] = []
-
-        registry_mirrors = inventory['services']['cri']['dockerConfig']["registry-mirrors"]
-        registry_mirrors.append(f"{protocol}://{registry_mirror_address}")
-        inventory['services']['cri']['dockerConfig']["registry-mirrors"] = list(set(registry_mirrors))
-
-    elif cri_impl == "containerd":
-        if not containerd_endpoints:
-            containerd_endpoints = ["%s://%s" % (protocol, registry_mirror_address)]
-
-        old_format_result, _ = contains_old_format_properties(inventory)
-        # todo remove p3_reconfigure_registries after next release
-        if old_format_result or not cluster.context.get('p3_reconfigure_registries', True):
-            # Add registry info in old format
-            registry_section = f'plugins."io.containerd.grpc.v1.cri".registry.mirrors."{registry_mirror_address}"'
-            containerd_config = inventory['services']['cri']['containerdConfig']
-            if not containerd_config.get(registry_section):
-                containerd_config[registry_section] = {
-                    'endpoint': containerd_endpoints
-                }
-        else:
-            # Add registry info in new format
-            old_registry_config = inventory['services']['cri'].get('containerdRegistriesConfig', {})
-            inventory['services']['cri']['containerdRegistriesConfig'] = {registry_mirror_address: {
-                                     f'host."{endpoint}"': {'capabilities': ['pull', 'resolve']}
-                                     for endpoint in containerd_endpoints
-                                 }}
-            default_merger.merge(inventory['services']['cri']['containerdRegistriesConfig'], old_registry_config)
-
-    from kubemarine import thirdparties
+    old_format_result, _ = contains_old_format_properties(inventory)
+    if old_format_result:
+        # Add registry info in old format
+        registry_section = f'plugins."io.containerd.grpc.v1.cri".registry.mirrors."{registry_mirror_address}"'
+        containerd_config = inventory['services']['cri']['containerdConfig']
+        if not containerd_config.get(registry_section):
+            containerd_config[registry_section] = {
+                'endpoint': containerd_endpoints
+            }
+    else:
+        # Add registry info in new format
+        old_registry_config = inventory['services']['cri'].get('containerdRegistriesConfig', {})
+        inventory['services']['cri']['containerdRegistriesConfig'] = {registry_mirror_address: {
+            f'host."{endpoint}"': {'capabilities': ['pull', 'resolve']}
+            for endpoint in containerd_endpoints
+        }}
+        default_merger.merge(inventory['services']['cri']['containerdRegistriesConfig'], old_registry_config)
 
     if thirdparties_address:
         for destination, config in inventory['services']['thirdparties'].items():
@@ -204,8 +222,6 @@ def apply_registry(inventory: dict, cluster: KubernetesCluster) -> dict:
             config['source'] = source
             if 'sha1' not in config:
                 config['sha1'] = sha1
-
-    return inventory
 
 
 def apply_registry_endpoints(inventory: dict) -> Tuple[str, List[str], Optional[str]]:
@@ -223,15 +239,17 @@ def apply_registry_endpoints(inventory: dict) -> Tuple[str, List[str], Optional[
     return registry_mirror_address, containerd_endpoints, thirdparties_address
 
 
-def append_controlplain(inventory: dict, cluster: Optional[KubernetesCluster]) -> dict:
+@enrichment(EnrichmentStage.FULL)
+def append_controlplain(cluster: KubernetesCluster) -> None:
+    _append_controlplain(cluster.inventory, cluster.log)
+
+
+def _append_controlplain(inventory: dict, logger: log.EnhancedLogger) -> None:
 
     if inventory.get('control_plain', {}).get('internal') and inventory.get('control_plain', {}).get('external'):
-        if cluster:
-            cluster.log.verbose('Control plains are set manually, nothing to detect.')
-        return inventory
+        logger.verbose('Control plains are set manually, nothing to detect.')
 
-    if cluster:
-        cluster.log.verbose('Detecting control plains...')
+    logger.verbose('Detecting control plains...')
 
     # calculate controlplain ips
     internal_address: Optional[str] = None
@@ -239,7 +257,7 @@ def append_controlplain(inventory: dict, cluster: Optional[KubernetesCluster]) -
     external_address: Optional[str] = None
     external_address_source: Optional[str] = None
 
-    balancer_names = keepalived.get_all_balancer_names(inventory, final=True)
+    balancer_names = keepalived.get_all_balancer_names(inventory)
     # vrrp_ip section is not enriched yet
     # If no VRRP IPs or no balancers are configured, Keepalived is not enabled.
     if inventory.get('vrrp_ips') and balancer_names:
@@ -264,15 +282,15 @@ def append_controlplain(inventory: dict, cluster: Optional[KubernetesCluster]) -
                     external_address = item['floating_ip']
                     external_address_source = 'vrrp_ip[%s]' % i
 
-    if internal_address is not None and external_address is None and cluster:
-        cluster.log.warning('VRRP_IPs has an internal address, but do not have an external one. Your configuration may be incorrect. Trying to handle this problem automatically...')
+    if internal_address is not None and external_address is None:
+        logger.warning('VRRP_IPs has an internal address, but do not have an external one. '
+                       'Your configuration may be incorrect. Trying to handle this problem automatically...')
 
     if internal_address is None or external_address is None:
-        # 'master' role is not deleted due to unit tests are not refactored
-        for role in ['balancer', 'control-plane', 'master']:
+        for role in ['balancer', 'control-plane']:
             # nodes are not compiled to groups yet
             for node in inventory['nodes']:
-                if role in node['roles'] and 'remove_node' not in node['roles']:
+                if role in node['roles']:
                     if internal_address is None or node.get('control_endpoint', False):
                         internal_address = node['internal_address']
                         internal_address_source = f"{role} \"{node['name']}\""
@@ -281,12 +299,11 @@ def append_controlplain(inventory: dict, cluster: Optional[KubernetesCluster]) -
                         external_address_source = f"{role} \"{node['name']}\""
 
     if external_address is None:
-        if cluster:
-            cluster.log.warning('Failed to detect external control plain. Something may work incorrect!')
+        logger.warning('Failed to detect external control plain. Something may work incorrect!')
         external_address = internal_address
 
-    if cluster:
-        cluster.log.debug('Control plains:\n   Internal: %s (%s)\n   External: %s (%s)' % (internal_address, internal_address_source, external_address, external_address_source))
+    logger.debug('Control plains:\n   Internal: %s (%s)\n   External: %s (%s)'
+                 % (internal_address, internal_address_source, external_address, external_address_source))
 
     # apply controlplain ips
     if not inventory.get('control_plain'):
@@ -298,18 +315,17 @@ def append_controlplain(inventory: dict, cluster: Optional[KubernetesCluster]) -
     if not inventory['control_plain'].get('external'):
         inventory['control_plain']['external'] = external_address
 
-    return inventory
-
 
 def recursive_apply_defaults(defaults: dict, section: dict) -> None:
     for key, value in defaults.items():
-        if isinstance(value, dict) and section.get(key) is not None and section[key]:
-            recursive_apply_defaults(value, section[key])
+        if isinstance(value, dict):
+            if section.get(key) is not None and section[key]:
+                recursive_apply_defaults(value, section[key])
         # check if target section exists and not empty
         elif section.get(value) is not None:
             for i, custom_value in enumerate(section[value]):
                 # copy defaults as new dict, to avoid problems with memory links
-                default_value = deepcopy(section[key])
+                default_value = utils.deepcopy_yaml(section[key])
 
                 # update defaults with custom-defined node configs
                 # TODO: Use deepmerge instead of update
@@ -319,11 +335,12 @@ def recursive_apply_defaults(defaults: dict, section: dict) -> None:
                 section[value][i] = default_value
 
 
-def calculate_node_names(inventory: dict, cluster: KubernetesCluster) -> dict:
+@enrichment(EnrichmentStage.ALL)
+def calculate_node_names(cluster: KubernetesCluster) -> None:
     roles_iterators: Dict[str, int] = {}
-    for i, node in enumerate(inventory['nodes']):
-        # 'master' role is not deleted because calculate_node_names() can be run over initial inventory,
-        # that still supports the old role.
+    for node in cluster.inventory['nodes']:
+        # 'master' role is not deleted because calculate_node_names() can be run over old inventory,
+        # that may still have the old role (LIGHT enrichment).
         for role_name in ['control-plane', 'master', 'worker', 'balancer']:
             if role_name in node['roles']:
                 # The idea is this:
@@ -350,12 +367,14 @@ def calculate_node_names(inventory: dict, cluster: KubernetesCluster) -> dict:
                     new_name = '%s-%s' % (role_name, role_i)
                     cluster.log.debug(f"Assigning name {new_name} to node {cluster.get_access_address_from_node(node)}")
                     node['name'] = new_name
-    return inventory
 
 
-def verify_node_names(inventory: dict, _: KubernetesCluster) -> dict:
+@enrichment(EnrichmentStage.ALL)
+def verify_nodes(cluster: KubernetesCluster) -> None:
     known_names = []
-    for i, node in enumerate(inventory['nodes']):
+    known_hosts = []
+    known_internal_addresses = []
+    for node in cluster.inventory['nodes']:
         node_name = node['name']
         if node_name in known_names:
             raise Exception('Node name %s is duplicated in configfile' % node_name)
@@ -363,116 +382,160 @@ def verify_node_names(inventory: dict, _: KubernetesCluster) -> dict:
             raise Exception('Node name \"%s\" contains invalid characters. A DNS-1123 subdomain must consist of lower '
                             'case alphanumeric characters, \'-\' or \'.\'' % node_name)
         known_names.append(node_name)
-    return inventory
+
+        host = node['connect_to']
+        if host in known_hosts:
+            raise Exception('Access address %s is duplicated in configfile' % host)
+        known_hosts.append(host)
+
+        internal_address = node['internal_address']
+        if internal_address in known_internal_addresses:
+            raise Exception('Internal address %s is duplicated in configfile' % internal_address)
+        known_internal_addresses.append(internal_address)
+
+    known_gateway_node_names = []
+    for gateway_node in cluster.inventory.get('gateway_nodes', []):
+        node_name = gateway_node['name']
+        if node_name in known_gateway_node_names:
+            raise Exception(f"Gateway node name {node_name} is duplicated in configfile")
+
+        known_gateway_node_names.append(node_name)
 
 
-def calculate_nodegroups(inventory: dict, cluster: KubernetesCluster) -> dict:
-    for role in cluster.ips.keys():
-        cluster.nodes[role] = cluster.make_group(cluster.ips[role])
-    return inventory
+def restrict_connection_sections(inventory: dict) -> dict:
+    """
+    Returns shallow copy of the inventory with only those sections
+    that participate in the enrichment of connections.
+    """
+    inventory = utils.subdict_yaml(inventory, connection_sections)
+    node_defaults = inventory.get('node_defaults', {})
+    if node_defaults:
+        inventory['node_defaults'] = utils.subdict_yaml(node_defaults, ssh_access_default_properties)
 
-
-def merge_defaults(inventory: dict, cluster: KubernetesCluster) -> dict:
-    base_inventory = deepcopy(static.DEFAULTS)
-
-    inventory = default_merger.merge(base_inventory, inventory)
-    # it is necessary to temporary put half-compiled inventory to cluster inventory field
-    cluster._inventory = inventory
-    return inventory
-
-
-def enrich_inventory(cluster: KubernetesCluster, inventory: dict,
-                     make_dumps: bool = True, enrichment_functions: List[str] = None) -> dict:
-    if not enrichment_functions:
-        enrichment_functions = DEFAULT_ENRICHMENT_FNS
-
-    # run required fields calculation
-    for enrichment_fn in enrichment_functions:
-        fn_package_name, fn_method_name = enrichment_fn.rsplit('.', 1)
-        mod = import_module(fn_package_name)
-        cluster.log.verbose('Calling fn "%s"' % enrichment_fn)
-        inventory = getattr(mod, fn_method_name)(inventory, cluster)
-
-    cluster.log.verbose('Enrichment finished!')
-
-    if make_dumps:
-        from kubemarine import controlplane
-        inventory_for_dump = controlplane.controlplane_finalize_inventory(cluster, prepare_for_dump(inventory))
-        utils.dump_file(cluster, yaml.dump(inventory_for_dump, ), "cluster.yaml")
-
-    return inventory
-
-
-def compile_inventory(inventory: dict, cluster: KubernetesCluster) -> dict:
-
-    # convert references in yaml to normal values
-    iterations = 100
-    root = deepcopy(inventory)
-    root['globals'] = static.GLOBALS
-    root['env'] = os.Environ()
-
-    while iterations > 0:
-
-        cluster.log.verbose('Inventory is not rendered yet...')
-        inventory = compile_object(cluster.log, inventory, root)
-
-        temp_dump = yaml.dump(inventory)
-
-        # remove golang specific
-        temp_dump = re.sub(escaped_expression_regex, '', temp_dump.replace('\n', ''))
-
-        # it is necessary to carry out several iterations,
-        # in case we have dynamic variables that reference each other
-        if '{{' in temp_dump or '{%' in temp_dump:
-            iterations -= 1
-        else:
-            iterations = 0
-
-    inventory = compile_object(cluster.log, inventory, root, ignore_jinja_escapes=False)
-
-    from kubemarine import controlplane
-    inventory_for_dump = controlplane.controlplane_finalize_inventory(cluster, prepare_for_dump(inventory))
-    merged_inventory = yaml.dump(inventory_for_dump)
-    utils.dump_file(cluster, merged_inventory, "cluster_precompiled.yaml")
+    nodes = inventory.get('nodes', [])
+    if nodes:
+        inventory['nodes'] = nodes = list(nodes)
+        for i, node in enumerate(nodes):
+            nodes[i] = utils.subdict_yaml(node, ssh_access_node_properties)
 
     return inventory
 
 
-def compile_object(logger: log.EnhancedLogger, struct: Any, root: dict, ignore_jinja_escapes: bool = True) -> Any:
+@enrichment(EnrichmentStage.LIGHT)
+def restrict_connections(cluster: KubernetesCluster) -> dict:
+    return restrict_connection_sections(cluster.inventory)
+
+
+@enrichment(EnrichmentStage.LIGHT)
+def merge_connection_defaults(cluster: KubernetesCluster) -> dict:
+    connection_defaults = restrict_connection_sections(static.DEFAULTS)
+    return _merge_inventory(cluster, connection_defaults)
+
+
+@enrichment(EnrichmentStage.FULL)
+def merge_defaults(cluster: KubernetesCluster) -> dict:
+    return _merge_inventory(cluster, static.DEFAULTS)
+
+
+def _merge_inventory(cluster: KubernetesCluster, base: dict) -> dict:
+    base_inventory = utils.deepcopy_yaml(base)
+    inventory: dict = default_merger.merge(base_inventory, cluster.inventory)
+    return inventory
+
+
+@enrichment(EnrichmentStage.LIGHT)
+def compile_connections(cluster: KubernetesCluster) -> None:
+    return _compile_inventory(cluster, light=True)
+
+
+@enrichment(EnrichmentStage.FULL)
+def compile_inventory(cluster: KubernetesCluster) -> None:
+    return _compile_inventory(cluster, light=False)
+
+
+def _compile_inventory(cluster: KubernetesCluster, *, light: bool) -> None:
+    inventory = cluster.inventory
+
+    extra: Dict[str, Any] = {'env': os.Environ()}
+    if not light:
+        extra['globals'] = static.GLOBALS
+
+    if light:
+        # Management of primitive values is currently not necessary for LIGHT stage.
+        env = Environment(cluster.log, inventory, recursive_compile=True, recursive_extra=extra)
+        jinja.compile_node(inventory, [], env)
+    else:
+        primitives_config = _get_primitive_values_registry()
+        env = Environment(cluster.log, inventory, recursive_compile=True, recursive_extra=extra,
+                          primitives_config=primitives_config)
+        compile_node_with_primitives(inventory, [], env, primitives_config)
+
+    remove_empty_items(inventory)
+
+    dump_inventory(cluster, cluster.context, "cluster_precompiled.yaml")
+
+
+def dump_inventory(cluster: KubernetesCluster, context: dict, filename: str) -> None:
+    if not utils.is_dump_allowed(context, filename):
+        return
+
+    data = yaml.dump(cluster.inventory)
+    utils.dump_file(context, data, filename)
+
+
+PrimitivesConfig = List[Tuple[List[str], Callable[[Any], Any]]]
+
+
+def compile_node_with_primitives(struct: Union[list, dict],
+                                 path: List[Union[str, int]],
+                                 env: jinja.Environment,
+                                 primitives_config: PrimitivesConfig) -> Union[list, dict]:
     if isinstance(struct, list):
-        new_struct = []
         for i, v in enumerate(struct):
-            struct[i] = compile_object(logger, v, root, ignore_jinja_escapes=ignore_jinja_escapes)
-            # delete empty list entries, which can appear after jinja compilation
-            if struct[i] != '':
-                new_struct.append(struct[i])
-        struct = new_struct
-    elif isinstance(struct, dict):
+            struct[i] = compile_object_with_primitives(v, path, i, env, primitives_config)
+    else:
         for k, v in struct.items():
-            struct[k] = compile_object(logger, v, root, ignore_jinja_escapes=ignore_jinja_escapes)
-    elif isinstance(struct, str) and ('{{' in struct or '{%' in struct):
-        struct = compile_string(logger, struct, root, ignore_jinja_escapes=ignore_jinja_escapes)
+            struct[k] = compile_object_with_primitives(v, path, k, env, primitives_config)
 
     return struct
 
 
-def compile_string(logger: log.EnhancedLogger, struct: str, root: dict,
-                   ignore_jinja_escapes: bool = True) -> str:
-    logger.verbose("Rendering \"%s\"" % struct)
+def compile_object_with_primitives(struct: Union[Primitive, list, dict],
+                                   path: List[Index], index: Index,
+                                   env: jinja.Environment,
+                                   primitives_config: PrimitivesConfig) -> Union[Primitive, list, dict]:
+    depth = len(path)
+    primitives_config = choose_nested_primitives_config(primitives_config, depth, index)
 
-    if ignore_jinja_escapes:
-        iterator = escaped_expression_regex.finditer(struct)
-        struct = re.sub(escaped_expression_regex, '', struct)
-        struct = jinja.new(logger, True, root).from_string(struct).render(**root)
-
-        # TODO this does not work for {raw}{jinja}{raw}{jinja}
-        for match in iterator:
-            span = match.span()
-            struct = struct[:span[0]] + match.group() + struct[span[0]:]
+    path.append(index)
+    if isinstance(struct, (list, dict)):
+        if primitives_config:
+            struct = compile_node_with_primitives(struct, path, env, primitives_config)
+        else:
+            struct = jinja.compile_node(struct, path, env)
     else:
-        struct = jinja.new(logger, True, root).from_string(struct).render(**root)
+        if isinstance(struct, str) and jinja.is_template(struct):
+            struct = env.compile_string(struct, jinja.Path(path))
 
-    logger.verbose("\tRendered as \"%s\"" % struct)
+        struct = convert_primitive(struct, path, primitives_config)
+
+    path.pop()
+    return struct
+
+
+def remove_empty_items(struct: Any) -> Any:
+    if isinstance(struct, list):
+        new_struct = []
+        for v in struct:
+            v = remove_empty_items(v)
+            # delete empty list entries, which can appear after jinja compilation
+            if v != '':
+                new_struct.append(v)
+        struct = new_struct
+    elif isinstance(struct, dict):
+        for k, v in struct.items():
+            struct[k] = remove_empty_items(v)
+
     return struct
 
 
@@ -489,33 +552,170 @@ def escape_jinja_characters_for_inventory(cluster: KubernetesCluster, obj: Any) 
 
 
 def _escape_jinja_character(value: str) -> str:
-    if '{{' in value and '}}' in value and re.search(jinja_query_regex, value):
-        matches = re.findall(jinja_query_regex, value)
-        for match in matches:
-            # TODO: rewrite to correct way of match replacement: now it can cause "{raw}{raw}xxx.." circular bug
-            value = value.replace(match, '{% raw %}'+match+'{% endraw %}')
+    if jinja.is_template(value):
+        value = '{{ %s }}' % (json.JSONEncoder().encode(value),)
+
     return value
 
 
-def prepare_for_dump(inventory: dict, copy: bool = True) -> dict:
-    # different preparations before the inventory can be dumped
+def _get_primitive_values_registry() -> PrimitivesConfig:
+    return [
+        (['services', 'cri', 'containerdConfig',
+          'plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options',
+          'SystemdCgroup'], utils.strtobool),
+        (['services', 'modprobe', '*', '*', 'install'], utils.strtobool),
+        # kernel parameters are actually not always represented as integers
+        (['services', 'sysctl', '*', 'value'], utils.strtoint),
+        (['services', 'sysctl', '*', 'install'], utils.strtobool),
+        # kernel parameters are actually not always represented as integers
+        (['patches', '*', 'services', 'sysctl', '*', 'value'], utils.strtoint),
+        (['patches', '*', 'services', 'sysctl', '*', 'install'], utils.strtobool),
+        (['plugins', '*', 'install'], utils.strtobool),
+        (['plugins', 'calico', 'typha', 'enabled'], utils.strtobool),
+        (['plugins', 'calico', 'typha', 'replicas'], utils.strtoint),
+        (['plugins', 'nginx-ingress-controller', 'ports', '*', 'hostPort'], utils.strtoint),
+    ]
 
-    if copy:
-        dump_inventory = deepcopy(inventory)
-    else:
-        dump_inventory = inventory
 
-    return dump_inventory
-
-
-def manage_true_false_values(inventory: dict, _: KubernetesCluster) -> dict:
-    # Check undefined values for plugin.name.install and convert it to bool
-    for plugin_name, plugin_item in inventory["plugins"].items():
-        # Check install value
-        if 'install' not in plugin_item:
+def choose_nested_primitives_config(primitives_config: PrimitivesConfig, depth: int, index: Index) -> PrimitivesConfig:
+    nested_config = []
+    for search in primitives_config:
+        search_path = search[0]
+        if depth == len(search_path):
             continue
-        value = utils.true_or_false(plugin_item.get('install', False))
-        if value == 'undefined':
-            raise ValueError(f"Found unsupported value for plugin.{plugin_name}.install: {plugin_item['install']}")
-        plugin_item['install'] = value == 'true'
-    return inventory
+
+        section = search_path[depth]
+        if section in ('*', index):
+            nested_config.append(search)
+
+    return nested_config
+
+
+def convert_primitive(struct: Primitive, path: Sequence[Index], primitives_config: PrimitivesConfig) -> Primitive:
+    for search_path, func in primitives_config:
+        if len(search_path) == len(path):
+            try:
+                struct = func(struct)
+            except ValueError as e:
+                raise ValueError(f"{str(e)} in section {utils.pretty_path(path)}") from None
+
+    return struct
+
+
+class NodePrimitives(jinja.JinjaNode):
+    """
+    A Node that both compiles template strings and converts primitive values in the underlying `dict` or `list`.
+    """
+
+    def __init__(self, delegate: Union[dict, list], *,
+                 path: jinja.Path, env: jinja.Environment,
+                 primitives_config: PrimitivesConfig):
+        super().__init__(delegate, path=path, env=env)
+        self.primitives_config = primitives_config
+
+    def _child(self, index: Index, val: Union[list, dict]) -> jinja.Node:
+        primitives_config = self._nested_primitives_config(index)
+        return self._child_type(index)(val, path=self.path + (index,), env=self.env,
+                                       primitives_config=primitives_config)
+
+    def _child_type(self, _: Index) -> Type['NodePrimitives']:
+        return NodePrimitives
+
+    def _convert(self, index: Index, val: Primitive) -> Primitive:
+        val = super()._convert(index, val)
+
+        primitives_config = self._nested_primitives_config(index)
+        val = convert_primitive(val, self.path + (index,), primitives_config)
+
+        return val
+
+    def _nested_primitives_config(self, index: Index) -> PrimitivesConfig:
+        depth = len(self.path)
+        return choose_nested_primitives_config(self.primitives_config, depth, index)
+
+
+class NodesCustomization:
+    """
+    Customize access to the particular sections of the inventory.
+    """
+
+    # pylint: disable=no-self-argument
+
+    def __init__(nodes) -> None:
+        # The classes below should customize access to the sections of the inventory,
+        # while preserving the global behaviour of Node implementations: NodePrimitives, JinjaNode, Node.
+
+        class Kubeadm(Node):
+            def descend(self, index: Index) -> Union[Primitive, Node]:
+                child: Union[Primitive, Node] = super().descend(index)
+
+                if index == 'kubernetesVersion':
+                    kubernetes.verify_allowed_version(cast(str, child))
+
+                return child
+
+        class Services(Node):
+            def _child_type(self, index: Index) -> Type[Node]:
+                if index == 'kubeadm':
+                    return nodes.Kubeadm
+
+                return super()._child_type(index)
+
+        class Root(Node):
+            def _child_type(self, index: Index) -> Type[Node]:
+                if index == 'services':
+                    return nodes.Services
+
+                return super()._child_type(index)
+
+        nodes.Kubeadm: Type[Node] = Kubeadm
+        nodes.Services: Type[Node] = Services
+        nodes.Root: Type[Node] = Root
+
+    def derive(nodes, Base: Type[Node], delegate: dict, **kwargs: Any) -> Node:
+        nodes.Kubeadm = cast(Type[Node], type("Kubeadm", (nodes.Kubeadm, Base), {}))
+        nodes.Services = cast(Type[Node], type("Services", (nodes.Services, Base), {}))
+        nodes.Root = cast(Type[Node], type("Root", (nodes.Root, Base), {}))
+
+        return nodes.Root(delegate, **kwargs)
+
+
+class Environment(jinja.Environment):
+    """
+    Environment that supports recursive compilation and on-the-fly conversion of primitive values.
+
+    It also customizes access to the particular sections of the inventory.
+    """
+
+    def __init__(self, logger: log.EnhancedLogger, recursive_values: dict,
+                 *,
+                 recursive_compile: bool = False,
+                 recursive_extra: Dict[str, Any] = None,
+                 primitives_config: PrimitivesConfig = None):
+        """
+        Instantiate new environment and set default filters.
+
+        :param logger: EnhancedLogger
+        :param recursive_values: The render values access to which should be customized.
+                                 They may also be automatically converted and compiled if necessary.
+        :param recursive_compile: Flag that enables recursive compilation.
+        :param recursive_extra: If recursive compilation occurs, these render values are supplied to the template.
+        :param primitives_config: List of sections and convertors of primitive values.
+        """
+        self.recursive_compile = recursive_compile
+        self.primitives_config = primitives_config
+        super().__init__(logger, recursive_values, recursive_extra=recursive_extra)
+
+    def create_root(self, delegate: dict) -> Node:
+        kwargs = {}
+        Base: Type[Node]
+        if not self.recursive_compile:
+            Base = Node
+        else:
+            Base = jinja.JinjaNode
+            kwargs = {"path": jinja.Path(), "env": self}
+            if self.primitives_config is not None:
+                Base = NodePrimitives
+                kwargs = {**kwargs, "primitives_config": self.primitives_config}
+
+        return NodesCustomization().derive(Base, delegate, **kwargs)

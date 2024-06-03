@@ -12,58 +12,52 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import logging
 import os
-import tempfile
 import unittest
 from typing import List
-from unittest import mock
+from test.unit import utils as test_utils
 
 import yaml
 
 from kubemarine import demo, thirdparties
-from kubemarine.core import utils, log, static
+from kubemarine.core import utils, static
 from kubemarine.procedures import restore, backup
-from test.unit import utils as test_utils
 
 
-class RestoreEnrichmentTest(unittest.TestCase):
+class RestoreEnrichmentTest(test_utils.CommonTest):
     def setUp(self):
-        self.tmpdir = tempfile.TemporaryDirectory()
         self.inventory = demo.generate_inventory(**demo.FULLHA_KEEPALIVED)
 
         self.context = self._create_context(['--without-act'])
-        utils.prepare_dump_directory(self.context['execution_arguments']['dump_location'])
+        utils.prepare_dump_directory(self.context)
 
-        self.restore_tmpdir = os.path.join(self.tmpdir.name, 'restore_test')
+        self.restore_tmpdir = os.path.join(self.tmpdir, 'restore_test')
         os.mkdir(self.restore_tmpdir)
 
-        self.backup_location = os.path.join(self.tmpdir.name, 'backup.tar.gz')
+        self.backup_location = os.path.join(self.tmpdir, 'backup.tar.gz')
         self.restore = demo.generate_procedure_inventory('restore')
         self.restore['backup_location'] = self.backup_location
 
-    def tearDown(self):
-        logger = logging.getLogger("k8s.fake.local")
-        for h in logger.handlers:
-            if isinstance(h, log.FileHandlerWithHeader):
-                h.close()
-        self.tmpdir.cleanup()
+    def run(self, *args, **kwargs):
+        with test_utils.temporary_directory(self):
+            return super().run(*args, **kwargs)
 
     def _create_context(self, args: List[str]) -> dict:
         context = demo.create_silent_context(['fake_path.yaml'] + args, procedure='restore')
 
         args = context['execution_arguments']
         args['disable_dump'] = False
-        args['dump_location'] = self.tmpdir.name
+        args['dump_location'] = self.tmpdir
 
         return context
 
     def _run(self) -> demo.FakeResources:
-        resources = demo.FakeResources(self.context, self.inventory,
-                                       procedure_inventory=self.restore,
-                                       nodes_context=demo.generate_nodes_context(self.inventory))
+        resources = test_utils.FakeResources(self.context, self.inventory,
+                                             procedure_inventory=self.restore,
+                                             nodes_context=demo.generate_nodes_context(self.inventory))
 
-        restore.RestoreFlow()._run(resources)
+        restore.RestoreFlow()._run(resources)  # pylint: disable=protected-access
+
         return resources
 
     def _pack_descriptor(self, backup_descriptor: dict):
@@ -80,17 +74,14 @@ class RestoreEnrichmentTest(unittest.TestCase):
         self._pack_data()
 
         resources = self._run()
-        cluster = resources.last_cluster
 
-        self.assertEqual('v1.27.4', cluster.inventory['services']['kubeadm']['kubernetesVersion'],
+        self.assertEqual('v1.27.4', resources.working_inventory['services']['kubeadm']['kubernetesVersion'],
                          "Kubernetes version was not restored from backup")
 
-        test_utils.stub_associations_packages(cluster, {})
-        finalized_inventory = cluster.make_finalized_inventory()
-        self.assertEqual('v1.27.4', finalized_inventory['services']['kubeadm']['kubernetesVersion'],
+        self.assertEqual('v1.27.4', resources.finalized_inventory['services']['kubeadm']['kubernetesVersion'],
                          "Kubernetes version was not restored from backup")
 
-        self.assertEqual('v1.27.4', resources.stored_inventory['services']['kubeadm']['kubernetesVersion'],
+        self.assertEqual('v1.27.4', resources.inventory()['services']['kubeadm']['kubernetesVersion'],
                          "Kubernetes version was not restored from backup")
 
     def test_enrich_and_finalize_inventory_thirdparties(self):
@@ -118,11 +109,10 @@ class RestoreEnrichmentTest(unittest.TestCase):
         self._pack_descriptor({})
         self._pack_data()
 
-        with mock.patch.object(thirdparties, thirdparties.install_thirdparty.__name__) as install_thirdparty:
+        with test_utils.mock_call(thirdparties.install_thirdparty):
             resources = self._run()
-        cluster = resources.last_cluster
 
-        thirdparties_section = cluster.inventory['services']['thirdparties']
+        thirdparties_section = resources.working_inventory['services']['thirdparties']
         self.assertEqual(all_thirdparties, set(thirdparties_section.keys()))
         self.assertEqual('kubectl-old', thirdparties_section['/usr/bin/kubectl']['source'])
         self.assertEqual('kubectl-sha1-old', thirdparties_section['/usr/bin/kubectl']['sha1'])
@@ -131,9 +121,7 @@ class RestoreEnrichmentTest(unittest.TestCase):
         self.assertEqual('kubelet-old', thirdparties_section['/usr/bin/kubelet']['source'])
         self.assertIsNone(thirdparties_section['/usr/bin/kubelet'].get('sha1'))
 
-        test_utils.stub_associations_packages(cluster, {})
-        finalized_inventory = cluster.make_finalized_inventory()
-        thirdparties_section = finalized_inventory['services']['thirdparties']
+        thirdparties_section = resources.finalized_inventory['services']['thirdparties']
 
         self.assertEqual(all_thirdparties, set(thirdparties_section.keys()))
         self.assertEqual('kubectl-old', thirdparties_section['/usr/bin/kubectl']['source'])
@@ -143,7 +131,7 @@ class RestoreEnrichmentTest(unittest.TestCase):
         self.assertEqual('kubelet-old', thirdparties_section['/usr/bin/kubelet']['source'])
         self.assertIsNone(thirdparties_section['/usr/bin/kubelet'].get('sha1'))
 
-        thirdparties_section = resources.stored_inventory['services']['thirdparties']
+        thirdparties_section = resources.inventory()['services']['thirdparties']
         self.assertEqual({'/usr/bin/kubectl', '/usr/bin/kubelet', '/usr/bin/kubeadm'},
                          set(thirdparties_section.keys()))
         self.assertEqual('kubectl-old', thirdparties_section['/usr/bin/kubectl']['source'])

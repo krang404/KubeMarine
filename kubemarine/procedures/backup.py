@@ -27,16 +27,13 @@ import uuid
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from queue import Queue
-from typing import List, Tuple, Union, Dict, Optional, Iterator
-from typing_extensions import Literal
+from typing import List, Tuple, Union, Dict, Optional, Iterator, Literal
 
 import yaml
 
 from kubemarine.core import utils, flow, log
-from kubemarine.core.action import Action
 from kubemarine.core.cluster import KubernetesCluster
 from kubemarine.core.group import NodeGroup, RemoteExecutor
-from kubemarine.core.resources import DynamicResources
 from kubemarine.cri import containerd
 
 
@@ -64,16 +61,12 @@ def get_default_backup_files_list(cluster: KubernetesCluster) -> List[str]:
         "/etc/systemd/system/kubelet.service"
     ]
 
-    cri_impl = cluster.inventory['services']['cri']['containerRuntime']
-    if cri_impl == "docker":
-        backup_files_list.append("/etc/docker/daemon.json")
-    elif cri_impl == "containerd":
-        backup_files_list.append("/etc/containerd/config.toml")
-        backup_files_list.append("/etc/crictl.yaml")
-        backup_files_list.append("/etc/ctr/kubemarine_ctr_flags.conf")
-        config_path = containerd.get_config_path(cluster.inventory)
-        if config_path:
-            backup_files_list.append(config_path)
+    backup_files_list.append("/etc/containerd/config.toml")
+    backup_files_list.append("/etc/crictl.yaml")
+    backup_files_list.append("/etc/ctr/kubemarine_ctr_flags.conf")
+    config_path = containerd.get_config_path(cluster.inventory)
+    if config_path:
+        backup_files_list.append(config_path)
 
 
     return backup_files_list
@@ -167,7 +160,7 @@ def export_nodes(cluster: KubernetesCluster) -> None:
 def export_etcd(cluster: KubernetesCluster) -> None:
     backup_directory = prepare_backup_tmpdir(cluster.log, cluster.context)
     etcd_node, is_custom_etcd_node = select_etcd_node(cluster)
-    cluster.context['backup_descriptor']['etcd']['image'] = retrieve_etcd_image(cluster, etcd_node)
+    cluster.context['backup_descriptor']['etcd']['image'] = retrieve_etcd_image(etcd_node)
 
     # Try to detect cluster health and other metadata like db size, leader
     etcd_status = None
@@ -230,30 +223,19 @@ def select_etcd_node(cluster: KubernetesCluster) -> Tuple[NodeGroup, bool]:
         return cluster.nodes['control-plane'].get_any_member(), False
 
 
-def retrieve_etcd_image(cluster: KubernetesCluster, etcd_node: NodeGroup) -> str:
+def retrieve_etcd_image(etcd_node: NodeGroup) -> str:
     # TODO: Detect ETCD version via /etc/kubernetes/manifests/etcd.yaml config if presented, otherwise use containers
     node_name = etcd_node.get_node_name()
-    if "docker" == cluster.inventory['services']['cri']['containerRuntime']:
-        cont_inspect = "docker inspect $(sudo docker ps -a | grep etcd-%s | awk '{print $1; exit}')" % node_name
-        etcd_container_json = json.loads(list(etcd_node.sudo(cont_inspect).values())[0].stdout)[0]
-        etcd_image_sha = etcd_container_json['Image'][7:]  # remove "sha256:" prefix
 
-        images_result = etcd_node.sudo("docker image ls --format '{{json .}}'")
-        formatted_images_result = "[" + ",".join(list(images_result.values())[0].stdout.strip().split('\n')) + "]"
-        images_json = json.loads(formatted_images_result)
-        for image in images_json:
-            if image['ID'] == etcd_image_sha[:len(image['ID'])]:
-                return f"{image['Repository']}:{image['Tag']}"
-    else:
-        cont_search = "sudo crictl ps --label io.kubernetes.pod.name=etcd-%s -aq | awk '{print $1; exit}'" % node_name
-        cont_inspect = f"crictl inspect $({cont_search})"
-        etcd_container_json = json.loads(list(etcd_node.sudo(cont_inspect).values())[0].stdout)
-        etcd_image_sha = etcd_container_json['info']['config']['image']['image']
+    cont_search = "sudo crictl ps --label io.kubernetes.pod.name=etcd-%s -aq | awk '{print $1; exit}'" % node_name
+    cont_inspect = f"crictl inspect $({cont_search})"
+    etcd_container_json = json.loads(list(etcd_node.sudo(cont_inspect).values())[0].stdout)
+    etcd_image_sha = etcd_container_json['info']['config']['image']['image']
 
-        images_json = json.loads(list(etcd_node.sudo("crictl images -v -o json").values())[0].stdout)['images']
-        for image in images_json:
-            if image['id'] == etcd_image_sha:
-                return f"{image['repoTags'][0]}"
+    images_json = json.loads(list(etcd_node.sudo("crictl images -v -o json").values())[0].stdout)['images']
+    for image in images_json:
+        if image['id'] == etcd_image_sha:
+            return f"{image['repoTags'][0]}"
 
     raise Exception("Unable to find etcd image on node %s" % node_name)
 
@@ -412,7 +394,18 @@ class ExportKubernetesParser:
         items_by_resource: Dict[str, List[str]] = {}
 
         def append_item(api_version: str, kind: str, item: str) -> None:
-            resource_name = next(r['name'] for r in resources if r['apiVersion'] == api_version and r['kind'] == kind)
+            resource_name = next((
+                r['name'] for r in resources
+                if r['apiVersion'] == api_version
+                and (r['kind'] == kind
+                     # TODO remove this W/A for future releases having https://github.com/kubernetes/kubectl/issues/1593 resolved
+                     or kind in ('ValidatingAdmissionPolicyList', 'ValidatingAdmissionPolicyBindingList')
+                     and r['kind'] == kind[:-len('List')])
+            ), None)
+
+            if resource_name is None:
+                raise Exception(f"Failed to find resource name for apiVersion: {api_version}, kind: {kind}")
+
             items_by_resource.setdefault(resource_name, []).append(item)
 
         with gzip.open(payload.resource_path, 'rt', encoding='utf-8') as file:
@@ -537,6 +530,10 @@ class ExportKubernetesDownloader:
                 if task is None:
                     break
 
+                # Skip task with empty resource list
+                if not task.resources:
+                    continue
+
                 random = uuid.uuid4().hex
                 temp_local_filepath = os.path.join(self.backup_directory, random)
                 self._download(task, temp_local_filepath)
@@ -545,7 +542,7 @@ class ExportKubernetesDownloader:
         except BaseException as e:
             self.parser.finish(graceful=False)
             if task is not None:
-                raise DownloadException(task, e)
+                raise DownloadException(task, e) from None
             else:
                 raise
         else:
@@ -556,7 +553,7 @@ class ExportKubernetesDownloader:
 
     def _download(self, task: DownloaderPayload, temp_local_filepath: str) -> None:
         namespace = task.namespace
-        temp_remote_filepath = f"/tmp/{os.path.basename(temp_local_filepath)}"
+        temp_remote_filepath = utils.get_remote_tmp_path(os.path.basename(temp_local_filepath))
 
         cmd = f'(set -o pipefail && sudo kubectl ' \
               f'{"" if namespace is None else ("-n " + namespace + " ")}' \
@@ -585,12 +582,12 @@ def export_kubernetes(cluster: KubernetesCluster) -> None:
 
     logger.debug('Loading namespaced resource types:')
     loaded_resources = _load_resources(logger, control_plane, True)
-    proposed_resources = backup_kubernetes.get('namespaced_resources', {}).get('resources', 'all')
+    proposed_resources = backup_kubernetes.get('namespaced_resources', {}).get('resources', [])
     namespaced_resources = _filter_resources_by_proposed(logger, loaded_resources, proposed_resources, 'resource')
 
     logger.debug('Loading non-namespaced resource types:')
     loaded_resources = _load_resources(logger, control_plane, False)
-    proposed_resources = backup_kubernetes.get('nonnamespaced_resources', 'all')
+    proposed_resources = backup_kubernetes.get('nonnamespaced_resources', [])
     nonnamespaced_resources = _filter_resources_by_proposed(logger, loaded_resources, proposed_resources, 'resource')
 
     logger.debug('Loading resources:')
@@ -628,7 +625,8 @@ def export_kubernetes(cluster: KubernetesCluster) -> None:
                 except BaseException as e:
                     logger.verbose(e)
                     if isinstance(e, DownloadException):
-                        logger.error(f"Failed to download resources {','.join(e.task.resources)} for namespace {e.task.namespace}")
+                        logger.error(f"Failed to download resources {','.join(e.task.resources)} "
+                                     f"for namespace {e.task.namespace}")
                         exc = e.reason
                     else:
                         exc = e
@@ -690,7 +688,7 @@ def pack_data(cluster: KubernetesCluster) -> None:
 
 def pack_to_tgz(target_archive: str, source_dir: str) -> None:
     with tarfile.open(target_archive, "w:gz") as tar_handle:
-        for root, dirs, files in os.walk(source_dir):
+        for root, _, files in os.walk(source_dir):
             for file in files:
                 pathname = os.path.join(root, file)
                 tar_handle.add(pathname, pathname.replace(source_dir, ''))
@@ -718,12 +716,9 @@ tasks = OrderedDict({
 })
 
 
-class BackupAction(Action):
+class BackupAction(flow.TasksAction):
     def __init__(self) -> None:
-        super().__init__('backup')
-
-    def run(self, res: DynamicResources) -> None:
-        flow.run_tasks(res, tasks)
+        super().__init__('backup', tasks)
 
 
 def create_context(cli_arguments: List[str] = None) -> dict:

@@ -238,19 +238,23 @@ class Processor(ABC):
                 self.log.verbose(f"The current version of original yaml does not include "
                                  f"the following object: {key}")
 
+    def original_manifest(self) -> Manifest:
+        """
+        get original YAML and parse it into list of objects
+        """
+        try:
+            with utils.open_utf8(self.manifest_path, 'r') as stream:
+                return Manifest(self.manifest_identity, stream)
+        except Exception as exc:
+            raise Exception(f"Failed to load {self.manifest_identity.repr_id()} from {self.manifest_path} "
+                            f"for {self.plugin_name!r} plugin") from exc
+
     def enrich(self) -> Manifest:
         """
         The method implements full processing for the plugin main manifest.
         """
 
-        # get original YAML and parse it into list of objects
-        try:
-            with utils.open_utf8(self.manifest_path, 'r') as stream:
-                manifest = Manifest(self.manifest_identity, stream)
-        except Exception as exc:
-            raise Exception(f"Failed to load {self.manifest_identity.repr_id()} from {self.manifest_path} "
-                            f"for {self.plugin_name!r} plugin") from exc
-
+        manifest = self.original_manifest()
         self.validate_original(manifest)
 
         # call enrichment functions one by one
@@ -303,11 +307,10 @@ class Processor(ABC):
         return f'{self.manifest_identity.name}-{self.get_version()}.yaml'
 
     def assign_default_pss_labels(self, manifest: Manifest, namespace: str) -> None:
-        key = f"Namespace_{namespace}"
-        rbac = self.inventory['rbac']
-        if rbac['admission'] == 'pss' and rbac['pss']['pod-security'] == 'enabled':
-            from kubemarine import admission
+        from kubemarine import admission  # pylint: disable=cyclic-import
 
+        key = f"Namespace_{namespace}"
+        if admission.is_security_enabled(self.inventory):
             profile = self.get_namespace_to_necessary_pss_profiles()[namespace]
             target_labels = admission.get_labels_to_ensure_profile(self.inventory, profile)
             if not target_labels:
@@ -370,6 +373,44 @@ class Processor(ABC):
 
         return image
 
+    def enrich_volume_and_volumemount(self, source_yaml: dict, serviceaccount: str, init_container_name: str = None) -> None:
+        """
+        Add a secret as volume and mount to the specified container in the manifest.
+
+        :param manifest: The Manifest object to operate with.
+        :param key: The key identifying the object in the manifest.
+        """
+
+        if 'volumes' not in source_yaml['spec']['template']['spec']:
+            source_yaml['spec']['template']['spec']['volumes'] = []
+
+        if 'volumeMounts' not in source_yaml['spec']['template']['spec']['containers'][0]:
+            source_yaml['spec']['template']['spec']['containers'][0]['volumeMounts'] = []
+
+        volume_names = [volume["name"] for volume in source_yaml["spec"]["template"]["spec"]["volumes"]]
+        if f"{serviceaccount}-token" not in volume_names:
+            source_yaml['spec']['template']['spec']['volumes'].append({
+                'name': f'{serviceaccount}-token',
+                'secret': {
+                    'secretName': f'{serviceaccount}-token'  
+                }
+            })
+        source_yaml['spec']['template']['spec']['containers'][0]['volumeMounts'].append({
+            'name': f'{serviceaccount}-token',
+            'mountPath': '/var/run/secrets/kubernetes.io/serviceaccount'
+        })
+
+        init_containers = source_yaml['spec']['template']['spec'].get('initContainers', [])
+        target_container = next((c for c in init_containers if c['name'] == init_container_name), None)
+        if target_container:
+            if 'volumeMounts' not in target_container:
+                target_container['volumeMounts'] = []
+            if f"{serviceaccount}-token" not in [vm['name'] for vm in target_container['volumeMounts']]:
+                target_container['volumeMounts'].append({
+                    'name': f'{serviceaccount}-token',
+                    'mountPath': '/var/run/secrets/kubernetes.io/serviceaccount'
+                })
+
     def enrich_image_for_container(self, manifest: Manifest, key: str,
                                    *,
                                    plugin_service: Optional[str] = None,
@@ -419,7 +460,8 @@ class Processor(ABC):
         container['resources'] = plugin_service_section['resources']
 
         self.log.verbose(f"The {key} has been patched in "
-                         f"'spec.template.spec.containers.[{container_pos}].resources' with {plugin_service_section['resources']!r}")
+                         f"'spec.template.spec.containers.[{container_pos}].resources' "
+                         f"with {plugin_service_section['resources']!r}")
 
     def enrich_args_for_container(self, manifest: Manifest, key: str,
                                   *,
@@ -469,10 +511,10 @@ class Processor(ABC):
                     raise Exception(
                         f"{extra_arg_key!r} argument is already defined in "
                         f"'spec.template.spec.containers.[{container_pos}].args' for the {key}.")
-            else:
-                container_args.append(extra_arg)
-                self.log.verbose(f"The {extra_arg!r} argument has been added to "
-                                 f"'spec.template.spec.containers.[{container_pos}].args' in the {key}")
+
+            container_args.append(extra_arg)
+            self.log.verbose(f"The {extra_arg!r} argument has been added to "
+                             f"'spec.template.spec.containers.[{container_pos}].args' in the {key}")
 
     def enrich_env_for_container(self, manifest: Manifest, key: str,
                                  *,
@@ -510,9 +552,9 @@ class Processor(ABC):
         env_update: Dict[str, dict] = {}
 
         def update_env(name: str, value: Union[str, dict]) -> None:
-            if type(value) is str:
+            if isinstance(value, str):
                 env_update[name] = {'value': value}
-            elif type(value) is dict:
+            elif isinstance(value, dict):
                 env_update[name] = {'valueFrom': value}
             self.log.verbose(f"The {key} has been patched in "
                              f"'spec.template.spec.containers.[{container_pos}].env.{name}' with '{value}'")
@@ -541,9 +583,9 @@ class Processor(ABC):
 
             value = env_update.pop(name)
             keys = list(env.keys())
-            for key in keys:
-                if key != 'name' and key not in value:
-                    del env[key]
+            for k in keys:
+                if k != 'name' and k not in value:
+                    del env[k]
 
             env.update(value)
 

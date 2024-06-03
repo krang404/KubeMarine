@@ -16,20 +16,33 @@ import fileinput
 import subprocess
 import sys
 from typing import List
+import tarfile
 
-PYINSTALLER_VERSION = "5.12.0"
+# pylint: disable=bad-builtin
+
+PIP_VERSION = "24.0"
 
 
 def call(args: List[str]) -> None:
     return_code = subprocess.call(args)
     if return_code != 0:
-        exit(return_code)
+        sys.exit(return_code)
 
+
+# Copy ipip_check from package
+with open('kubemarine/version', 'r', encoding='utf-8') as version_file:
+    version = version_file.readline().split('\n')[0].split('v')[1]
+
+with tarfile.open(f"dist/kubemarine-{version}.tar.gz") as arch:
+    file_obj = arch.extractfile(f"kubemarine-{version}/kubemarine/resources/scripts/ipip_check.gz")
+    with open('kubemarine/resources/scripts/ipip_check.gz', 'wb') as binary:
+        if file_obj is not None:
+            binary.write(file_obj.read())
 
 # Install exact version of pip, because 'scripts/ci/install_package.py' relies on its internal implementation.
 # Note that downgrade is possible.
-# https://github.com/pypa/pip/blob/23.0/docs/html/user_guide.rst#using-pip-from-your-program
-call([sys.executable, '-m', 'pip', 'install', 'pip==23.0'])
+# https://github.com/pypa/pip/blob/24.0/docs/html/user_guide.rst#using-pip-from-your-program
+call([sys.executable, '-m', 'pip', 'install', f'pip=={PIP_VERSION}'])
 
 target_arch = None
 if len(sys.argv) > 1:
@@ -40,9 +53,16 @@ if target_arch:
     install_package.append(target_arch)
 call(install_package)
 
+if target_arch == 'arm64':
+    # universal2 build for macOS is not really universal, and this won't be fixed
+    # https://sourceforge.net/p/ruamel-yaml-clib/tickets/20/
+    # At the same time, the dependency is optional and is going to be removed.
+    # https://sourceforge.net/p/ruamel-yaml-clib/tickets/33/#0443
+    call(['pip', 'uninstall', '-y', 'ruamel.yaml.clib'])
+
 # To avoid ambiguity, remove Kubemarine package to surely run PyInstaller on sources.
 call(['pip', 'uninstall', '-y', 'kubemarine'])
-call(['pip', 'install', f'pyinstaller=={PYINSTALLER_VERSION}'])
+call(['pip', 'install', '-r', 'requirements-pyinstaller.txt'])
 
 if target_arch:
     with fileinput.FileInput('kubemarine.spec', inplace=True) as file:

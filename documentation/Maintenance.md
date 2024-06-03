@@ -1,6 +1,7 @@
 This section describes the features and steps for performing maintenance procedures on the existing Kubernetes cluster.
 
 - [Prerequisites](#prerequisites)
+- [Basics](#basics)
 - [Provided Procedures](#provided-procedures)
     - [Kubemarine Migration Procedure](#kubemarine-migration-procedure)
       - [Software Upgrade Patches](#software-upgrade-patches)
@@ -10,12 +11,10 @@ This section describes the features and steps for performing maintenance procedu
     - [Add Node Procedure](#add-node-procedure)
       - [Operating System Migration](#operating-system-migration)
     - [Remove Node Procedure](#remove-node-procedure)
-    - [Manage PSP Procedure](#manage-psp-procedure)
+    - [Reconfigure Procedure](#reconfigure-procedure)
     - [Manage PSS Procedure](#manage-pss-procedure)
     - [Reboot Procedure](#reboot-procedure)
     - [Certificate Renew Procedure](#certificate-renew-procedure)
-    - [Cri Migration Procedure](#cri-migration-procedure)
-    - [Admission Migration Procedure](#admission-migration-procedure)
 - [Procedure Execution](#procedure-execution)
     - [Procedure Execution From CLI](#procedure-execution-from-cli)
     - [Logging](#logging)
@@ -25,10 +24,12 @@ This section describes the features and steps for performing maintenance procedu
       - [Images Prepull](#images-prepull)
 - [Additional Procedures](#additional-procedures)
     - [Changing Calico Settings](#changing-calico-settings)
-    - [Data Encryption in Kubernetes](#data-encryption-in-kubernetes)
+    - [Data Encryption in Kubernetes](internal/Hardening.md#data-encryption-in-kubernetes)
     - [Changing Cluster CIDR](#changing-cluster-cidr)
     - [Kubelet Server Certificate Approval](#kubelet-server-certificate-approval)
 - [Common Practice](#common-practice)
+  - [Security Hardening Guide](#security-hardening-guide)
+  - [Worker Nodes Should be Managed by Kubelet](#worker-nodes-should-be-managed-by-kubelet)
 
 # Prerequisites
 
@@ -40,10 +41,21 @@ Before you start any maintenance procedure, you must complete the following mand
 1. If using custom RPM repositories, make sure they are online, accessible from nodes, and you are able to perform repository updates.
 1. Prepare the latest actual **cluster.yaml** that should contain information about the current cluster state. For more information, refer to the [Kubemarine Inventory Preparation](Installation.md#inventory-preparation) section in _Kubemarine Installation Procedure_.
 
-   **Note**: If you provide an incorrect config file, it can cause unknown consequences.
+   **Note**: If you provide an incorrect config file, it can cause unknown consequences. For more information, refer to [Basics](#basics). 
 
 1. Prepare **procedure.yaml** file containing the configuration for the procedure that you are about to perform. Each procedure has its own configuration format. Read documentation below to fill procedure inventory data.
 
+# Basics
+
+According to the Kubemarine concept, `cluster.yaml` is a reflection of the Kubernetes cluster state.
+Therefore, any changes on the cluster must be reflected in `cluster.yaml` in the corresponding section to be consistent with the cluster state.
+This is an important practice even if the `cluster.yaml` section or option is applicable only for the installation procedure because the particular `cluster.yaml` can be used for the reinstallation or reproduction of some cases.
+For the changes that cannot be reflected in `cluster.yaml`, the appropriate comments can be used.
+
+The maintenance of the cluster can be done in two scenarios:
+
+- It can be performed using some Kubemarine procedure. In this case, Kubemarine does its best to keep `cluster.yaml` and the cluster consistent to each other.
+- The cluster can be reconfigured manually. In this case, the user should also manually reflect the changes in the `cluster.yaml`.
 
 # Provided Procedures
 
@@ -106,7 +118,7 @@ For more information, refer to [Packages Upgrade Patches](#packages-upgrade-patc
 
 The upgrade is performed node-by-node. The process for each node is as follows:
 1. All the pods are drained from the node.
-2. The docker or containerd is upgraded.
+2. Containerd is upgraded.
 3. All containers on the node are deleted.
 4. The node is returned to the cluster for scheduling.
 
@@ -147,7 +159,7 @@ By default, it is not required to provide information about thirdparties.
 They are upgraded automatically as required.
 You can provide this information if you want to have better control over their versions.
 Also, you have to explicitly provide thirdparties `source` if you have specified this information in the `cluster.yaml`.
-It is because in this case, you take full control over the thirdparties' versions and the defaults do not apply.
+It is because in this case, you take a full control over the thirdparties' versions and the defaults do not apply.
 
 #### Packages Upgrade Patches
 
@@ -157,17 +169,16 @@ Patches that upgrade system packages have the following identifiers:
 * `upgrade_haproxy` - It upgrades the Haproxy service on all balancers.
 * `upgrade_keepalived` - It upgrades the Keepalived service on all balancers.
 
-System packages such as docker, containerd, haproxy, and keepalived are upgraded automatically as required.
+System packages such as containerd, haproxy, and keepalived are upgraded automatically as required.
 You can influence the system packages' upgrade using the `packages` section as follows:
 
 ```yaml
 upgrade:
   packages:
     associations:
-      docker:
+      containerd:
         package_name:
-          - docker-ce-cli-19.03*
-          - docker-ce-19.03*
+          - 'containerd.io-1.6*'
 ```
 
 The configuration from the procedure inventory is merged with the configuration in the `cluster.yaml`.
@@ -198,9 +209,9 @@ upgrade:
         image: 'calico/node:v3.25.1'
 ```
 
-After applying, this configuration is merged with the plugins' configuration contained in the current `cluster.yaml`.
+After applying, this configuration is merged with the plugins' configuration contained in the current **cluster.yaml**.
 
-**Note**: If you have changed images for any of the plugins in the `cluster.yaml`,
+**Note**: If you have changed images for any of the plugins in the **cluster.yaml**,
 it is required to explicitly specify new images in the procedure inventory for those plugins.
 The configuration format for the plugins is the same.
 
@@ -214,8 +225,10 @@ The configuration format for the plugins is the same.
   * https://kubernetes.io/docs/tasks/run-application/configure-pdb/#unhealthy-pod-eviction-policy is configured to _AlwaysAllow_
 * API versions `extensions/v1beta1` and `networking.k8s.io/v1beta1` are not supported starting from Kubernetes 1.22 and higher. Need to update ingress to the new API `networking.k8s.io/v1`. More info: https://kubernetes.io/docs/reference/using-api/deprecation-guide/#ingress-v122
 * Before starting the upgrade, make sure you make a backup. For more information, see the section [Backup Procedure](#backup-procedure).
-* The upgrade procedure only maintains upgrading from one `supported` version to the next `supported` version. For example, from 1.18 to 1.20 or from 1.20 to 1.21.
-* Since Kubernetes v1.25 doesn't support PSP, any clusters with `PSP` enabled must be migrated to `PSS` **before the upgrade** procedure running. For more information see the [Admission Migration Procedure](#admission-migration-procedure). The migration procedure is very important for Kubernetes cluster. If the solution doesn't have appropriate description about what `PSS` profile should be used for every namespace, it is better not to migrate from PSP for a while.  
+* The upgrade procedure only maintains upgrading from one `supported` version to the higher `supported` version.
+  The target version must also be the latest patch version supported by Kubemarine.
+  For example, upgrade is allowed from v1.26.7 to v1.26.11, or from v1.26.7 to v1.27.8, or from v1.26.7 to v1.28.4 through v1.27.8,
+  but not from v1.26.7 to v1.27.1 as v1.27.1 is not the latest supported patch version of Kubernetes v1.27.
 
 ### Upgrade Procedure Parameters
 
@@ -251,7 +264,13 @@ UPGRADING KUBERNETES v1.18.8 ⭢ v1.19.3
 ------------------------------------------
 ```
 
-The script upgrades Kubernetes versions one-by-one. After each upgrade, the `cluster.yaml` is regenerated to reflect the actual cluster state. Use the latest updated `cluster.yaml` configuration to further work with the cluster.
+The script upgrades Kubernetes versions one-by-one. After each upgrade, the **cluster.yaml** is regenerated to reflect the actual cluster state. Use the latest updated **cluster.yaml** configuration to further work with the cluster.
+
+Additionally, Kubemarine cleans up the `/etc/kubernetes/tmp` directory before the upgrade, where kubeadm stores the [backup files](https://kubernetes.io/docs/tasks/administer-cluster/kubeadm/kubeadm-upgrade/#recovering-from-a-failure-state)
+during the upgrade. For this reason, only the backups for the latest upgrade through Kubemarine are placed here after the upgrade procedure.
+
+**Note**: It is not recommended to use the backup files for rolling back after the upgrade because it can follow an inconsistent state 
+for `cluster.yaml`. Use the Kubemarine [backup](#backup-procedure) and [restore](#restore-procedure) procedures instead of manual restoration.
 
 #### Upgrading Specific Nodes
 
@@ -321,38 +340,38 @@ etcd:
 ...
 ```
 
-**Note**: All the custom settings for the system services should be properly reflected in the cluster.yaml (see [services.kubeadm parameters](Installation.md#kubeadm)) to be kept after upgrade.
-
-
 #### Thirdparties Upgrade Section and Task
 
-If the cluster is located in an isolated environment, it is possible to specify the custom paths to new thirdparties with the same syntax as in the `cluster.yaml` as shown in the following script:
+If the cluster is located in an isolated environment, it is possible to specify the custom paths to new thirdparties with the same syntax as in the **cluster.yaml** as shown in the following script:
 
 ```yaml
-v1.24.2:
+v1.30.1:
   thirdparties:
       /usr/bin/kubeadm:
-        source: https://example.com/thirdparty.files/kubernetes/kubeadm/v1.24.2/bin/linux/amd64/kubeadm
+        source: https://example.com/thirdparty.files/kubernetes/kubeadm/v1.30.1/bin/linux/amd64/kubeadm
       /usr/bin/kubelet:
-        source: https://example.com/thirdparty.files/kubernetes/kubelet/v1.24.2/bin/linux/amd64/kubelet
+        source: https://example.com/thirdparty.files/kubernetes/kubelet/v1.30.1/bin/linux/amd64/kubelet
       /usr/bin/kubectl:
-        source: https://example.com/thirdparty.files/kubernetes/kubectl/v1.24.2/bin/linux/amd64/kubectl
+        source: https://example.com/thirdparty.files/kubernetes/kubectl/v1.30.1/bin/linux/amd64/kubectl
       /usr/bin/calicoctl:
-        source: https://example.com/thirdparty.files/projectcalico/calico/v3.22.2/calicoctl-linux-amd64
+        source: https://example.com/thirdparty.files/projectcalico/calico/v3.27.3/calicoctl-linux-amd64
 ```
 
-This configuration replaces the configuration contained in the current `cluster.yaml`.
+This configuration replaces the configuration contained in the current **cluster.yaml**.
 
 #### Kubernetes Upgrade Task
 
-This task is required to actually upgrade the Kubernetes cluster to the next version. The upgrade is performed node-by-node. On each node, the docker or containerd is upgraded, if required. After all the pods are drained from the node, the node is upgraded and finally returned to the cluster for scheduling.
+This task is required to actually upgrade the Kubernetes cluster to the next version.
+The upgrade is performed node-by-node.
+On each node, containerd is upgraded, if required.
+After all the pods are drained from the node, the node is upgraded and finally returned to the cluster for scheduling.
 
 By default, node drain is performed using `disable-eviction=True` to ignore the PodDisruptionBudget (PDB) rules. If you want to enforce PDB rules during the upgrade, set `disable-eviction` to False. However, in this case, the upgrade may fail if you are unable to drain the node due of PDB rules. `disable-eviction` works only for upgrades on Kubernetes versions >= 1.18. 
 An example configuration to enforce PDB rules is as follows:
 
 ```yaml
 upgrade_plan:
-  - v1.18.8
+  - v1.30.1
 
 disable-eviction: False # default is True
 ```
@@ -370,10 +389,12 @@ This task is executed to restore the required CoreDNS configuration.
 
 #### Packages Upgrade Section and Task
 
-This inventory section contains the configuration to upgrade custom and system packages, such as docker and containerd. The system packages are upgraded by default, if necessary. You can influence the system packages' upgrade and specify custom packages for the upgrade/installation/removal using the `packages` section as follows:
+This inventory section contains the configuration to upgrade custom and system packages, such as containerd.
+The system packages are upgraded by default, if necessary.
+You can influence the system packages' upgrade and specify custom packages for the upgrade/installation/removal using the `packages` section as follows:
 
 ```yaml
-v1.18.8:
+v1.30.1:
   packages:
     remove:
       - curl
@@ -383,27 +404,39 @@ v1.18.8:
     upgrade:
       - openssl
     associations:
-      docker:
+      containerd:
         package_name:
-          - docker-ce-cli-19.03*
-          - docker-ce-19.03*
+          - 'containerd.io-1.6*'
 ```
 
 The requested actions for custom packages are performed in the `packages` task. The configuration from the procedure inventory replaces the configuration specified in the `cluster.yaml`. If you do not want to lose the packages specified in the `cluster.yaml`, then it is necessary to copy them to the procedure inventory.
 
-By default, it is not required to provide information about system packages through associations. They are upgraded automatically as required. You can provide this information if you want to have better control over system packages' versions, such as docker. Also, you have to explicitly provide system packages' information if you have specified this information in the `cluster.yaml`. It is because in this case, you take full control over the system packages and the defaults do not apply. The provided configuration for system packages is merged with configuration in the `cluster.yaml`.
+By default, it is not required to provide information about system packages through associations.
+They are upgraded automatically as required.
+You can provide this information if you want to have better control over system packages' versions, such as containerd.
+Also, you have to explicitly provide system packages' information if you have specified this information in the `cluster.yaml`.
+It is because in this case, you take full control over the system packages and the defaults do not apply.
+The provided configuration for system packages is merged with configuration in the `cluster.yaml`.
 
-**Note**: The system packages are updated in separate tasks. For example, the container runtime (docker/containerd) is upgraded during the Kubernetes upgrade.
+**Note**: The system packages are updated in separate tasks. For example, the container runtime (containerd) is upgraded during the Kubernetes upgrade.
 
 **Note**: During the container runtime upgrade, the containers may be broken, so all containers on the node are deleted after the upgrade.
 Kubernetes re-creates all the pod containers. However, your custom containers may be deleted, and you need to start them manually.
 
 #### Plugins Upgrade Section and Task
 
-This task is required to upgrade OOB plugins and specified user plugins. The OOB plugins are upgraded automatically. You can also configure your own plugins for the upgrade as follows:
+This task is required to upgrade OOB plugins and specified user plugins.
+
+The OOB plugins are upgraded automatically if the supported versions are changed for them.
+For more information about the supported versions, refer to [Supported Versions](Installation.md#supported-versions).
+
+The previously configured custom plugins are also re-installed if the effectively resolved inventory configuration is changed for them.
+For example, they may depend on Kubernetes version using [Dynamic Variables](Installation.md#dynamic-variables).
+
+You can also configure your own plugins for the upgrade as follows:
 
 ```yaml
-v1.18.10:
+v1.30.1:
   plugins:
     example-plugin:
       installation:
@@ -418,6 +451,15 @@ v1.18.10:
               apply_groups: None
               apply_nodes: ['control-plane-1', 'worker-1']
               apply_command: 'testctl apply -f /etc/example/configuration.yaml'
+```
+
+You can also re-install custom or OOB plugins even without changes in the inventory configuration.
+
+```yaml
+v1.30.1:
+  plugins:
+    calico: {}
+    example-plugin: {}
 ```
 
 After applying, this configuration is merged with the plugins' configuration contained in the current `cluster.yaml`. Only the `installation` section for each plugin is overwritten, if specified.
@@ -446,7 +488,7 @@ The `upgrade` procedure executes the following sequence of tasks:
 The backup procedure automatically saves the following entities:
 * ETCD snapshot
 * Files and configs from cluster nodes
-* Kubernetes resources
+* Kubernetes resources (if it's configured in procedure.yaml)
 
 As a result of the procedure, you receive an archive with all the stored objects inside. The archive has approximately the following structure inside:
 
@@ -460,7 +502,6 @@ backup-Jan-01-21-09-00-00.tar.gz
 │   ├── apiservices.apiregistration.k8s.io.yaml
 │   ├── blockaffinities.crd.projectcalico.org.yaml
 │   ├── ...
-│   ├── podsecuritypolicies.policy.yaml
 │   └── priorityclasses.scheduling.k8s.io.yaml
 │   ├── default
 │   │   ├── endpoints.yaml
@@ -549,7 +590,6 @@ By default, the following files are backed up from all nodes in the cluster:
 * /etc/chrony.conf
 * /etc/selinux/config
 * /etc/systemd/system/kubelet.service
-* /etc/docker/daemon.json
 * /etc/containerd/config.toml
 * /etc/containerd/certs.d
 * /etc/crictl.yaml
@@ -583,7 +623,7 @@ backup_plan:
 
 #### kubernetes Parameter
 
-The procedure exports all available Kubernetes resources from the cluster to yaml files. There are two types of resources - namespaced and non-namespaced. If you need to restrict resources for export, you can specify which ones you need.
+The procedure can export any available Kubernetes resources from the cluster to yaml files. There are two types of resources - namespaced and non-namespaced. If you need to export resources, you can specify which ones you need. By default, **no** resources from **all** namespaces are exported.
 
 **Note**: If the specified resource is missing, it is skipped without an error.
 
@@ -626,6 +666,16 @@ Another example:
 backup_plan:
   kubernetes:
     nonnamespaced_resources: all
+```
+
+If you do not specify `backup_plan.kubernetes`, the following configuration will be used:
+```yaml
+backup_plan:
+  kubernetes:
+    namespaced_resources:
+      namespaces: all
+      resources: []
+    nonnamespaced_resources: []
 ```
 
 ### Backup Procedure Tasks Tree
@@ -753,6 +803,7 @@ Also pay attention to the following:
 * System configurations like `selinux`, `modprobe`, `sysctl`, and others should be verified and configured only on new nodes.
 * Only new nodes can be rebooted.
 * The file `/etc/hosts` is updated and uploaded to all nodes in the cluster.
+* If there are some offline workers during the procedure, you should exclude `prepare.dns.etc_hosts` task and update `/etc/hosts` on new nodes manually.
 
 **Note**: It is not possible to change a node's role by adding an existing node again with a new role. You have to remove the node and add it again.
 
@@ -782,10 +833,26 @@ nodes:
 **Note**:
 
 * The connection information for new nodes can be used from defaults as described in the [Kubemarine Inventory Node Defaults](Installation.md#nodedefaults) section in _Kubemarine Installation Procedure_. If the connection information is not present by default, define the information in each new node configuration.
-* If you intend to add the new `balancer` node with VRRP IP, and have previously not configured the `vrrp_ips` section, you need to do the following preliminarily:
+* If you intend to add a new `balancer` node with VRRP IP, and have previously not configured the `vrrp_ips` section, you need to do the following preliminarily:
   * And the section to the main `cluster.yaml`.
   * If you already have balancers without VRRP IPs, reconfigure the balancers and DNS,
-    for example, using `kubemarine install --tasks prepare.dns.etc_hosts,deploy.loadbalancer.haproxy.configure,deploy.loadbalancer.keepalived,deploy.coredns`
+    for example, using `kubemarine install --tasks prepare.dns.etc_hosts,deploy.loadbalancer.haproxy.configure,deploy.loadbalancer.keepalived,deploy.coredns`.
+* If you intend to add a new `balancer` node with VRRP IP, and have previously configured the `vrrp_ips` section in the `cluster.yaml` with the `hosts` subsection, then add the new balancer node to the `vrrp_ips.*.hosts` section in the `cluster.yaml` in the same way as the old balancer nodes if this new node has to share the same VRRP IP address.
+
+For example, if you want `new-balancer-node-1` to be added to a subset of balancer nodes that share VRRP IP `192.168.0.100`:
+
+```
+vrrp_ips:
+- hosts:
+  - name: balancer-node-1
+    priority: 254
+  - name: balancer-node-2
+    priority: 253
+  - name: new-balancer-node-1
+  ip: 192.168.0.100
+```
+
+It may be useful, if you have some VRRP IPs working at different subsets of balancer nodes. If you have one VRRP IP and all the balancer nodes must share it, just remove the `hosts` section from `vrrp_ips`.
 
 ### Add Node Tasks Tree
 
@@ -799,10 +866,11 @@ The `add_node` procedure executes the following sequence of tasks:
     * cluster_installation
   * dns
     * hostname
-    * resolv_conf
     * etc_hosts
+    * resolv_conf
   * package_manager
     * configure
+    * disable_unattended_upgrades
     * manage_packages
   * ntp
     * chrony
@@ -835,7 +903,6 @@ The `add_node` procedure executes the following sequence of tasks:
     * prepull_images
     * init (as join)
     * audit
-  * admission
   * coredns
   * plugins
 * overview
@@ -859,6 +926,7 @@ Also pay attention to the following:
   such hosts are ignored with warnings.
 * The file `/etc/hosts` is updated and uploaded to all remaining nodes in the cluster. The control plane address may change.
 * This procedure only removes nodes and does not restore nodes to their original state. Packages, configurations, and Thirdparties are also not deleted.
+* If there are some offline workers during the procedure, you should exclude `update.etc_hosts` task.
 
 Removing a node from a Kubernetes cluster is done in the following order:
 
@@ -940,74 +1008,216 @@ To change the operating system on an already running cluster:
 
 **Warning**: In case when you use custom associations, you need to specify them simultaneously for all types of operating systems. For more information, refer to the [associations](Installation.md#associations) section in the _Kubemarine Installation Procedure_.
 
-## Manage PSP Procedure
+## Reconfigure Procedure
 
-The manage PSP procedure allows you to change PSP configuration on an already installed cluster. Using this procedure, you can:
-* Add/delete custom policies
-* Enable/disable OOB policies
-* Enable/disable admission controller 
+This procedure is aimed to reconfigure the cluster.
 
-Manage PSP procedure works as follows:
-1. During this procedure the custom policies specified for deletion are deleted.
-   Then the custom policies specified for addition are added.
-2. If OOB policies are reconfigured or admission controller is reconfigured, then all OOB policies are recreated
-   as configured in the `cluster.yaml` and `procedure.yaml`. The values from `procedure.yaml` take precedence.
-   If admission controller is disabled, then all OOB policies are deleted without recreation.
-3. If the admission controller is reconfigured in `procedure.yaml`, then `kubeadm` configmap and `kube-apiserver` manifest is updated accordingly. 
-4. All Kubernetes nodes are `drain-uncordon`ed one-by-one and all daemon-sets are restarted to restart all pods (except system) in order to re-validate pods specifications.
+It is supposed to reconfigure the cluster as a generalized concept described by the inventory file.
+Though, currently the procedure supports to reconfigure only Kubeadm-managed settings, and `services.sysctl`.
+If you are looking for how to reconfigure other settings, consider the following:
 
-### Configuring Manage PSP Procedure
+- Probably some other [maintenance procedure](#provided-procedures) can do the task.
+- Some [installation tasks](Installation.md#tasks-list-redefinition) can reconfigure some system settings without full redeploy of the cluster.
+
+**Basic prerequisites**:
+
+- Make sure to follow the [Basics](#basics).
+- Before starting the procedure, consider making a backup. For more information, see the section [Backup Procedure](#backup-procedure).
+
+### Reconfigure Procedure Parameters
 
 The procedure accepts required positional argument with the path to the procedure inventory file.
+You can find description and examples of the accepted parameters in the next sections.
 
-The JSON schema for procedure inventory is available by [URL](../kubemarine/resources/schemas/manage_psp.json?raw=1).
+The JSON schema for procedure inventory is available by [URL](../kubemarine/resources/schemas/reconfigure.json?raw=1).
 For more information, see [Validation by JSON Schemas](Installation.md#inventory-validation).
 
-To manage PSPs on existing cluster, use the configuration similar to PSP installation, except the
-`custom-policies` is replaced by `add-policies` and `delete-policies` as follows:
+**Common Considerations**
+
+Each section from the procedure inventory is merged with the corresponding section in the main **cluster.yaml**,
+and the related services are reconfigured based on the resulting inventory.
+
+Additionally, it is possible to supply empty section describing a particular service for most services.
+This does not introduce new changes in the **cluster.yaml**, but still triggers the reconfiguring,
+and thus allows to make the cluster and the inventory consistent to each other.
+
+Also, Kubemarine detects effectively changed settings of the services, if ones depend on the others, and reconfigures the dependent services accordingly.
+
+#### Reconfigure Kubeadm
+
+The following Kubeadm-managed sections can be reconfigured:
+
+- `services.kubeadm.apiServer`
+- `services.kubeadm.apiServer.certSANs`
+- `services.kubeadm.scheduler`
+- `services.kubeadm.controllerManager`
+- `services.kubeadm.etcd.local.extraArgs`
+- `services.kubeadm_kubelet`
+- `services.kubeadm_kube-proxy`
+- `services.kubeadm_patches`
+
+For more information, refer to the description of these sections:
+
+- [kubeadm](Installation.md#kubeadm)
+- [kubeadm_kubelet](Installation.md#kubeadm_kubelet)
+- [kubeadm_kube-proxy](Installation.md#kubeadm_kube-proxy)
+- [kubeadm_patches](Installation.md#kubeadm_patches)
+
+Example of procedure inventory that reconfigures all the supported sections:
+
+<details>
+  <summary>Click to expand</summary>
 
 ```yaml
-psp:
-  pod-security: enabled/disabled
-  oob-policies:
-    default: enabled/disabled
-    host-network: enabled/disabled
-    anyuid: enabled/disabled
-  add-policies:
-    psp-list: []
-    roles-list: []
-    bindings-list: []
-  delete-policies:
-    psp-list: []
-    roles-list: []
-    bindings-list: []
+services:
+  kubeadm:
+    apiServer:
+      certSANs:
+        - k8s-lb
+      extraArgs:
+        enable-admission-plugins: NodeRestriction,PodNodeSelector
+        profiling: "false"
+        audit-log-path: /var/log/kubernetes/audit/audit.log
+        audit-policy-file: /etc/kubernetes/audit-policy.yaml
+        audit-log-maxage: "30"
+        audit-log-maxbackup: "10"
+        audit-log-maxsize: "100"
+    scheduler:
+      extraArgs:
+        profiling: "false"
+    controllerManager:
+      extraArgs:
+        profiling: "false"
+        terminated-pod-gc-threshold: "1000"
+    etcd:
+      local:
+        extraArgs:
+          heartbeat-interval: "1000"
+          election-timeout: "10000"
+  kubeadm_kubelet:
+    protectKernelDefaults: true
+  kubeadm_kube-proxy:
+    conntrack:
+      min: 1000000
+  kubeadm_patches:
+    apiServer:
+      - groups: [control-plane]
+        patch:
+          max-requests-inflight: 500
+      - nodes: [master-3]
+        patch:
+          max-requests-inflight: 600
+    etcd:
+      - nodes: [master-1]
+        patch:
+          snapshot-count: 110001
+      - nodes: [master-2]
+        patch:
+          snapshot-count: 120001
+      - nodes: [master-3]
+        patch:
+          snapshot-count: 130001
+    controllerManager:
+      - groups: [control-plane]
+        patch:
+          authorization-webhook-cache-authorized-ttl: 30s
+    scheduler:
+      - nodes: [master-2,master-3]
+        patch:
+          profiling: true
+    kubelet:
+      - nodes: [worker5]
+        patch:
+          maxPods: 100
+      - nodes: [worker6]
+        patch:
+          maxPods: 200
 ```
 
-For example, if admission controller is disabled on existing cluster and you want to enable it, without enabling
-`host-network` OOB policy, you should specify the following in the `procedure.yaml` file:
+</details>
+
+The above configuration is merged with the corresponding sections in the main **cluster.yaml**,
+and the related Kubernetes components are reconfigured based on the resulting inventory.
+
+In this way it is not possible to delete some property,
+allowing the corresponding Kubernetes component to fall back to the default behaviour.
+This can be worked around by manual changing of the `cluster.yaml`
+and running the `reconfigure` procedure with **empty** necessary section.
+For example, you can delete `services.kubeadm.etcd.local.extraArgs.election-timeout` from **cluster.yaml**
+and then run the procedure with the following procedure inventory:
 
 ```yaml
-psp:
-  pod-security: enabled
-  oob-policies:
-    host-network: disabled
+services:
+  kubeadm:
+    etcd: {}
 ```
 
-To configure `add-policies` and `delete-policies`, use the configuration format similar to `custom-policies`. For more information, refer to the [Configuring Custom Policies](Installation.md#configuring-custom-policies) section in the _Kubemarine Installation Procedure_.
+**Note**: It is not possible to delete default parameters offered by Kubemarine.
 
-**Note**: The OOB plugins use OOB policies, so disabling OOB policy breaks some OOB plugins. 
-To avoid this, you need to specify custom policy and bind it using `ClusterRoleBinding` to the `ServiceAccout` plugin.
+**Note**: The mentioned hint to delete custom properties is not enough for `services.kubeadm_kube-proxy` due to existing restrictions of Kubeadm CLI tool.
+One should additionally edit the `kube-proxy` ConfigMap and set the value that is considered the default.
 
-### Manage PSP Tasks Tree
+**Note**: Passing of empty `services.kubeadm.apiServer` section reconfigures the `kube-apiserver`,
+but does not write new certificate.
+To **additionally** write new certificate, pass the desirable extra SANs in `services.kubeadm.apiServer.certSANs`.
 
-The `manage_psp` procedure executes the following sequence of tasks:
+**Restrictions**:
 
-1. check_inventory
-1. delete_custom
-2. add_custom
-3. reconfigure_oob
-4. reconfigure_plugin
-5. restart_pods
+- Very few options of `services.kubeadm_kubelet` section can be reconfigured currently.
+  To learn exact set of options, refer to the JSON schema.
+- Some properties cannot be fully redefined.
+  For example, this relates to some settings in `services.kubeadm.apiServer`.
+  For details, refer to the description of the corresponding sections in the installation guide.
+
+**Basic flow**:
+
+If the procedure affects the particular set of Kubernetes components, all the components are reconfigured on each relevant node one by one.
+The flow proceeds to the next nodes only after the affected components are considered up and ready on the reconfigured node.
+Control plane nodes are reconfigured first.
+
+Working `kube-apiserver` is not required to reconfigure control plane components (more specifically, to change their static manifests),
+but required to reconfigure kubelet and kube-proxy.
+
+### Reconfigure sysctl
+
+The `reconfigure` procedure allows to supply new kernel parameters or change the existing ones
+in the same format, and with the same caveats, as for the installation procedure.
+For more information, refer to [sysctl](Installation.md#sysctl).
+
+It is also possible to trigger reconfiguring using empty `services.sysctl` section:
+
+```yaml
+services:
+  sysctl: {}
+```
+
+**Note**: kernel parameters can also be reconfigured using [patches](#append-patches).
+
+**Warning**: Be careful with these settings, they directly affect the hosts operating system.
+
+**Warning**: In comparison to the installation procedure, the new parameters are validated, but reboot is not scheduled.
+To make sure that the new settings are preserved after reboot, perform the reboot using [Reboot Procedure](#reboot-procedure),
+and run PaaS check, namely [232 Kernel Parameters Configuration](Kubecheck.md#232-kernel-parameters-configuration).
+
+### Append Patches
+
+It is possible to **append** new [patches](Installation.md#patches) to the main **cluster.yaml**, and trigger reconfiguring of the corresponding services.
+
+The following sections are supported in the new patches:
+- `services.sysctl`
+
+Since the new patches are appended, the same settings have precedence in the last patch of the procedure inventory if overridden few times for the same node.
+
+### Reconfigure Procedure Tasks Tree
+
+The `reconfigure` procedure executes the following sequence of tasks:
+
+- prepare
+  - system
+    - sysctl
+- deploy
+  - kubernetes
+    - reconfigure
 
 ## Manage PSS Procedure
 
@@ -1024,7 +1234,7 @@ The procedure accepts required positional argument with the path to the procedur
 The JSON schema for procedure inventory is available by [URL](../kubemarine/resources/schemas/manage_pss.json?raw=1).
 For more information, see [Validation by JSON Schemas](Installation.md#inventory-validation).
 
-To manage PSS on existing cluster one should configure `procedure.yaml` similar the following:
+To manage PSS on existing cluster one should configure the **procedure.yaml** file similar the following:
 
 ```yaml
 pss:
@@ -1076,17 +1286,16 @@ They are deleted during the procedure in case of using `pod-security: disabled`,
 * Be careful with the `restart-pods: true` options it drains nodes one by one and may cause cluster instability. The best way to 
 restart pods in cluster is a manual restart according to particular application. The restart procedure should consider if the 
 application is stateless or stateful. Also shouldn't use `restart-pod: true` option if [Pod Disruption Budget](https://kubernetes.io/docs/tasks/run-application/configure-pdb/) is configured.
-* Pay attention to the fact that for Kubernetes versions higher than v1.23 the PSS option implicitly enabled by default in 
-`kube-apiserver` [Feature Gates](https://kubernetes.io/docs/reference/command-line-tools-reference/feature-gates/). Therefor all PSS labels on namespaces should be deleted during the maintenance procedure so as not to face unpredictable cluster behavior.
+* Pay attention to the fact that PSS is implicitly enabled by default (that is reflected in 
+`kube-apiserver` [Feature Gates](https://kubernetes.io/docs/reference/command-line-tools-reference/feature-gates/) prior to Kubernetes v1.28).
+Therefore, all PSS labels on namespaces should be deleted during the maintenance procedure so as not to face unpredictable cluster behavior.
 
 ### Manage PSS Tasks Tree
 
-The `manage_pss procedure executes the following sequence of tasks:
+The `manage_pss` procedure executes the following sequence of tasks:
 
-1. check_inventory
-2. delete_default_pss
-3. apply_default_pss
-4. restart_pods
+1. manage_pss
+2. restart_pods
 
 ## Reboot Procedure
 
@@ -1131,7 +1340,7 @@ The `cert_renew` procedure allows you to renew some certificates on an existing 
 
 For Kubernetes, most of the internal certificates could be updated, specifically: 
 `apiserver`, `apiserver-etcd-client`, `apiserver-kubelet-client`, `etcd-healthcheck-client`, `etcd-peer`, `etcd-server`,
-`admin.conf`, `controller-manager.conf`, `scheduler.conf`, `front-proxy-client`. 
+`admin.conf`, `super-admin.conf`, `controller-manager.conf`, `scheduler.conf`, `front-proxy-client`. 
 Certificate used by `kubelet.conf` by default is updated automatically by Kubernetes, 
 link to Kubernetes docs regarding `kubelet.conf` rotation: https://kubernetes.io/docs/tasks/tls/certificate-rotation/#understanding-the-certificate-rotation-configuration.
 
@@ -1203,6 +1412,7 @@ kubernetes:
     - etcd-peer
     - etcd-server
     - admin.conf
+    - super-admin.conf
     - controller-manager.conf
     - scheduler.conf
     - front-proxy-client
@@ -1223,169 +1433,6 @@ The `cert_renew` procedure executes the following sequence of tasks:
 2. nginx_ingress_controller
 3. calico
 4. certs_overview
-
-## Cri Migration Procedure
-
-The `migrate_cri` procedure allows you to migrate from Docker to Containerd.
-
-**Note**: This procedure consults `/etc/fstab` to see if separate disk is used for docker directory `/var/lib/docker`.
-If there is such disk, it will be **cleared** and re-mounted to `/var/lib/containerd`.
-
-**Warning**: This procedure works only in one direction.
-
-**Warning**: If for some reason, the migration to Containerd has been executed on an environment where Containerd was already used as Cri, Kubernetes dashboard may be unavailable. To resolve this issue, restart the pods of the ingress-nginx-controller service.
-
-**Warning**: The migration procedure removes the docker daemon from all nodes in the cluster.
-
-### Procedure Execution Steps
-
-This procedure includes the following steps:
-1. Verify and merge all the specified parameters into the inventory.
-2. Install and configure containerd.
-3. Install crictl.
-4. Implement the following steps on each control-plane and worker node by node:
-    1. Drain the node.
-    2. Update configurations on the node for migration to containerd.
-    3. Move the pods on the node from the docker's containers to those of containerd.
-    4. Uncordon the node.
-
-**Warning**: Before starting the migration procedure, verify that you already have the actual cluster.yaml structure. The services.docker scheme is deprecated. 
-
-### migrate_cri Parameters
-
-The procedure accepts required positional argument with the path to the procedure inventory file.
-You can find description and examples of the accepted parameters in the next sections.
-
-The JSON schema for procedure inventory is available by [URL](../kubemarine/resources/schemas/migrate_cri.json?raw=1).
-For more information, see [Validation by JSON Schemas](Installation.md#inventory-validation).
-
-The following sections describe the `migrate_cri` parameters.
-
-#### cri Parameter
-
-In this parameter, you should specify the `containerRuntime: containerd` parameter.
-
-**Note**: This parameter is mandatory. An exception is raised if the parameter is absent.
-
-You can also optionally specify the configuration for the containerd.
-For more information, refer to [CRI](Installation.md#cri).
-
-Example for CLI:
-
-```yaml
-cri:
-  containerRuntime: containerd
-  containerdConfig:
-    plugins."io.containerd.grpc.v1.cri":
-      sandbox_image: registry.k8s.io/pause:3.2
-  containerdRegistriesConfig:
-    artifactory.example.com:5443:
-      host."https://artifactory.example.com:5443":
-        capabilities: [ "pull", "resolve" ]
-```
-
-#### packages-associations Parameter
-
-This parameter allows you to specify an association for containerd, thus you could set a concrete version which should be installed from the allowed repositories.
-
-**Note**: This parameter is optional.
-
-Example:
-
-```yaml
-packages:
-  associations:
-    containerd:
-      executable_name: 'containerd'
-      package_name: 'containerd.io-1.4.*'
-      service_name: 'containerd'
-      config_location: '/etc/containerd/config.toml'
-```
-
-#### thirdparties Parameter
-
-This parameter allows you to specify the link to a concrete version of a crictl third-party. In the absence of this parameter, crictl is downloaded from Github/registry in case you ran the procedure from CLI. 
-
-**Note**: This parameter is optional.
-
-Example:
-
-```yaml
-thirdparties:
-  /usr/bin/crictl.tar.gz:
-    source: https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.20.0/crictl-v1.20.0-linux-amd64.tar.gz
-```
-
-## Admission Migration Procedure
-
-Since Kubernetes v1.20 Pod Security Policy (PSP) has been deprecated and will be delete in Kubernetes 1.25 the migration procedure 
-from PSP to  another solution is very important. Kubemarine supports Pod Security Standards (PSS) by default as a replacement PSP.
-The most important step in the procedure is to define the PSS profiles for particular namespace. PSS has only three feasible options:
-`privileged`, `baseline`, `restricted` that should be matched with PSP. It's better to use more restrictive the PSS profile 
-for namespace. For proper matching see the following articles:
-* [Migrate from PodSecurityPolicy](https://kubernetes.io/docs/tasks/configure-pod-container/migrate-from-psp/)
-* [Pod Security Standards](https://kubernetes.io/docs/concepts/security/pod-security-standards/)
-
-**Notes**: 
-* Kubemarine predefined PSP such as 'oob-anyuid-psp', 'oob-host-network-psp', 'oob-privileged-psp' match with 'privileged' PSS profile and 'oob-default-psp' matches with 'restricted' PSS profile.
-* Before running the migration procedure, be sure that all applications in Kubernetes cluster match with prerequisites:
-[Application prerequisites](https://github.com/Netcracker/KubeMarine/blob/main/documentation/Installation.md#application-prerequisites)
-* One of the ways to check if the pods in a particular namespace are matched with the PSS profile is that the `pod-security.kubernetes.io/enforce` label in the namespace should be set to `privileged`, whereas the `pod-security.kubernetes.io/warn` and `pod-security.kubernetes.io/audit` labels should be set to `restricted` or `baseline`. When the pods are up and running in the namespace, the audit messages and namespace events can be checked. Any violation of the `restricted` profile is reflected in these messages. The next step is to rework the pods that violate the PSS profile and repeat the procedure.
-
-
-### Procedure Execution Steps
-
-1. Verify that Kubernetes cluster has version v1.23+
-2. Match the PSP permission to PSS and define the PSS profile for each namespace in cluster according to the notes above. 
-3. Run the `manage_psp` procedure with `pod-security: disabled` option, ensure `admission: psp` is set in `cluster.yaml` preliminary. The example of `cluster.yaml` part is the following:
-```yaml
-...
-rbac:
-  admission: psp
-  psp:
-    pod-security: enabled
-...
-```
-
-The example of `procedure.yaml` is the following:
-```yaml
-psp:
-  pod-security: disabled
-```
-
-4. Verify if the applications in the cluster work properly.
-5. Set the `admission: pss` options in `cluster.yaml`. An example of the `cluster.yaml` part is as follows:
-
-```yaml
-...
-rbac:
-  admission: pss
-  pss:
-    pod-security: disabled
-...
-```
-
-6. Create the `procedure.yaml` for `migrate_pss` and fill in `namespaces` subsection in `pss` section in procedure file. The example of `procedure.yaml` is the following:
-
-```yaml
-pss:
-  pod-security: enabled
-  namespaces:
-    - namespace_1
-    - namespace_2:
-        enforce: "baseline"
-    - namespace_3
-  namespaces_defaults:
-    enforce: "privileged"
-    enforce-version: latest
-restart-pods: false
-```
-
-7. Run the `manage_pss` procedure with `restart-pods: true` option if it is applicable for solution
-8. Restart pods in all namespaces if `restart-pods: false` option was used on previous step
-9. Verify if the applications in cluster work properly
-
-It's possible to switch off `PSS` on dev environment for some reason. In this case migration procedure become shorter and steps #6,7,8 should be skipped.
 
 # Procedure Execution
 
@@ -1510,225 +1557,6 @@ plugins:
 	
 ```
 
-## Data Encryption in Kubernetes
-
-The following section describes the Kubernetes cluster capabilities to store and manipulate encrypted data.
-
-### Enabling Encryption
-
-ETCD as a Kubernetes cluster storage can interact with encrypted data. The encryption/decryption procedures are the part of `kube-apiserver` functionality.
-
-An example of the `EncryptionConfiguration` file is as follows:
-
-```yaml
-apiVersion: apiserver.config.k8s.io/v1
-kind: EncryptionConfiguration
-resources:
-  - resources:
-      - secrets
-      - configmaps
-    providers:
-      - aesgcm:
-          keys:
-            - name: key1
-              secret: c2VjcmV0IGlzIHNlY3VyZQ==
-            - name: key2
-              secret: dGhpcyBpcyBwYXNzd29yZA==
-      - aescbc:
-          keys:
-            - name: key1
-              secret: c2VjcmV0IGlzIHNlY3VyZQ==
-            - name: key2
-              secret: dGhpcyBpcyBwYXNzd29yZA==
-      - secretbox:
-          keys:
-            - name: key1
-              secret: YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0NTY=
-      - identity: {}
-```
-
-It should be created preliminarily and placed in the `/etc/kubernetes/enc/` directory.
-
-The next step is to enable the encryption settings in `kubeadm-config`: 
-```yaml
-data:
-  ClusterConfiguration: |
-    apiServer:
-      ...
-      extraArgs:
-        ...
-        encryption-provider-config: /etc/kubernetes/enc/enc.yaml
-      extraVolumes:
-      ...
-      - hostPath: /etc/kubernetes/enc
-        mountPath: /etc/kubernetes/enc
-        name: enc
-        pathType: DirectoryOrCreate
-```
-
-There is an `--encryption-provider-config` option that points to the `EncryptionConfiguration` file location. The `kube-apiserver` should have the following parts in the manifest yaml:
-
-```yaml
-...
-spec:
-  containers:
-  - command:
-    - kube-apiserver
-     ...
-    - --encryption-provider-config=/etc/kubernetes/enc/enc.yaml
-      ...
-    volumeMounts:
-    - name: enc
-      mountPath: /etc/kubernetes/enc
-      readonly: true
-       ...
-  volumes:
-  - name: enc
-    hostPath:
-      path: /etc/kubernetes/enc
-      type: DirectoryOrCreate
-```
-
-In the above case, the `secrets` and `configmaps` are encrypted on the first key of the `aesgcm` provider, but the previously encrypted `secrets` and `configmaps` are decrypted on any keys of any providers that are matched. This approach allows to change both encryption providers and keys during the operation. The keys should be random strings in base64 encoding. `identity` is the default provider that does not provide any encryption at all.
-For more information, refer to [https://kubernetes.io/docs/tasks/administer-cluster/encrypt-data/](https://kubernetes.io/docs/tasks/administer-cluster/encrypt-data/).
-
-### Integration with External KMS
-
-There is an encryption provider `kms` that allows using an external `Key Management Service` for the key storage, therefore the keys are not stored in the `EncryptionConfiguration` file, which is more secure. The `kms` provider needs to deploy a KMS plugin for further use.
-The `Trousseau` KMS plugin is an example. It works through a unix socket, therefore `Trousseau` pods must be run on the same nodes as `kube-apiserver`. In case of using the KMS provider, the `EncryptionConfiguration` is as follows (`Vault` is a KMS):
-
-```yaml
-apiVersion: apiserver.config.k8s.io/v1
-kind: EncryptionConfiguration
-resources:
-  - resources:
-      - secrets
-      - configmaps
-    providers:
-      - kms:
-          name: vaultprovider
-          endpoint: unix:///opt/vault-kms/vaultkms.socket
-          cachesize: 100
-          timeout: 3s
-      - identity: {}
-```
-
-Also, unix socket must be available for `kube-apiserver`:
-
-
-```yaml
-apiVersion: v1
-kind: Pod
-metadata:
-  name: kube-apiserver
-  namespace: kube-system
-spec:
-  containers:
-  - command:
-    volumeMounts:
-    - mountPath: /opt/vault-kms/vaultkms.socket
-      name: vault-kms
-       ...
-  volumes:
-  - hostPath:
-      path: /opt/vault-kms/vaultkms.socket
-      type: Socket
-    name: vault-kms
-```
-
-The environment variable `VAULT_ADDR` matches the address of the `Vault` service and `--listen-addr` argument points to KMS plugin unix socket in the following example:
-
-```yaml
-apiVersion: apps/v1
-kind: DaemonSet
-metadata:
-  name: vault-kms-provider
-  namespace: kube-system
-    ...
-spec:
-  template:
-    spec:
-      initContainers:
-        - name: vault-agent
-          image: vault
-          securityContext:
-            privileged: true
-          args:
-            - agent
-            - -config=/etc/vault/vault-agent-config.hcl
-            - -log-level=debug
-          env:
-            - name: VAULT_ADDR
-              value: http://vault-adress:8200
-               ...
-      containers:
-        - name: vault-kms-provider
-          image: ghcr.io/ondat/trousseau:v1.1.3
-          imagePullPolicy: Always
-          args:
-            - -v=5
-            - --config-file-path=/opt/trousseau/config.yaml
-            - --listen-addr=unix:///opt/vault-kms/vaultkms.socket
-            - --zap-encoder=json
-            - --v=3
-```
-
-For more information, refer to:
-* [https://kubernetes.io/docs/tasks/administer-cluster/kms-provider/](https://kubernetes.io/docs/tasks/administer-cluster/kms-provider/)
-* [https://github.com/ondat/trousseau/wiki/Trousseau-Deployment](https://github.com/ondat/trousseau/wiki/Trousseau-Deployment)
-
-### Disabling Encryption
-
-The first step of disabling encryption is to make the `identity` provider default for encryption. The enabling of `EncryptionConfiguration` should be similar to the following example:
-
-```yaml
-apiVersion: apiserver.config.k8s.io/v1
-kind: EncryptionConfiguration
-resources:
-  - resources:
-      - secrets
-      - configmaps
-    providers:
-      - identity: {}
-      - aesgcm:
-          keys:
-            - name: key1
-              secret: c2VjcmV0IGlzIHNlY3VyZQ==
-            - name: key2
-              secret: dGhpcyBpcyBwYXNzd29yZA==
-      - aescbc:
-          keys:
-            - name: key1
-              secret: c2VjcmV0IGlzIHNlY3VyZQ==
-            - name: key2
-              secret: dGhpcyBpcyBwYXNzd29yZA==
-      - secretbox:
-          keys:
-            - name: key1
-              secret: YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0NTY=
-```
-
-The next step is to replace all resources that were previously encrypted (e.g. `secrets`):
-
-```console
-# kubectl get secrets --all-namespaces -o json | kubectl replace -f -
-```
-
-It is then possible to remove encryption settings from the `kubeadm-config` configmap and `kube-apiserver` manifest.
-
-### Maintenance and Operation Features
-
-* Since the `/etc/kubernetes/enc/enc.yaml` file has keys, access to the file must be restricted. For instance:
-```console
-# chmod 0700 /etc/kubernetes/enc/
-```
-
-* The proper way for using encryption is to rotate the keys. The rotation procedure of the keys should take into consideration the fact that the `EncryptionConfiguration` file must be equal on each `control-plane` node. During the keys rotation procedure, some operation of getting the encrypted resources may be unsuccessful.
-* The `kube-apiserver` has an `--encryption-provider-config-automatic-reload` option that allows applying a new `EncryptionConfiguration` without `kube-apiserver` reload.
-
-* ETCD restore procedures should take into consideration the keys rotation, otherwise some data may be unavailable due to keys that were used for encryption and is not available after restoration. The backup procedure may include an additional step that renews all encrypted data before the ETCD backup. This approach decreases the security level for data in ETCD backup, but it prevents any inconvenience in the future. Another option is not to delete the keys from `env.yml` even if they are not used for encryption/decryption anymore.
-* External services that interact with ETCD may stop working due to encryption enabling.
-
 ## Changing Cluster CIDR
 
 There might be a situation when you have to change the pod network used in a cluster. The default `podSubnet` (`10.128.0.0/14` for IPv4 and `fd02::/48` for IPv6) may be inappropriate for some reason.
@@ -1836,48 +1664,14 @@ data:
 
 11. Check that everything works properly and remove the old ippool if necessary.
 
-## Kubelet Server Certificate Approval
-
-The `kubelet` server certificate is self-signed by default, and is usually stored in the `/var/lib/kubelet/pki/kubelet.crt` file. To avoid using the self-signed `kubelet` server certificate, alter the `cluster.yaml` file in the following way:
-
-```yaml
-...
-services:
-  kubeadm_kubelet:
-    serverTLSBootstrap: true
-    rotateCertificates: true
-  kubeadm:
-    apiServer:
-      extraArgs:
-        kubelet-certificate-authority: /etc/kubernetes/pki/ca.crt
-...
-```
-
-These settings enforce `kubelet` on each node of the cluster to request certificate approval (for `kubelet` server part) from the default Kubernetes CA and rotate certificate in the future. The `kube-apiserver` machinery does not approve certificate requests for `kubelet` automatically. They might be approved manually by the following commans. Get the list of certificate requests:
-
-```
-# kubectl get csr
-NAME        AGE     SIGNERNAME                          REQUESTOR                 REQUESTEDDURATION    CONDITION
-csr-2z6rv   12m     kubernetes.io/kubelet-serving       system:node:nodename-1    <none>               Pending
-csr-424qg   89m     kubernetes.io/kubelet-serving       system:node:nodename-2    <none>               Pending
-```
-
-Approve the particular request:
-
-```
-kubectl certificate approve csr-424qg
-```
-
-These commands might be automated in several ways.
-
-### Auto Approval CronJob
-
-Basically, `CronJob` runs the approval command above for every CSR according to some schedule.
-
-### Auto Approval Service
-
-It is possible to install the kubelet-csr-approver service. For more information, refer to [[kubelet-csr-approver](https://github.com/postfinance/kubelet-csr-approver)](https://github.com/postfinance/kubelet-csr-approver). This service approves CSR automatically when a CSR is created according to several settings. It is better to restrict nodes' IP addresses (`providerIpPrefixes` option) and FQDN templates (providerRegex). For more information, refer to the official documentation.
-
 # Common Practice
 
-You should not run any containers on worker nodes that are not managed by `kubelet` so as not to break the `kube-scheduler` precision.
+The common practice information is given below.
+
+## Security Hardening Guide
+
+For more information, refer to the [Security Hardening Guide](./internal/Hardening.md).
+
+## Worker Nodes Should be Managed by Kubelet
+
+You should not run any containers on worker nodes that are not managed by `kubelet` to avoid breaking the `kube-scheduler` precision.

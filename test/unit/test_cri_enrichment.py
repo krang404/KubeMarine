@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import re
 import unittest
 
 from kubemarine import demo
@@ -233,6 +233,16 @@ class TestContainerdCriEnrichment(unittest.TestCase):
         cluster = self.do_successful_enrichment(inventory)
         containerd_config = cluster.inventory['services']['cri']['containerdConfig']
         self.assertNotIn('config_path', containerd_config.get('plugins."io.containerd.grpc.v1.cri".registry', {}))
+
+    def test_containerd_forbidden_docker_config(self):
+        inventory = demo.generate_inventory(**demo.ALLINONE)
+        inventory.setdefault('services', {})['cri'] = {
+            'containerRuntime': 'containerd',
+            'dockerConfig': {'registry-mirrors': ['http://example.registry']}
+        }
+        with self.assertRaisesRegex(Exception, re.escape(
+                "Additional properties are not allowed ('dockerConfig' was unexpected)")):
+            demo.new_cluster(inventory)
 
 
 if __name__ == '__main__':

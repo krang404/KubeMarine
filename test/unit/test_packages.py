@@ -15,24 +15,24 @@
 import unittest
 from copy import deepcopy
 from typing import Optional
+from test.unit import utils
 
-from kubemarine import demo, packages, kubernetes
+from kubemarine import demo, packages
 from kubemarine.core import static, errors
 from kubemarine.core.yaml_merger import default_merger
 from kubemarine.demo import FakeKubernetesCluster
 from kubemarine.procedures import add_node
-from test.unit import utils
 
 
 def new_debian_cluster(inventory: dict) -> FakeKubernetesCluster:
     context = demo.create_silent_context()
-    context['nodes'] = demo.generate_nodes_context(inventory, os_name='ubuntu', os_version='20.04')
-    return demo.new_cluster(inventory, context=context)
+    nodes_context = demo.generate_nodes_context(inventory, os_name='ubuntu', os_version='20.04')
+    return demo.new_cluster(inventory, context=context, nodes_context=nodes_context)
 
 
 def prepare_enriched_associations_defaults() -> dict:
     default_associations = deepcopy(static.DEFAULTS['services']['packages']['associations'])
-    kubernetes_version = kubernetes.get_initial_kubernetes_version({})
+    kubernetes_version = static.DEFAULTS['services']['kubeadm']['kubernetesVersion']
 
     for os_family in packages.get_associations_os_family_keys():
         os_associations: dict = deepcopy(static.GLOBALS['packages']['common_associations'])
@@ -54,8 +54,14 @@ def prepare_enriched_associations_defaults() -> dict:
 ASSOCIATIONS_DEFAULTS = prepare_enriched_associations_defaults()
 
 
-def get_compiled_defaults():
-    return deepcopy(ASSOCIATIONS_DEFAULTS)
+def get_compiled_defaults(cluster: FakeKubernetesCluster) -> dict:
+    defaults = deepcopy(ASSOCIATIONS_DEFAULTS)
+
+    for association_name in packages.get_associations_os_family_keys():
+        if cluster.nodes['all'].get_subgroup_with_os(association_name).is_empty():
+            del defaults[association_name]
+
+    return defaults
 
 
 def global_associations(inventory: dict) -> dict:
@@ -151,90 +157,98 @@ class AssociationsEnrichment(unittest.TestCase):
         inventory = demo.generate_inventory(**demo.MINIHA_KEEPALIVED)
         cluster = new_debian_cluster(inventory)
         associations = global_associations(cluster.inventory)
-        self.assertEqual(packages.get_associations_os_family_keys(), associations.keys(),
+        self.assertEqual({'debian'}, associations.keys(),
                          "Associations should have only OS family specific sections")
-        self.assertEqual(get_compiled_defaults(), associations,
+        self.assertEqual(get_compiled_defaults(cluster), associations,
                          "Enriched associations of the cluster does not equal to enriched defaults")
 
     def test_redefine_os_specific_section(self):
         inventory = demo.generate_inventory(**demo.MINIHA_KEEPALIVED)
-        expected_pkgs = 'docker-ce'
-        package_associations(inventory, 'debian', 'docker')['package_name'] = expected_pkgs
+        expected_pkgs = 'containerd'
+        package_associations(inventory, 'debian', 'containerd')['package_name'] = expected_pkgs
         cluster = new_debian_cluster(inventory)
         associations = global_associations(cluster.inventory)
 
-        defs = get_compiled_defaults()
-        self.assertNotEqual(expected_pkgs, defs['debian']['docker']['package_name'])
-        defs['debian']['docker']['package_name'] = expected_pkgs
+        defs = get_compiled_defaults(cluster)
+        self.assertNotEqual(expected_pkgs, defs['debian']['containerd']['package_name'])
+        defs['debian']['containerd']['package_name'] = expected_pkgs
         self.assertEqual(defs, associations,
                          "Debian associations section was not enriched")
 
     def test_propagate_global_section_to_os_specific(self):
         inventory = demo.generate_inventory(**demo.MINIHA_KEEPALIVED)
-        expected_pkgs_1 = 'docker-ce'
+        expected_pkgs_1 = 'haproxy'
         expected_pkgs_2 = ['containerd=1.5.*']
-        package_associations(inventory, None, 'docker')['package_name'] = expected_pkgs_1
+        package_associations(inventory, None, 'haproxy')['package_name'] = expected_pkgs_1
         package_associations(inventory, None, 'containerd')['package_name'] = expected_pkgs_2
         cluster = new_debian_cluster(inventory)
         associations = global_associations(cluster.inventory)
-        self.assertEqual(packages.get_associations_os_family_keys(), associations.keys(),
+        self.assertEqual({'debian'}, associations.keys(),
                          "Associations should have only OS family specific sections")
 
-        defs = get_compiled_defaults()
-        self.assertNotEqual(expected_pkgs_1, defs['debian']['docker']['package_name'])
+        defs = get_compiled_defaults(cluster)
+        self.assertNotEqual(expected_pkgs_1, defs['debian']['haproxy']['package_name'])
         self.assertNotEqual(expected_pkgs_2, defs['debian']['containerd']['package_name'])
-        defs['debian']['docker']['package_name'] = expected_pkgs_1
+        defs['debian']['haproxy']['package_name'] = expected_pkgs_1
         defs['debian']['containerd']['package_name'] = expected_pkgs_2
         self.assertEqual(defs, associations,
                          "Debian associations section was not enriched")
 
     def test_error_if_global_section_redefined_for_multiple_os(self):
         inventory = demo.generate_inventory(**demo.MINIHA_KEEPALIVED)
-        expected_pkgs = 'docker-ce'
-        package_associations(inventory, None, 'docker')['package_name'] = expected_pkgs
+        expected_pkgs = 'containerd'
+        package_associations(inventory, None, 'containerd')['package_name'] = expected_pkgs
         context = demo.create_silent_context()
         host_different_os = inventory['nodes'][0]['address']
-        context['nodes'] = self._nodes_context_one_different_os(inventory, host_different_os)
+        nodes_context = self._nodes_context_one_different_os(inventory, host_different_os)
         with self.assertRaisesRegex(Exception, packages.ERROR_GLOBAL_ASSOCIATIONS_REDEFINED_MULTIPLE_OS):
-            demo.new_cluster(inventory, context=context)
+            demo.new_cluster(inventory, context=context, nodes_context=nodes_context)
 
     def test_error_if_global_section_redefined_for_add_node_different_os(self):
         inventory = demo.generate_inventory(**demo.MINIHA_KEEPALIVED)
-        expected_pkgs = 'docker-ce'
-        package_associations(inventory, None, 'docker')['package_name'] = expected_pkgs
+        expected_pkgs = 'containerd'
+        package_associations(inventory, None, 'containerd')['package_name'] = expected_pkgs
         context = demo.create_silent_context(['fake.yaml'], procedure='add_node')
         host_different_os = inventory['nodes'][0]['address']
-        context['nodes'] = self._nodes_context_one_different_os(inventory, host_different_os)
+        nodes_context = self._nodes_context_one_different_os(inventory, host_different_os)
         add_node = demo.generate_procedure_inventory('add_node')
         add_node['nodes'] = [inventory['nodes'].pop(0)]
         with self.assertRaisesRegex(Exception, packages.ERROR_GLOBAL_ASSOCIATIONS_REDEFINED_MULTIPLE_OS):
-            demo.new_cluster(inventory, procedure_inventory=add_node, context=context)
+            demo.new_cluster(inventory, procedure_inventory=add_node, context=context, nodes_context=nodes_context)
+
+    def test_no_error_if_global_section_redefined_for_check_iaas_all_nodes_inaccessible(self):
+        inventory = demo.generate_inventory(**demo.MINIHA_KEEPALIVED)
+        expected_pkgs = 'containerd'
+        package_associations(inventory, None, 'containerd')['package_name'] = expected_pkgs
+        context = demo.create_silent_context(procedure='check_iaas')
+        nodes_context = {node['address']: demo.generate_node_context(accessible=False) for node in inventory['nodes']}
+        # no error
+        demo.new_cluster(inventory, context=context, nodes_context=nodes_context)
 
     def test_success_if_os_specific_section_redefined_for_add_node_different_os(self):
         inventory = demo.generate_inventory(**demo.MINIHA_KEEPALIVED)
-        expected_pkgs = 'docker-ce'
-        package_associations(inventory, 'rhel', 'docker')['package_name'] = expected_pkgs
+        expected_pkgs = 'containerd'
+        package_associations(inventory, 'rhel', 'containerd')['package_name'] = expected_pkgs
         context = demo.create_silent_context(['fake.yaml'], procedure='add_node')
         host_different_os = inventory['nodes'][0]['address']
-        context['nodes'] = self._nodes_context_one_different_os(inventory, host_different_os)
+        nodes_context = self._nodes_context_one_different_os(inventory, host_different_os)
         add_node = demo.generate_procedure_inventory('add_node')
         add_node['nodes'] = [inventory['nodes'].pop(0)]
         # no error
-        demo.new_cluster(inventory, procedure_inventory=add_node, context=context)
+        demo.new_cluster(inventory, procedure_inventory=add_node, context=context, nodes_context=nodes_context)
 
     def test_cache_versions_false_use_recommended_versions(self):
         inventory = demo.generate_inventory(**demo.MINIHA_KEEPALIVED)
         set_cache_versions_false(inventory, None, None)
         cluster = new_debian_cluster(inventory)
         associations = global_associations(cluster.inventory)
-        self.assertEqual(get_compiled_defaults(), associations,
+        self.assertEqual(get_compiled_defaults(cluster), associations,
                          "Even if cache_versions == false, we still need to use recommended versions")
 
     def test_remove_unused_os_family_associations(self):
         inventory = demo.generate_inventory(**demo.MINIHA_KEEPALIVED)
         cluster = new_debian_cluster(inventory)
-        finalized_inventory = packages.remove_unused_os_family_associations(cluster, cluster.inventory)
-        self.assertEqual({'debian'}, global_associations(finalized_inventory).keys())
+        self.assertEqual({'debian'}, global_associations(cluster.inventory).keys())
 
     def test_semanage_debian_not_managed(self):
         inventory = demo.generate_inventory(**demo.MINIHA_KEEPALIVED)
@@ -268,8 +282,8 @@ class PackagesUtilities(unittest.TestCase):
     def test_detect_versions_debian(self):
         inventory = demo.generate_inventory(**demo.MINIHA_KEEPALIVED)
         context = demo.create_silent_context()
-        context['nodes'] = demo.generate_nodes_context(inventory, os_name='ubuntu', os_version='20.04')
-        cluster = demo.new_cluster(inventory, context=context)
+        nodes_context = demo.generate_nodes_context(inventory, os_name='ubuntu', os_version='20.04')
+        cluster = demo.new_cluster(inventory, context=context, nodes_context=nodes_context)
 
         expected_pkg = 'containerd=1.5.9-0ubuntu1~20.04.4'
         queried_pkg = 'containerd=1.5.*'
@@ -291,8 +305,8 @@ class PackagesUtilities(unittest.TestCase):
     def test_detect_versions_rhel(self):
         inventory = demo.generate_inventory(**demo.MINIHA_KEEPALIVED)
         context = demo.create_silent_context()
-        context['nodes'] = demo.generate_nodes_context(inventory, os_name='centos', os_version='7.9')
-        cluster = demo.new_cluster(inventory, context=context)
+        nodes_context = demo.generate_nodes_context(inventory, os_name='centos', os_version='7.9')
+        cluster = demo.new_cluster(inventory, context=context, nodes_context=nodes_context)
 
         expected_pkg = 'docker-ce-19.03.15-3.el7.x86_64'
         queried_pkg = 'docker-ce-19.03*'
@@ -316,16 +330,17 @@ class CacheVersions(unittest.TestCase):
     def setUp(self) -> None:
         self.inventory = demo.generate_inventory(**demo.FULLHA_KEEPALIVED)
         self.context = demo.create_silent_context(['fake.yaml'], procedure='add_node')
-        self.context['nodes'] = demo.generate_nodes_context(self.inventory, os_name='ubuntu', os_version='20.04')
+        self.nodes_context = demo.generate_nodes_context(self.inventory, os_name='ubuntu', os_version='20.04')
         self.hosts = [node['address'] for node in self.inventory['nodes']]
-        first_master_idx = next(i for i, node in enumerate(self.inventory['nodes']) if 'master' in node['roles'])
-        self.new_host = self.inventory['nodes'][first_master_idx]['address']
+        first_control_plane_idx = next(i for i, node in enumerate(self.inventory['nodes']) if 'control-plane' in node['roles'])
+        self.new_host = self.inventory['nodes'][first_control_plane_idx]['address']
         self.procedure_inventory = demo.generate_procedure_inventory('add_node')
-        self.procedure_inventory['nodes'] = [self.inventory['nodes'].pop(first_master_idx)]
+        self.procedure_inventory['nodes'] = [self.inventory['nodes'].pop(first_control_plane_idx)]
         self.initial_hosts = [node['address'] for node in self.inventory['nodes']]
 
     def _new_cluster(self):
-        return demo.new_cluster(self.inventory, context=self.context, procedure_inventory=self.procedure_inventory)
+        return demo.new_cluster(self.inventory, context=self.context, procedure_inventory=self.procedure_inventory,
+                                nodes_context=self.nodes_context)
 
     def _packages_install(self, inventory: dict):
         return inventory.setdefault('services', {}).setdefault('packages', {}).setdefault('install', [])
@@ -355,9 +370,9 @@ class CacheVersions(unittest.TestCase):
         self.assertEqual('auditd=1:2.8.5-2ubuntu6',
                          package_associations(cluster.inventory, 'debian', 'audit')['package_name'],
                          "auditd was not detected")
-        self.assertEqual('kmod=27-1ubuntu2.1',
+        self.assertEqual('kmod',
                          package_associations(cluster.inventory, 'debian', 'kmod')['package_name'],
-                         "kmod was not detected")
+                         "kmod should be default because cache_versions=false for it")
         self.assertEqual({'curl2', 'unzip2'}, set(self._packages_include(cluster.inventory)),
                          "Custom packages versions should be not detected when adding node")
 
@@ -377,8 +392,8 @@ class CacheVersions(unittest.TestCase):
     def test_cache_versions_global_off(self):
         expected_containerd = 'containerd=1.5.9-0ubuntu1~20.04.4'
         expected_kmod = 'kmod=27-1ubuntu2.1'
-        default_containerd = get_compiled_defaults()['debian']['containerd']['package_name']
-        default_kmod = get_compiled_defaults()['debian']['kmod']['package_name']
+        default_containerd = ASSOCIATIONS_DEFAULTS['debian']['containerd']['package_name']
+        default_kmod = ASSOCIATIONS_DEFAULTS['debian']['kmod']['package_name']
         self.assertNotEqual(expected_containerd, default_containerd)
         self.assertNotEqual(expected_kmod, default_kmod)
 
@@ -398,7 +413,7 @@ class CacheVersions(unittest.TestCase):
                          package_associations(cluster.inventory, 'debian', 'kmod')['package_name'],
                          "kmod should be default because caching versions is off")
 
-        finalized_inventory = utils.make_finalized_inventory(cluster)
+        finalized_inventory = utils.make_finalized_inventory(cluster, stub_cache_packages=False)
         self.assertEqual(expected_containerd,
                          package_associations(finalized_inventory, 'debian', 'containerd')['package_name'],
                          "containerd was not detected")
@@ -407,9 +422,9 @@ class CacheVersions(unittest.TestCase):
                          "kmod was not detected")
 
     def test_cache_versions_specific_off(self):
-        default_containerd = get_compiled_defaults()['debian']['containerd']['package_name']
-        default_haproxy = get_compiled_defaults()['debian']['haproxy']['package_name']
-        default_curl = get_compiled_defaults()['debian']['curl']['package_name']
+        default_containerd = ASSOCIATIONS_DEFAULTS['debian']['containerd']['package_name']
+        default_haproxy = ASSOCIATIONS_DEFAULTS['debian']['haproxy']['package_name']
+        default_curl = ASSOCIATIONS_DEFAULTS['debian']['curl']['package_name']
 
         set_cache_versions_false(self.inventory, None, 'containerd')
         set_cache_versions_false(self.inventory, 'debian', 'haproxy')
@@ -437,7 +452,7 @@ class CacheVersions(unittest.TestCase):
                          package_associations(cluster.inventory, 'debian', 'curl')['package_name'],
                          "curl should be default because caching versions is off")
 
-        finalized_inventory = utils.make_finalized_inventory(cluster)
+        finalized_inventory = utils.make_finalized_inventory(cluster, stub_cache_packages=False)
         self.assertEqual('containerd=1.5.9-0ubuntu1~20.04.4',
                          package_associations(finalized_inventory, 'debian', 'containerd')['package_name'],
                          "containerd was not detected")
@@ -452,46 +467,38 @@ class CacheVersions(unittest.TestCase):
                          "curl was not detected")
 
     def test_skip_cache_versions_not_managed(self):
-        default_kmod = get_compiled_defaults()['debian']['kmod']['package_name']
-        default_docker = get_compiled_defaults()['debian']['docker']['package_name'][0]
+        default_conntrack = ASSOCIATIONS_DEFAULTS['debian']['conntrack']['package_name']
 
-        set_mandatory_off(self.inventory, 'kmod')
+        set_mandatory_off(self.inventory, 'conntrack')
         cluster = self._new_cluster()
         utils.stub_associations_packages(cluster, {
-            'kmod': {host: 'kmod=27-1ubuntu2.1' for host in self.initial_hosts},
+            'conntrack': {host: 'conntrack=1:1.4.6-2build2' for host in self.initial_hosts},
             'curl': {host: 'curl=7.68.0-1ubuntu2.14' for host in self.initial_hosts},
-            'docker-ce': {host: 'docker-ce=1' for host in self.initial_hosts},
         })
 
         cache_installed_packages(cluster)
 
-        self.assertEqual(default_kmod,
-                         package_associations(cluster.inventory, 'debian', 'kmod')['package_name'],
-                         "kmod should be default because automatic management is off")
-        self.assertEqual('curl=7.68.0-1ubuntu2.14',
+        self.assertEqual(default_conntrack,
+                         package_associations(cluster.inventory, 'debian', 'conntrack')['package_name'],
+                         "conntrack should be default because automatic management is off")
+        self.assertEqual('curl',
                          package_associations(cluster.inventory, 'debian', 'curl')['package_name'],
-                         "curl was not detected")
-        self.assertEqual(default_docker,
-                         package_associations(cluster.inventory, 'debian', 'docker')['package_name'][0],
-                         "docker should be default because cluster is based on containerd")
+                         "curl should be default because cache_version is disabled for it")
 
-        finalized_inventory = utils.make_finalized_inventory(cluster)
-        self.assertEqual(default_kmod,
-                         package_associations(finalized_inventory, 'debian', 'kmod')['package_name'],
-                         "kmod should be default because automatic management is off")
+        finalized_inventory = utils.make_finalized_inventory(cluster, stub_cache_packages=False)
+        self.assertEqual(default_conntrack,
+                         package_associations(finalized_inventory, 'debian', 'conntrack')['package_name'],
+                         "conntrack should be default because automatic management is off")
         self.assertEqual('curl=7.68.0-1ubuntu2.14',
                          package_associations(finalized_inventory, 'debian', 'curl')['package_name'],
                          "curl was not detected")
-        self.assertEqual(default_docker,
-                         package_associations(finalized_inventory, 'debian', 'docker')['package_name'][0],
-                         "docker should be default because cluster is based on containerd")
 
     def test_add_node_fails_different_package_versions(self):
         cluster = self._new_cluster()
         containerd_hosts_stub = {}
         last_k8s_host = ''
-        for i, node in enumerate(self.inventory['nodes']):
-            if 'master' in node['roles'] or 'worker' in node['roles']:
+        for node in self.inventory['nodes']:
+            if 'control-plane' in node['roles'] or 'worker' in node['roles']:
                 last_k8s_host = node['address']
                 containerd_hosts_stub[last_k8s_host] = 'containerd=1.5.9-0ubuntu1~20.04.4'
         containerd_hosts_stub[last_k8s_host] = 'containerd=2'
@@ -505,8 +512,8 @@ class CacheVersions(unittest.TestCase):
         cluster = self._new_cluster()
         conntrack_hosts_stub = {}
         last_k8s_host = ''
-        for i, node in enumerate(self.inventory['nodes']):
-            if 'master' in node['roles'] or 'worker' in node['roles']:
+        for node in self.inventory['nodes']:
+            if 'control-plane' in node['roles'] or 'worker' in node['roles']:
                 last_k8s_host = node['address']
                 conntrack_hosts_stub[last_k8s_host] = 'conntrack=1:1.4.5-2'
         conntrack_hosts_stub[last_k8s_host] = 'conntrack=2'
@@ -519,9 +526,9 @@ class CacheVersions(unittest.TestCase):
     def test_add_node_success_cache_by_initial_nodes(self):
         cluster = self._new_cluster()
         packages_hosts_stub = {'containerd': {}, 'conntrack': {}}
-        for i, node in enumerate(self.inventory['nodes']):
+        for node in self.inventory['nodes']:
             host = node['address']
-            if 'master' in node['roles'] or 'worker' in node['roles']:
+            if 'control-plane' in node['roles'] or 'worker' in node['roles']:
                 packages_hosts_stub['containerd'][host] = 'containerd=1.5.9-0ubuntu1~20.04.4'
                 packages_hosts_stub['conntrack'][host] = 'conntrack=1:1.4.5-2'
 
@@ -541,9 +548,9 @@ class CacheVersions(unittest.TestCase):
     def test_add_node_success_cache_versions_managed_nodes(self):
         cluster = self._new_cluster()
         packages_hosts_stub = {'containerd': {}, 'conntrack': {}}
-        for i, node in enumerate(self.inventory['nodes']):
+        for node in self.inventory['nodes']:
             host = node['address']
-            if 'master' in node['roles'] or 'worker' in node['roles']:
+            if 'control-plane' in node['roles'] or 'worker' in node['roles']:
                 packages_hosts_stub['containerd'][host] = 'containerd=1.5.9-0ubuntu1~20.04.4'
                 packages_hosts_stub['conntrack'][host] = 'conntrack=1:1.4.5-2'
             else:
@@ -570,8 +577,8 @@ class CacheVersions(unittest.TestCase):
                          "conntrack was not detected")
 
     def test_finalize_inventory_different_package_versions(self):
-        default_containerd = get_compiled_defaults()['debian']['containerd']['package_name']
-        default_kmod = get_compiled_defaults()['debian']['kmod']['package_name']
+        default_containerd = ASSOCIATIONS_DEFAULTS['debian']['containerd']['package_name']
+        default_kmod = ASSOCIATIONS_DEFAULTS['debian']['kmod']['package_name']
 
         self._packages_install(self.inventory).extend(['curl2=7.*', 'unzip2=6.*'])
         cluster = self._new_cluster()
@@ -598,7 +605,7 @@ class CacheVersions(unittest.TestCase):
             'unzip2': {host: 'unzip2=6.0-25ubuntu1.1' for host in self.hosts},
         })
 
-        finalized_inventory = utils.make_finalized_inventory(cluster)
+        finalized_inventory = utils.make_finalized_inventory(cluster, stub_cache_packages=False)
         self.assertEqual(default_containerd,
                          [package_associations(finalized_inventory, 'debian', 'containerd')['package_name']],
                          "containerd should be default because multiple versions are installed")
@@ -612,10 +619,10 @@ class CacheVersions(unittest.TestCase):
                          "Custom packages versions should be partially detected in finalized inventory")
 
     def test_not_cache_versions_if_multiple_os_family_versions(self):
-        default_containerd = get_compiled_defaults()['debian']['containerd']['package_name']
-        default_kmod = get_compiled_defaults()['debian']['kmod']['package_name']
+        default_containerd = ASSOCIATIONS_DEFAULTS['debian']['containerd']['package_name']
+        default_kmod = ASSOCIATIONS_DEFAULTS['debian']['kmod']['package_name']
 
-        self.context['nodes'][self.new_host]['os']['version'] = '22.04'
+        self.nodes_context[self.new_host]['os']['version'] = '22.04'
         self._packages_install(self.inventory).extend(['curl2=7.*'])
         cluster = self._new_cluster()
 
@@ -636,7 +643,7 @@ class CacheVersions(unittest.TestCase):
                          package_associations(cluster.inventory, 'debian', 'kmod')['package_name'],
                          "kmod should be default because multiple OS versions are detected")
 
-        finalized_inventory = utils.make_finalized_inventory(cluster)
+        finalized_inventory = utils.make_finalized_inventory(cluster, stub_cache_packages=False)
         self.assertEqual(default_containerd,
                          package_associations(finalized_inventory, 'debian', 'containerd')['package_name'],
                          "containerd should be default because multiple OS versions are detected")
@@ -645,6 +652,25 @@ class CacheVersions(unittest.TestCase):
                          "kmod should be default because multiple OS versions are detected")
         self.assertEqual({'curl2=7.*'}, set(self._packages_include(finalized_inventory)),
                          "Custom packages should be default because multiple OS versions are detected")
+
+    def test_unattended_upgrades(self):
+        cluster = self._new_cluster()
+        balancers_config = 'Unattended-Upgrade::Package-Blacklist { "haproxy"; "keepalived"; };\n'
+        kubernetes_config = 'Unattended-Upgrade::Package-Blacklist { "containerd"; "auditd"; "conntrack"; "iptables"; };\n'
+        packages.disable_unattended_upgrade(cluster.nodes['all'])
+
+        for node in cluster.make_group_from_roles(['balancer']).get_ordered_members_list():
+            unattended_upgrades_config = cluster.fake_fs.read(node.get_host(),
+                                                              '/etc/apt/apt.conf.d/51unattended-upgrades-kubemarine')
+            self.assertIsNotNone(unattended_upgrades_config)
+            self.assertEqual(balancers_config, unattended_upgrades_config,
+                             'Wrong unattended-upgrade config on balancer')
+        for node in cluster.make_group_from_roles(['control-plane', 'worker']).get_ordered_members_list():
+            unattended_upgrades_config = cluster.fake_fs.read(node.get_host(),
+                                                              '/etc/apt/apt.conf.d/51unattended-upgrades-kubemarine')
+            self.assertIsNotNone(unattended_upgrades_config)
+            self.assertEqual(kubernetes_config, unattended_upgrades_config,
+                             'Wrong unattended-upgrade config on control-plane/worker')
 
 
 if __name__ == '__main__':

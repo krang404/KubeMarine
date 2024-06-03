@@ -72,7 +72,7 @@ class EnrichmentValidation(unittest.TestCase):
             demo.new_cluster(inventory)
 
     @patch('kubemarine.core.utils.determine_resource_absolute_file', return_value=("path", True))
-    def test_verify_python_import_error(self, patch):
+    def test_verify_python_import_error(self, _patch):
         inventory = demo.generate_inventory(**demo.ALLINONE)
         inventory['plugins'] = {'custom': {'installation': {'procedures': [
             {'python': {'module': 'm', 'method': 'f'}}
@@ -84,7 +84,7 @@ class EnrichmentValidation(unittest.TestCase):
     @patch('kubemarine.core.utils.determine_resource_absolute_file', return_value=("path", True))
     @patch('importlib.util.spec_from_file_location', return_value=MOCK_SPEC)
     @patch('importlib.util.module_from_spec', return_value=None)
-    def test_verify_python_method_not_exist(self, patch, patch1, patch2):
+    def test_verify_python_method_not_exist(self, _patch, _patch1, _patch2):
         inventory = demo.generate_inventory(**demo.ALLINONE)
         inventory['plugins'] = {'custom': {'installation': {'procedures': [
             {'python': {'module': 'plugins/builtin.py', 'method': 'apply_yaml'}}
@@ -97,7 +97,7 @@ class EnrichmentValidation(unittest.TestCase):
         inventory['plugins'] = {'custom': {'installation': {'procedures': [
             {'shell': ''}
         ]}}}
-        with self.assertRaisesRegex(errors.FailException, r"'' is too short"):
+        with self.assertRaisesRegex(errors.FailException, r"'' should be non-empty"):
             demo.new_cluster(inventory)
 
     def test_verify_shell_in_var_name_not_defined(self):
@@ -128,7 +128,7 @@ class EnrichmentValidation(unittest.TestCase):
         inventory['plugins'] = {'custom': {'installation': {'procedures': [
             {'ansible': ''}
         ]}}}
-        with self.assertRaisesRegex(errors.FailException, r"'' is too short"):
+        with self.assertRaisesRegex(errors.FailException, r"'' should be non-empty"):
             demo.new_cluster(inventory)
 
     def test_verify_helm_empty_chart_path(self):
@@ -136,7 +136,7 @@ class EnrichmentValidation(unittest.TestCase):
         inventory['plugins'] = {'custom': {'installation': {'procedures': [
             {'helm': {'chart_path': ''}}
         ]}}}
-        with self.assertRaisesRegex(errors.FailException, r"'' is too short"):
+        with self.assertRaisesRegex(errors.FailException, r"'' should be non-empty"):
             demo.new_cluster(inventory)
 
     def test_verify_manifest_not_found(self):

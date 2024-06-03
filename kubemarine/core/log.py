@@ -16,11 +16,9 @@ import logging
 import os
 import sys
 from abc import ABC, abstractmethod
+from typing import Any, List, Optional, cast, Dict, Union
 
 from pygelf import gelf, GelfTcpHandler, GelfUdpHandler, GelfTlsHandler, GelfHttpHandler  # type: ignore[import-untyped]
-
-from copy import deepcopy
-from typing import Any, List, Optional, cast, Dict, Union
 
 VERBOSE = 5
 gelf.LEVELS.update({VERBOSE: 8})
@@ -93,7 +91,11 @@ class EnhancedLogger(logging.Logger, VerboseLogger):
 
     def verbose(self, msg: object, *args: object, **kwargs: Any) -> None:
         if self.isEnabledFor(VERBOSE):
-            self._log(VERBOSE, msg, args, **kwargs)
+            if sys.version_info[:2] >= (3, 11):
+                # https://github.com/python/cpython/pull/28287
+                self._log(VERBOSE, msg, args, **kwargs, stacklevel=2)
+            else:
+                self._log(VERBOSE, msg, args, **kwargs)
 
     def makeRecord(self, name: str, level: int, fn: str, lno: int, msg: object, args,  # type: ignore[no-untyped-def]
                    exc_info, func=None, extra=None,
@@ -194,7 +196,7 @@ class LogHandler:
                  colorize: bool = False,
                  correct_newlines: bool = False,
                  filemode: str = 'a',
-                 format: str = DEFAULT_FORMAT,
+                 format: str = DEFAULT_FORMAT,  # pylint: disable=redefined-builtin
                  datefmt: str = None,
                  header: str = None,
                  **kwargs: Union[str, bool, int]):
@@ -253,7 +255,8 @@ class LogHandler:
             self._target = target
             # Output produced by remote commands might contain characters which cannot be encoded on Windows deployer.
             # Specify explicitly utf-8 encoding which is native to the remote machines.
-            self.handler = FileHandlerWithHeader(self._formatter, self._target, mode=filemode, header=self._header, encoding='utf-8')
+            self.handler = FileHandlerWithHeader(self._formatter, self._target,
+                                                 mode=filemode, header=self._header, encoding='utf-8')
 
         if level not in LOGGING_LEVELS_BY_NAME:
             raise Exception(f'Failed to create logger - unknown logging level: "{level}"')
@@ -261,7 +264,8 @@ class LogHandler:
         self.handler.setLevel(self._level)
 
     def __str__(self) -> str:
-        return f'target: {self._target}, level: {LOGGING_NAMES_BY_LEVEL[self._level]}, colorize: {self._colorize}, datefmt: {self._datefmt}, format: {self._format}'
+        return (f'target: {self._target}, level: {LOGGING_NAMES_BY_LEVEL[self._level]}, '
+                f'colorize: {self._colorize}, datefmt: {self._datefmt}, format: {self._format}')
 
     def append_to_logger(self, logger: EnhancedLogger) -> None:
         logger.addHandler(self.handler)
@@ -272,8 +276,8 @@ class LogHandler:
 
 class Log:
 
-    def __init__(self, raw_inventory: dict, handlers: List[LogHandler]):
-        logger = logging.getLogger(raw_inventory.get('cluster_name', 'cluster.local'))
+    def __init__(self, name: str, handlers: List[LogHandler]):
+        logger = logging.getLogger(name)
         self._logger = cast(EnhancedLogger, logger)
         self._logger.setLevel(VERBOSE)
 
@@ -335,7 +339,7 @@ def parse_log_argument(argument: str) -> LogHandler:
         if parameter == '':
             continue
         value: Union[str, bool, int]
-        key, value, *rest = parameter.split('=')
+        key, value, *_ = parameter.split('=')
         if key == 'level':
             level = value
         else:
@@ -359,12 +363,12 @@ def get_dump_debug_filepath(context: dict) -> Optional[str]:
     return os.path.join(args['dump_location'], 'dump', 'debug.log')
 
 
-def init_log_from_context_args(globals: dict, context: dict, raw_inventory: dict) -> Log:
+def init_log_from_context_args(globals_: dict, context: dict, name: str) -> Log:
     """
     Create Log from raw CLI arguments in Cluster context
-    :param globals: parsed globals collection
+    :param globals_: parsed globals collection
     :param context: context holding execution arguments.
-    :param raw_inventory: parsed but not yet enriched inventory
+    :param name: desirable logger name
     :return: Initialized Log, based on all parsed logging arguments
     """
 
@@ -385,13 +389,13 @@ def init_log_from_context_args(globals: dict, context: dict, raw_inventory: dict
     debug_filepath = get_dump_debug_filepath(context)
     if debug_filepath:
         handlers.append(LogHandler(target=debug_filepath,
-                                   **globals['logging']['default_targets']['dump']))
+                                   **globals_['logging']['default_targets']['dump']))
 
     if not stdout_specified:
-        stdout_settings = deepcopy(globals['logging']['default_targets']['stdout'])
+        stdout_settings = globals_['logging']['default_targets']['stdout']
         handlers.append(LogHandler(target='stdout', **stdout_settings))
 
-    log = Log(raw_inventory, handlers)
+    log = Log(name, handlers)
 
     log.logger.verbose('Using the following loggers: \n\t%s' % "\n\t".join("- " + str(x) for x in handlers))
 
@@ -405,7 +409,12 @@ def caller_info(logger: EnhancedLogger) -> Dict[str, object]:
     :param logger: EnhancedLogger
     :return: dictionary with the invocation metadata
     """
-    fn, lno, func, sinfo = logger.findCaller()
+    if sys.version_info[:2] >= (3, 11):
+        # https://github.com/python/cpython/pull/28287
+        fn, lno, func, sinfo = logger.findCaller(stacklevel=3)
+    else:
+        fn, lno, func, sinfo = logger.findCaller()
+
     record: logging.LogRecord = logger.makeRecord("", logging.DEBUG, fn, lno, "", (), None,
                                                   func=func, extra=None, sinfo=sinfo)
     return dict(item for item in record.__dict__.items()

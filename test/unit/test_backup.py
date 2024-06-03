@@ -13,68 +13,68 @@
 # limitations under the License.
 
 import gzip
-import logging
-import tempfile
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
 from textwrap import dedent
 from typing import Optional
 from unittest import mock
+from test.unit import utils as test_utils
 
 from kubemarine import demo
-from kubemarine.core import flow, utils, log
+from kubemarine.core import utils, flow
 from kubemarine.procedures import backup
 
 
-class TestBackupTasks(unittest.TestCase):
+class TestBackupTasks(test_utils.CommonTest):
     def setUp(self):
-        self.tmpdir = tempfile.TemporaryDirectory()
         self.inventory = demo.generate_inventory(**demo.FULLHA_KEEPALIVED)
         self.hosts = [node['address'] for node in self.inventory['nodes']]
 
-        self.context = backup.create_context(['fake.yaml'])
-        self.context['preserve_inventory'] = False
+        self.context = demo.create_silent_context(['fake.yaml'], procedure='backup')
 
         self.args = self.context['execution_arguments']
-        del self.args['ansible_inventory_location']
         self.args['disable_dump'] = False
-        self.args['dump_location'] = self.tmpdir.name
-        utils.prepare_dump_directory(self.args['dump_location'])
+        self.args['dump_location'] = self.tmpdir
+        utils.prepare_dump_directory(self.context)
 
         self.fake_shell = demo.FakeShell()
         self.resources: Optional[demo.FakeResources] = None
 
-    def tearDown(self):
-        logger = logging.getLogger("k8s.fake.local")
-        for h in logger.handlers:
-            if isinstance(h, log.FileHandlerWithHeader):
-                h.close()
-        self.tmpdir.cleanup()
+    def run(self, *args, **kwargs):
+        with test_utils.temporary_directory(self):
+            return super().run(*args, **kwargs)
 
-    def _run(self):
-        self.resources = demo.FakeResources(self.context, self.inventory,
-                                            procedure_inventory=demo.generate_procedure_inventory('backup'),
-                                            nodes_context=demo.generate_nodes_context(self.inventory),
-                                            fake_shell=self.fake_shell)
+    def _run(self, procedure_inventory: dict):
+        self.resources = test_utils.FakeResources(self.context, self.inventory,
+                                                  procedure_inventory=procedure_inventory,
+                                                  nodes_context=demo.generate_nodes_context(self.inventory),
+                                                  fake_shell=self.fake_shell)
 
         flow.run_actions(self.resources, [backup.BackupAction()])
 
-    def test_export_kubernetes(self):
+    def test_export_whole_kubernetes(self):
         self.args['tasks'] = 'export.kubernetes'
         self._stub_load_namespaces()
         self._stub_load_resources()
-        with self._mock_manifest_processor_enrich():
-            self._run()
 
-        descriptor = self.resources.last_cluster.context['backup_descriptor']['kubernetes']['resources']
+        backup_all_procedure = demo.generate_procedure_inventory('backup')
+        backup_all_procedure.setdefault('backup_plan', {}).setdefault('kubernetes', {})\
+            .setdefault('namespaced_resources', {}).setdefault('resources', 'all')
+        backup_all_procedure.setdefault('backup_plan', {}).setdefault('kubernetes', {}) \
+            .setdefault('nonnamespaced_resources', 'all')
+
+        with self._mock_download():
+            self._run(backup_all_procedure)
+
+        descriptor = self.resources.cluster_if_initialized().context['backup_descriptor']['kubernetes']['resources']
         self.assertEqual({'kube-system': ['configmaps', 'configmaps.example.com', 'roles.rbac.authorization.k8s.io']},
                          descriptor.get('namespaced'),
                          "Not expected resulting list of namespaced resources")
         self.assertEqual(['nodes'], descriptor.get('nonnamespaced'),
                          "Not expected resulting list of non-namespaced resources")
 
-        resources_path = Path(self.tmpdir.name) / 'dump' / 'backup' / 'kubernetes_resources'
+        resources_path = Path(self.tmpdir) / 'dump' / 'backup' / 'kubernetes_resources'
         actual_files = {str(p.relative_to(resources_path)) for p in resources_path.glob("**/*.yaml")}
         expected_files = {str(Path(p)) for p in ['nodes.yaml', 'kube-system/configmaps.yaml',
                                                  'kube-system/configmaps.example.com.yaml',
@@ -172,6 +172,23 @@ class TestBackupTasks(unittest.TestCase):
         self.assertEqual(expected_context, actual_content,
                          f"Data in file 'kube-system/roles.rbac.authorization.k8s.io.yaml' is not expected")
 
+    def test_export_default_kubernetes(self):
+        self.args['tasks'] = 'export.kubernetes'
+        self._stub_load_namespaces()
+        self._stub_load_resources()
+
+        backup_all_procedure = demo.generate_procedure_inventory('backup')
+
+        with self._mock_download():
+            self._run(backup_all_procedure)
+
+        descriptor = self.resources.cluster_if_initialized().context['backup_descriptor']['kubernetes']['resources']
+        self.assertEqual({}, descriptor, "Not expected resulting list of resources")
+
+        resources_path = Path(self.tmpdir) / 'dump' / 'backup' / 'kubernetes_resources'
+        actual_files = {str(p.relative_to(resources_path)) for p in resources_path.glob("**/*.yaml")}
+        self.assertFalse(actual_files, "List of files is not empty")
+
     def _parse_yaml(self, data: str):
         return utils.yaml_structure_preserver().load(data)
 
@@ -205,8 +222,8 @@ class TestBackupTasks(unittest.TestCase):
                             ['kubectl api-resources --verbs=list --sort-by=name --namespaced=false'])
 
     @contextmanager
-    def _mock_manifest_processor_enrich(self):
-        download_orig = backup.ExportKubernetesDownloader._download
+    def _mock_download(self):
+        download_orig = backup.ExportKubernetesDownloader._download  # pylint: disable=protected-access
 
         def download_stub(location: str, data: str):
             with gzip.open(location, 'wt', encoding='utf-8') as f:

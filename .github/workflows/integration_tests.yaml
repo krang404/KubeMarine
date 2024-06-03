@@ -30,6 +30,7 @@ jobs:
     runs-on: ubuntu-22.04
     needs: collect_kubernetes_versions
     env:
+      KUBERNETES_VERSION: ${{ matrix.kubernetes-version }}
       cluster_yaml_file: ./ci/default_cluster.yaml
     strategy:
       fail-fast: false
@@ -63,9 +64,6 @@ jobs:
         run: |
           sudo apt update && sudo apt install -y systemd
           sudo systemctl start systemd-journald.service	
-         # TODO: change to kubemarine runtime values feature
-      - name: Set kubernetes version to cluster.yaml
-        run: sed -i "s/<KUBERNETES_VERSION>/${{ matrix.kubernetes-version }}/" ${{ env.cluster_yaml_file }}
       - name: Check Iaas
         id: test_check_iaas
         run: kubemarine check_iaas -c ${{ env.cluster_yaml_file }}  --dump-location ./results/check_iaas_dump/
@@ -75,6 +73,9 @@ jobs:
       - name: Check paas
         id: test_check_paas
         run: kubemarine check_paas -c ${{ env.cluster_yaml_file }} --dump-location ./results/check_paas_dump/
+      - name: Get events kubectl
+        if: failure()
+        run: sudo kubectl get events --sort-by='.metadata.creationTimestamp' -A
       - name: Collect journalctl logs
         if: failure()
         run: |
@@ -136,7 +137,7 @@ jobs:
         run: kubemarine check_paas -c ${{ env.cluster_yaml_file }} --dump-location ./results/check_paas_dump/
       - name: Get events kubectl
         if: failure()
-        run: kubectl get events --sort-by='.metadata.creationTimestamp' -A
+        run: sudo kubectl get events --sort-by='.metadata.creationTimestamp' -A
       - name: Collect journalctl logs
         if: failure()
         run: |
@@ -166,7 +167,7 @@ jobs:
         run: python scripts/thirdparties/sync.py --refresh-manifests
       - name: Check source code unchanged
         run: |
-          if ! git diff --exit-code; then
+          if ! git diff --staged --exit-code; then
             echo ""
             echo -e "\033[91mkubernetes_versions.yaml may be not synchronized with internal compatibility maps, or plugin manifests. See diff above.\033[0m"
             echo -e "\033[91mDo not change internal compatibility maps manually. Use scripts/thirdparties/sync.py to synchronize the compatibility maps.\033[0m"

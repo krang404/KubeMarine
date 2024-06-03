@@ -18,6 +18,7 @@ import random
 import re
 import time
 from abc import ABC, abstractmethod
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from types import TracebackType
 from typing import Tuple, List, Dict, Callable, Any, Optional, Union, OrderedDict, TypeVar, Type, Mapping, Iterable
@@ -25,13 +26,13 @@ from typing import Tuple, List, Dict, Callable, Any, Optional, Union, OrderedDic
 import fabric  # type: ignore[import-untyped]
 import fabric.transfer  # type: ignore[import-untyped]
 
-from concurrent.futures.thread import ThreadPoolExecutor
-
 import invoke
 
 from kubemarine.core import log, static
 from kubemarine.core.connections import ConnectionPool
 from kubemarine.core.environment import Environment
+
+EXIT_CODE_PATTERN = re.compile(r'^\n(\d+)\n')
 
 
 class RunnersResult:
@@ -121,6 +122,9 @@ class RunnersResult:
                            f"{val.rstrip()}\n")
         return "\n".join(ret)
 
+    def grep_returned_nothing(self) -> bool:
+        return not self.stdout and not self.stderr and self.exited == 1
+
 
 class UnexpectedExit(Exception):
     def __init__(self, result: RunnersResult):
@@ -193,16 +197,12 @@ _T = TypeVar('_T', bound='RawExecutor')
 
 class RawExecutor:
 
-    def __init__(self, cluster: Environment, connection_pool: ConnectionPool = None, timeout: int = None) -> None:
+    def __init__(self, cluster: Environment, connection_pool: ConnectionPool = None) -> None:
         self.logger = cluster.log
         if connection_pool is not None:
             self.connection_pool = connection_pool
         else:
             self.connection_pool = cluster.connection_pool
-        self.inventory = cluster.inventory
-        self.timeout = timeout
-        if timeout is None:
-            self.timeout = static.GLOBALS['nodes']['command_execution']['timeout']
         self._connections_queue: Dict[str, List[_PayloadItem]] = {}
         self._last_token = -1
         self._last_results: Dict[str, TokenizedResult] = {}
@@ -255,10 +255,7 @@ class RawExecutor:
             reparsed_results[host] = conn_results
 
             runner_exception = None
-            if isinstance(raw_result, invoke.UnexpectedExit) or isinstance(raw_result, invoke.CommandTimedOut):
-                # If UnexpectedExit, all separators are printed till the last failed command.
-                # CommandTimedOut may currently arise only for the single command in the batch,
-                # so it definitely have no separators in the output, and it is thus safe to parse it.
+            if isinstance(raw_result, (invoke.UnexpectedExit, invoke.CommandTimedOut)):
                 runner_exception = raw_result
                 raw_result = raw_result.result
 
@@ -277,7 +274,13 @@ class RawExecutor:
                         # Commands were successful until the last command in the batch.
                         reparsed_result = UnexpectedExit(result)
                     if isinstance(runner_exception, invoke.CommandTimedOut):
-                        # There can be only one (and the last) command with 'timeout' in the batch.
+                        # Commands were successful until the last reparsed command.
+
+                        # Take common timeout as timeout for the last command.
+                        # This is not honest enough, as previous commands also consumed some time.
+                        # This is acceptable for an exceptional case when we did not expect long-running command,
+                        # as this is applicable only for commands without explicit timeout
+                        # (i.e. having timeout=globals.nodes.command_execution.timeout).
                         reparsed_result = CommandTimedOut(result, runner_exception.timeout)
 
                 conn_results[token] = reparsed_result
@@ -290,25 +293,54 @@ class RawExecutor:
                                result: fabric.runners.Result) -> List[RunnersResult]:
         # unpack last action in list of payloads
         _, _, kwargs = payloads[-1][0]
+        hide = kwargs.get('hide', False)
 
-        stderrs = result.stderr.split(self._command_separator + '\n')
-        raw_stdouts = result.stdout.split(self._command_separator + '\n')
-        stdouts = []
-        exit_codes = []
-        i = 0
-        while i < len(raw_stdouts):
-            stdouts.append(raw_stdouts[i])
-            if i + 1 < len(raw_stdouts):
-                exit_codes.append(int(raw_stdouts[i + 1].strip()))
-            i += 2
-        exit_codes.append(result.exited)
+        # Raw stdout may not fully contain the separator,
+        # if the channel was closed due to a timeout while reading the separator from the remote output.
+        # In this case the part of the separator becomes a part of the reparsed command output.
+        # This is acceptable as the situation is considered extremely rare,
+        # and because the only we can do with not finished command is to print its partial output.
+        raw_stderrs = result.stderr.split(self._command_separator)
+        raw_stdouts = result.stdout.split(self._command_separator)
 
         results = []
-        for i, code in enumerate(exit_codes):
-            action, _, _ = payloads[i]
+        result_i = 0
+        stdout = stderr = ''
+        code = result.exited
+
+        out_i = 0
+        err_i = 0
+        has_next = True
+        while has_next:
+            has_next = out_i < len(raw_stdouts) and err_i < len(raw_stderrs)
+            if has_next:
+                stdout = raw_stdouts[out_i]
+                stderr = raw_stderrs[err_i]
+                if result_i > 0:
+                    # cut LF from the previous "echo <separator>" command
+                    stdout = stdout[1:]
+                    stderr = stderr[1:]
+
+                has_next = out_i + 1 < len(raw_stdouts)
+                if has_next:
+                    matcher = EXIT_CODE_PATTERN.match(raw_stdouts[out_i + 1])
+                    if matcher is not None:
+                        code = int(matcher.group(1))
+                    else:
+                        has_next = False
+
+                has_next = has_next and err_i + 1 < len(raw_stderrs)
+
+            action, _, _ = payloads[result_i]
             command: str = action[1][0]
-            results.append(RunnersResult(
-                    [command], [code], stdouts[i], stderrs[i], hide=kwargs.get('hide', False)))
+            results.append(RunnersResult([command], [code], stdout, stderr, hide=hide))
+
+            stdout = stderr = ''
+            code = result.exited
+            result_i += 1
+
+            err_i += 1
+            out_i += 2
 
         return results
 
@@ -357,9 +389,9 @@ class RawExecutor:
                     batch[host] = actions[i]
             if not batch:
                 break
-            else:
-                i += 1
-                batches.append(batch)
+
+            i += 1
+            batches.append(batch)
 
         return batches
 
@@ -456,9 +488,8 @@ class RawExecutor:
             args = (local_stream, remote_file)
 
         if do_type in ('run', 'sudo'):
-            # Do not add 'timeout=self.timeout'.
-            # Though it is possible in case of only one command in the batch, it is unsafe in case of few commands.
-            # If few commands failed with timeout, we currently do not have safe algorithm to reparse the results.
+            if kwargs.get('timeout', None) is None:
+                kwargs = {**kwargs, 'timeout': static.GLOBALS['nodes']['command_execution']['timeout']}
 
             commands: List[str] = [action[1][0] for action, _, _ in payloads]
             self.logger.verbose('Executing %s %s on host %s with options: %s' % (do_type, commands, host, kwargs))
@@ -500,10 +531,17 @@ class RawExecutor:
         for host, payloads in batch.items():
             cxn = self.connection_pool.get_connection(host)
             do_type, args, kwargs = self._prepare_merged_action(host, payloads)
+            # pylint: disable-next=cell-var-from-loop
             safe_exec(futures, host, lambda: tpe.submit(getattr(cxn, do_type), *args, **kwargs))
 
         for host, future in futures.items():
-            safe_exec(results, host, lambda: future.result(timeout=self.timeout))
+            # We try to shut down ThreadPoolExecutor gracefully with joining of all the threads.
+            # This makes usage of future timeout useless, as the operation is not stopped.
+            # Instead, we always pass timeout for run/sudo and so have CommandTimedOut.
+            # For put/get fabric & paramiko do not offer timeout, so transfer cannot be stopped currently.
+
+            # pylint: disable-next=cell-var-from-loop
+            safe_exec(results, host, lambda: future.result(timeout=None))
 
         self._flush_logger_writers(batch)
 
@@ -570,14 +608,11 @@ class RawExecutor:
             return self._wait_for_boot_with_executor(left_nodes, TPE, timeout, initial_boot_history)
 
     def _wait_for_boot_with_executor(self, left_nodes: List[str], tpe: ThreadPoolExecutor,
-                                     timeout: int = None,
+                                     overridden_timeout: int = None,
                                      initial_boot_history: Mapping[str, RunnersResult] = None) -> HostToResult:
 
-        boot_config = self._get_boot_config()
-        if timeout is None:
-            timeout = boot_config['timeout']
-
-        delay_period = boot_config['defaults']['delay_period']
+        timeout = self._resolve_boot_timeout(left_nodes, overridden_timeout)
+        delay_period = static.GLOBALS['nodes']['boot']['defaults']['delay_period']
 
         if initial_boot_history is None:
             initial_boot_history = {}
@@ -604,6 +639,8 @@ class RawExecutor:
                               and result == initial_boot_history.get(host))]
 
             waited = (datetime.now() - time_start).total_seconds()
+            if left_nodes:
+                timeout = self._resolve_boot_timeout(left_nodes, overridden_timeout)
 
             if not left_nodes or waited >= timeout:
                 break
@@ -611,7 +648,7 @@ class RawExecutor:
             for host, exc in results.items():
                 if isinstance(exc, Exception) and not self._is_allowed_connection_exception(str(exc)):
                     self.logger.verbose("Unexpected exception at %s, node is considered as not booted: %s"
-                                             % (host, str(exc)))
+                                        % (host, str(exc)))
 
             self.logger.verbose("Nodes %s are not ready yet, remaining time to wait %i"
                                 % (left_nodes, timeout - waited))
@@ -627,10 +664,15 @@ class RawExecutor:
 
         return results
 
-    def _get_boot_config(self) -> dict:
-        boot_config = dict(self.inventory['globals']['nodes']['boot'])
-        boot_config.update(static.GLOBALS['nodes']['boot'])
-        return boot_config
+    def _resolve_boot_timeout(self, hosts: List[str], overridden_timeout: Optional[int]) -> int:
+        if overridden_timeout is not None:
+            return overridden_timeout
+
+        return max(self._get_node_boot_timeout(host) for host in hosts)
+
+    def _get_node_boot_timeout(self, host: str) -> int:
+        timeout: int = self.connection_pool.get_node(host)['boot']['timeout']
+        return timeout
 
     def _do_nopasswd(self, left_nodes: List[str], tpe: ThreadPoolExecutor, command: str) -> HostToResult:
         prompt = '[sudo] password: '
@@ -694,4 +736,3 @@ class RawExecutor:
             self.logger.verbose('Disconnected session with %s' % host)
             cxn = self.connection_pool.get_connection(host)
             cxn.close()
-            cxn._sftp = None

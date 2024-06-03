@@ -11,8 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import difflib
 import hashlib
 import io
+import ipaddress
 import json
 import os
 import re
@@ -20,38 +22,26 @@ import shutil
 import sys
 import time
 import tarfile
+import uuid
+from collections import OrderedDict
+from copy import deepcopy
+from datetime import datetime
 
-from typing import Tuple, Callable, List, TextIO, cast, Union, TypeVar, Dict, Sequence
+from typing import Tuple, Callable, List, TextIO, cast, Union, Dict, Sequence, Optional, NoReturn
 
 import deepdiff  # type: ignore[import-untyped]
 import yaml
 import ruamel.yaml
-from copy import deepcopy
-from datetime import datetime
-from collections import OrderedDict
 
 from pathvalidate import sanitize_filepath
 from ruamel.yaml import CommentedMap
-from typing_extensions import Protocol
+from useful_types import SupportsAllComparisons
 
 from kubemarine.core import log
 from kubemarine.core.errors import pretty_print_error
 
 
-_T_contra = TypeVar("_T_contra", contravariant=True)
-
-
-class SupportsAllComparisons(Protocol[_T_contra]):
-    def __lt__(self, __other: _T_contra) -> bool: ...
-
-    def __gt__(self, __other: _T_contra) -> bool: ...
-
-    def __le__(self, __other: _T_contra) -> bool: ...
-
-    def __ge__(self, __other: _T_contra) -> bool: ...
-
-
-def do_fail(message: str = '', reason: Exception = None, hint: str = '', logger: log.EnhancedLogger = None) -> None:
+def do_fail(message: str = '', reason: Exception = None, hint: str = '', logger: log.EnhancedLogger = None) -> NoReturn:
 
     if not logger:
         sys.stderr.write("\033[91m")
@@ -77,18 +67,23 @@ def get_elapsed_string(start: float, end: float) -> str:
     return '{:02}h {:02}m {:02}s'.format(int(hours), int(minutes), int(seconds))
 
 
-def prepare_dump_directory(location: str, reset_directory: bool = True) -> None:
+def prepare_dump_directory(context: dict) -> None:
+    args: dict = context['execution_arguments']
+    location = args['dump_location']
+    reset_directory = not args['disable_dump_cleanup']
     dumpdir = os.path.join(location, 'dump')
     if reset_directory and os.path.exists(dumpdir) and os.path.isdir(dumpdir):
         shutil.rmtree(dumpdir)
-    os.makedirs(dumpdir, exist_ok=True)
+
+    if not args['disable_dump']:
+        os.makedirs(dumpdir, exist_ok=True)
 
 
 def make_ansible_inventory(location: str, c: object) -> None:
-    from kubemarine.core.cluster import KubernetesCluster
+    from kubemarine.core.cluster import KubernetesCluster  # pylint: disable=cyclic-import
     cluster = cast(KubernetesCluster, c)
 
-    inventory = get_final_inventory(cluster)
+    inventory = cluster.inventory
     roles = []
     for node in inventory['nodes']:
         for role in node['roles']:
@@ -107,7 +102,7 @@ def make_ansible_inventory(location: str, c: object) -> None:
     for role in roles:
         config[role] = []
         config['cluster:children'].append(role)
-        for node in cluster.nodes[role].get_final_nodes().get_ordered_members_configs_list():
+        for node in cluster.nodes[role].get_ordered_members_configs_list():
             record = "%s ansible_host=%s ansible_ssh_user=%s ansible_ssh_pass=%s ansible_ssh_private_key_file=%s ip=%s" % \
                      (node['name'],
                       node['connect_to'],
@@ -130,33 +125,31 @@ def make_ansible_inventory(location: str, c: object) -> None:
     ]
 
     for group in ['services', 'plugins']:
-        if inventory.get(group) is not None:
-            for service_name, service_configs in inventory[group].items():
-                # write to inventory only plugins, which will be installed
-                if group != 'plugins' or service_configs.get('install', False):
+        for service_name, service_configs in inventory.get(group, {}).items():
+            # write to inventory only plugins, which will be installed
+            if group == 'plugins' and not service_configs.get('install', False):
+                continue
 
-                    config['cluster:vars'].append('\n# %s.%s' % (group, service_name))
+            config['cluster:vars'].append('\n# %s.%s' % (group, service_name))
 
-                    if isinstance(service_configs, dict):
+            if isinstance(service_configs, dict):
 
-                        if service_configs.get('installation') is not None:
-                            del service_configs['installation']
-                        if service_configs.get('install') is not None:
-                            del service_configs['install']
+                for config_name, config_value in service_configs.items():
+                    if config_name in ('installation', 'install'):
+                        continue
 
-                        for config_name, config_value in service_configs.items():
-                            if isinstance(config_value, dict) or isinstance(config_value, list):
-                                config_value = json.dumps(config_value)
-                            config['cluster:vars'].append('%s_%s=%s' % (
-                                # TODO: Rewrite replace using regex
-                                service_name.replace('-', '_').replace('.', '_').replace('/', '_'),
-                                config_name.replace('-', '_').replace('.', '_').replace('/', '_'),
-                                config_value))
-                    else:
-                        config_value = json.dumps(service_configs)
-                        config['cluster:vars'].append('%s=%s' % (
-                            service_name.replace('-', '_').replace('.', '_'),
-                            config_value))
+                    if isinstance(config_value, (dict, list)):
+                        config_value = json.dumps(config_value)
+                    config['cluster:vars'].append('%s_%s=%s' % (
+                        # TODO: Rewrite replace using regex
+                        service_name.replace('-', '_').replace('.', '_').replace('/', '_'),
+                        config_name.replace('-', '_').replace('.', '_').replace('/', '_'),
+                        config_value))
+            else:
+                config_value = json.dumps(service_configs)
+                config['cluster:vars'].append('%s=%s' % (
+                    service_name.replace('-', '_').replace('.', '_'),
+                    config_value))
 
     config_compiled = ''
     for section_name, strings in config.items():
@@ -169,46 +162,7 @@ def make_ansible_inventory(location: str, c: object) -> None:
 
 
 def get_current_timestamp_formatted() -> str:
-    return datetime.now().strftime("%Y%m%d-%H%M%S")
-
-
-def get_final_inventory(c: object, initial_inventory: dict = None) -> dict:
-    from kubemarine.core.cluster import KubernetesCluster
-    cluster = cast(KubernetesCluster, c)
-
-    if initial_inventory is None:
-        inventory = deepcopy(cluster.inventory)
-    else:
-        inventory = deepcopy(initial_inventory)
-
-    from kubemarine import admission, cri, kubernetes, packages, plugins, thirdparties
-    from kubemarine.core import defaults
-    from kubemarine.cri import containerd
-    from kubemarine.plugins import nginx_ingress
-    from kubemarine.procedures import add_node, remove_node
-
-    inventory_finalize_functions = [
-        add_node.add_node_finalize_inventory,
-        lambda cluster, inventory: defaults.calculate_node_names(inventory, cluster),
-        remove_node.remove_node_finalize_inventory,
-        kubernetes.restore_finalize_inventory,
-        kubernetes.upgrade_finalize_inventory,
-        thirdparties.restore_finalize_inventory,
-        thirdparties.upgrade_finalize_inventory,
-        thirdparties.migrate_cri_finalize_inventory,
-        plugins.upgrade_finalize_inventory,
-        packages.upgrade_finalize_inventory,
-        packages.migrate_cri_finalize_inventory,
-        admission.finalize_inventory,
-        nginx_ingress.finalize_inventory,
-        containerd.migrate_cri_finalize_inventory,
-        cri.upgrade_finalize_inventory,
-    ]
-
-    for finalize_fn in inventory_finalize_functions:
-        inventory = finalize_fn(cluster, inventory)
-
-    return inventory
+    return datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
 
 
 def merge_vrrp_ips(procedure_inventory: dict, inventory: dict) -> None:
@@ -226,21 +180,29 @@ def merge_vrrp_ips(procedure_inventory: dict, inventory: dict) -> None:
         inventory.move_to_end("vrrp_ips", last=False)
 
 
+def is_dump_allowed(context: dict, filename: str) -> bool:
+    args = context['execution_arguments']
+    if args['disable_dump'] \
+            and not (filename in ClusterStorage.PRESERVED_DUMP_FILES
+                     and context['preserve_inventory']
+                     and not args.get('without_act', False)):
+        return False
+
+    return True
+
+
 def dump_file(context: Union[dict, object], data: Union[TextIO, str], filename: str,
-              *, dump_location: bool = True, create_subdir: bool = False) -> None:
+              *, dump_location: bool = True) -> None:
     if dump_location:
         if not isinstance(context, dict):
             # cluster is passed instead of the context directly
-            from kubemarine.core.cluster import KubernetesCluster
+            from kubemarine.core.cluster import KubernetesCluster  # pylint: disable=cyclic-import
             cluster = cast(KubernetesCluster, context)
             context = cluster.context
 
-        args = context['execution_arguments']
-        if args['disable_dump'] \
-                and not (filename in ClusterStorage.PRESERVED_DUMP_FILES and context['preserve_inventory']):
+        if not is_dump_allowed(context, filename):
             return
 
-        prepare_dump_directory(args['dump_location'], reset_directory=False)
         target_path = get_dump_filepath(context, filename)
     else:
         target_path = get_external_resource_path(filename)
@@ -248,8 +210,7 @@ def dump_file(context: Union[dict, object], data: Union[TextIO, str], filename: 
     # but they can appear in target path. They will be replaced with '_'
     target_path = sanitize_filepath(target_path, replacement_text='_')
 
-    if create_subdir:
-        os.makedirs(os.path.dirname(target_path), exist_ok=True)
+    os.makedirs(os.path.dirname(target_path), exist_ok=True)
 
     if isinstance(data, io.StringIO):
         text = data.getvalue()
@@ -262,33 +223,26 @@ def dump_file(context: Union[dict, object], data: Union[TextIO, str], filename: 
         file.write(text)
 
 
+def get_dump_directory(context: dict) -> str:
+    parts = [context['execution_arguments']['dump_location'], 'dump']
+    if 'dump_subdir' in context:
+        parts.append(context['dump_subdir'])
+
+    dump_directory: str = os.path.join(*parts)
+    return dump_directory
+
+
 def get_dump_filepath(context: dict, filename: str) -> str:
-    if context.get("dump_filename_prefix"):
-        filename = f"{context['dump_filename_prefix']}_{filename}"
-
-    return get_external_resource_path(os.path.join(context['execution_arguments']['dump_location'], 'dump', filename))
+    return get_external_resource_path(os.path.join(get_dump_directory(context), filename))
 
 
-def wait_command_successful(g: object, command: str,
-                            retries: int = 15, timeout: int = 5,
-                            warn: bool = True, hide: bool = False) -> None:
-    from kubemarine.core.group import NodeGroup
-    group = cast(NodeGroup, g)
-
-    log = group.cluster.log
-
+def wait_command_successful(logger: log.EnhancedLogger, attempt: Callable[[], bool],
+                            retries: int, timeout: int) -> None:
     while retries > 0:
-        log.debug("Waiting for command to succeed, %s retries left" % retries)
-        result = group.sudo(command, warn=warn, hide=hide)
-        if hide:
-            log.verbose(result)
-            for host in result.get_failed_hosts_list():
-                stderr = result[host].stderr.rstrip('\n')
-                if stderr:
-                    log.debug(f"{host}: {stderr}")
-
-        if not result.is_any_failed():
-            log.debug("Command succeeded")
+        logger.debug("Waiting for command to succeed, %s retries left" % retries)
+        result = attempt()
+        if result:
+            logger.debug("Command succeeded")
             return
         retries = retries - 1
         time.sleep(timeout)
@@ -381,11 +335,55 @@ def get_local_file_sha1(filename: str) -> str:
     return sha1.hexdigest()
 
 
+def get_remote_tmp_path(filename: str = None, ext: str = None) -> str:
+    if filename is None:
+        filename = uuid.uuid4().hex
+
+    if ext is not None:
+        filename += '.' + ext
+
+    return "/tmp/" + filename
+
+
 def yaml_structure_preserver() -> ruamel.yaml.YAML:
     """YAML loader and dumper which saves original structure"""
     ruamel_yaml = ruamel.yaml.YAML()
     ruamel_yaml.preserve_quotes = True
     return ruamel_yaml
+
+
+def deepcopy_yaml(data: dict) -> dict:
+    if isinstance(data, CommentedMap):
+        ruamel_yaml = yaml_structure_preserver()
+        # Dump and parse yaml object to work around ruamel.yaml bug
+        # https://sourceforge.net/p/ruamel-yaml/tickets/410/
+        buf = io.StringIO()
+        ruamel_yaml.dump(data, buf)
+        data = ruamel_yaml.load(buf.getvalue())
+        return data
+
+    return deepcopy(data)
+
+
+def subdict_yaml(data: dict, keys: Sequence[str]) -> dict:
+    items = (item for item in data.items() if item[0] in keys)
+    if isinstance(data, CommentedMap):
+        return CommentedMap(items)
+    else:
+        return dict(items)
+
+
+def convert_native_yaml(data: dict) -> dict:
+    if isinstance(data, CommentedMap):
+        buf = io.StringIO()
+        yaml_structure_preserver().dump(data, buf)
+        data = yaml.safe_load(io.StringIO(buf.getvalue()))
+
+    return data
+
+
+def identity(x: str) -> str:
+    return x
 
 
 def is_sorted(l: Sequence[str], key: Callable[[str], SupportsAllComparisons] = None) -> bool:
@@ -397,7 +395,7 @@ def is_sorted(l: Sequence[str], key: Callable[[str], SupportsAllComparisons] = N
     :return: boolean flag if the list is sorted
     """
     if key is None:
-        key = lambda x: x
+        key = identity
     return all(key(l[i]) <= key(l[i + 1]) for i in range(len(l) - 1))
 
 
@@ -412,7 +410,7 @@ def map_sorted(map_: CommentedMap, key: Callable[[str], SupportsAllComparisons] 
     if key is not None:
         _key = key
     else:
-        _key = lambda x: x
+        _key = identity
     map_keys: List[str] = list(map_)
     if not is_sorted(map_keys, key=_key):
         map_ = CommentedMap(sorted(map_.items(), key=lambda item: _key(item[0])))
@@ -435,7 +433,7 @@ def insert_map_sorted(map_: CommentedMap, k: str, v: object, key: Callable[[str]
         return
 
     if key is None:
-        key = lambda x: x
+        key = identity
     # Find position to insert new item maintaining the order
     pos = max((mi + 1 for mi, mv in enumerate(map_)
                if key(mv) < key(k)),
@@ -451,28 +449,66 @@ def load_yaml(filepath: str) -> dict:
             return data
     except yaml.YAMLError as exc:
         do_fail(f"Failed to load {filepath}", exc)
-        return {}  # unreachable
 
 
-def true_or_false(value: Union[str, bool]) -> str:
+def pretty_path(path: Sequence[Union[str, int]]) -> str:
+    if not path:
+        return ""
+    return f"[{']['.join(map(repr, path))}]"
+
+
+def strtobool(value: Union[str, bool]) -> bool:
     """
     The method check string and boolean value
     :param value: Value that should be checked
     """
-    input_string = str(value)
-    if input_string in ['true', 'True', 'TRUE']:
-        result = "true"
-    elif input_string in ['false', 'False', 'FALSE']:
-        result = "false"
+    val = str(value).lower()
+    if val in ('y', 'yes', 't', 'true', 'on', '1'):
+        return True
+    elif val in ('n', 'no', 'f', 'false', 'off', '0'):
+        return False
     else:
-        result = "undefined"
-    return result
+        raise ValueError(f"invalid truth value {value!r}")
+
+
+def strtoint(value: Union[str, int]) -> int:
+    if isinstance(value, int):
+        return value
+
+    try:
+        # whitespace required because python's int() ignores them
+        return int(value.replace(' ', '.'))
+    except ValueError:
+        raise ValueError(f"invalid integer value {value!r}") from None
 
 
 def print_diff(logger: log.EnhancedLogger, diff: deepdiff.DeepDiff) -> None:
     # Extra transformation to JSON is necessary,
     # because DeepDiff.to_dict() returns custom nested classes that cannot be serialized to yaml by default.
     logger.debug(yaml.safe_dump(yaml.safe_load(diff.to_json())))
+
+
+def get_unified_diff(old: str, new: str, fromfile: str = '', tofile: str = '') -> Optional[str]:
+    diff = list(difflib.unified_diff(
+        old.splitlines(), new.splitlines(),
+        fromfile=fromfile, tofile=tofile,
+        lineterm=''))
+
+    if diff:
+        return '\n'.join(diff)
+
+    return None
+
+
+def get_yaml_diff(old: str, new: str, fromfile: str = '', tofile: str = '') -> Optional[str]:
+    if yaml.safe_load(old) == yaml.safe_load(new):
+        return None
+
+    return get_unified_diff(old, new, fromfile, tofile)
+
+
+def isipv(address: str, versions: List[int]) -> bool:
+    return ipaddress.ip_network(address).version in versions
 
 
 def get_version_filepath() -> str:
@@ -488,6 +524,13 @@ def minor_version(version: str) -> str:
     Converts vN.N.N to vN.N
     """
     return 'v' + '.'.join(map(str, _test_version(version, 3)[0:2]))
+
+
+def major_version(version: str) -> str:
+    """
+    Converts vN.N.N to vN
+    """
+    return 'v' + '.'.join(map(str, _test_version(version, 3)[0:1]))
 
 
 def version_key(version: str) -> Tuple[int, int, int]:
@@ -508,21 +551,28 @@ def minor_version_key(version: str) -> Tuple[int, int]:
 
 def _test_version(version: str, numbers_amount: int) -> List[int]:
     # catch version without "v" at the first symbol
+    is_rc = 0
     if version.startswith('v'):
         version_list: list = version[1:].split('.')
-        # catch invalid version 'v1.16'
-        if len(version_list) == numbers_amount:
-            # parse str to int and catch invalid symbols in version number
-            try:
-                for i, value in enumerate(version_list):
-                    # whitespace required because python's int() ignores them
-                    version_list[i] = int(value.replace(' ', '.'))
-            except ValueError:
-                pass
-            else:
-                return version_list
+        # catch version with unexpected number or parts
+        parts_num = len(version_list)
+        try:
+            for i, value in enumerate(version_list):
+                # catch release candidate version like v1.29.0-rc.1
+                if parts_num == 4 and i == 2 and value.endswith('-rc'):
+                    value = value[:-3]
+                    is_rc = 1
+                # whitespace required because python's int() ignores them
+                version_list[i] = int(value.replace(' ', '.'))
+        except ValueError:
+            pass
+        else:
+            if numbers_amount == parts_num - is_rc:
+                return version_list[:numbers_amount]
 
     expected_pattern = 'v' + '.'.join('N+' for _ in range(numbers_amount))
+    if numbers_amount == 3:
+        expected_pattern += '[-rc.N+]'
     raise ValueError(f'Incorrect version \"{version}\" format, expected version pattern is \"{expected_pattern}\"')
 
 
@@ -578,43 +628,54 @@ class ClusterStorage:
     4- Copying dumps to new nodes
     """
 
-    PRESERVED_DUMP_FILES = ['procedure.yaml', 'procedure_parameters', 'cluster_precompiled.yaml',
-                            'cluster.yaml','cluster_initial.yaml', 'cluster_finalized.yaml']
+    PRESERVED_DUMP_FILES = ['procedure.yaml', 'procedure_parameters',
+                            'cluster.yaml', 'cluster_initial.yaml', 'cluster_finalized.yaml']
 
-    def __init__(self, cluster: object):
-        from kubemarine.core.cluster import KubernetesCluster
+    def __init__(self, cluster: object, context: dict):
+        from kubemarine.core.cluster import KubernetesCluster  # pylint: disable=cyclic-import
         self.cluster = cast(KubernetesCluster, cluster)
+        self.context = context
         self.dir_path = "/etc/kubemarine/procedures/"
-        self.dir_name = ''
         self.dir_location = ''
+        self.local_archive_path = ''
 
     def make_dir(self) -> None:
         """
         This method creates a directory in which logs about operations on the cluster will be stored.
         """
         readable_timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        initial_procedure = self.cluster.context["initial_procedure"]
-        self.dir_name = readable_timestamp + "_" + initial_procedure + "/"
-        self.dir_location = self.dir_path + self.dir_name
-        self.cluster.nodes['control-plane'].get_final_nodes().sudo(f"mkdir -p {self.dir_location} ; sudo rm {self.dir_path + 'latest_dump'} ;"
+        initial_procedure = self.context["initial_procedure"]
+        dir_name = readable_timestamp + "_" + initial_procedure + "/"
+        self.dir_location = self.dir_path + dir_name
+        self.cluster.nodes['control-plane'].sudo(f"mkdir -p {self.dir_location} ; sudo rm {self.dir_path + 'latest_dump'} ;"
                                                  f" sudo ln -s {self.dir_location} {self.dir_path + 'latest_dump'}")
 
-    def rotation_file(self) -> None:
+    def upload_and_rotate(self) -> None:
         """
-        This method packs files with logs and maintains a structured storage of logs on the cluster.
+        This method uploads and unpacks the archive,
+        then packs files with logs and maintains a structured storage of logs on the cluster.
         """
+        control_planes = self.cluster.nodes["control-plane"]
+
+        self.cluster.log.debug('Uploading archive with preserved information about the procedure.')
+        remote_archive = self.dir_location + "local.tar.gz"
+        control_planes.put(self.local_archive_path, remote_archive, sudo=True)
+        control_planes.sudo(
+            f'tar -C {self.dir_location} -xzv --no-same-owner -f {remote_archive}  && '
+            f'sudo rm -f {remote_archive} ')
+
         not_pack_file = self.cluster.inventory['procedure_history']['archive_threshold']
         delete_old = self.cluster.inventory['procedure_history']['delete_threshold']
 
         command = f'ls {self.dir_path} | grep -v latest_dump'
-        node_group_results = self.cluster.nodes["control-plane"].get_final_nodes().sudo(command)
-        with node_group_results.get_group().new_executor() as exe:
+        node_group_results = control_planes.sudo(command)
+        with control_planes.new_executor() as exe:
             for control_plane in exe.group.get_ordered_members_list():
                 result = node_group_results[control_plane.get_host()]
                 files = result.stdout.split()
                 files.sort(reverse=True)
                 for i, file in enumerate(files):
-                    if i >= not_pack_file and i < delete_old:
+                    if not_pack_file <= i < delete_old:
                         if 'tar.gz' not in file:
                             control_plane.sudo(
                                 f'tar -czvf {self.dir_path + file + ".tar.gz"} {self.dir_path + file} &&'
@@ -622,31 +683,30 @@ class ClusterStorage:
                     elif i >= delete_old:
                         control_plane.sudo(f'rm -rf {self.dir_path + file}')
 
-    def compress_and_upload_archive(self) -> None:
+    def compress_archive(self, enriched: bool) -> None:
         """
-        This method compose dump files and sends the collected files to the nodes.
+        This method compose dump files in the local archive.
         """
-        context = self.cluster.context
-        archive = get_dump_filepath(context, "local.tar.gz")
-        with tarfile.open(archive, "w:gz") as tar:
-            for name in ClusterStorage.PRESERVED_DUMP_FILES:
+        context = self.context
+        self.local_archive_path = get_dump_filepath(context, "local.tar.gz")
+        with tarfile.open(self.local_archive_path, "w:gz") as tar:
+            dump_files = set(ClusterStorage.PRESERVED_DUMP_FILES)
+            if not enriched:
+                dump_files -= {'cluster.yaml', 'cluster_finalized.yaml'}
+
+            for name in dump_files:
                 source = get_dump_filepath(context, name)
                 if os.path.exists(source):
                     tar.add(source, 'dump/' + name)
             tar.add(context['execution_arguments']['config'], 'cluster.yaml')
             tar.add(get_version_filepath(), 'version')
 
-        self.cluster.log.debug('Uploading archive with preserved information about the procedure.')
-        self.cluster.nodes['control-plane'].get_final_nodes().put(archive, self.dir_location + 'local.tar.gz', sudo=True)
-        self.cluster.nodes['control-plane'].get_final_nodes().sudo(f'tar -C {self.dir_location} -xzv --no-same-owner -f {self.dir_location + "local.tar.gz"}  && '
-                                                 f'sudo rm -f {self.dir_location + "local.tar.gz"} ')
-
     def collect_procedure_info(self) -> None:
         """
         This method collects information about the type of procedure and the version of the tool we are working with.
         """
-        context = self.cluster.context
-        out = dict()
+        context = self.context
+        out = {}
         out['arguments'] = context['initial_cli_arguments']
         if 'proceeded_tasks' in context:
             out['finished_tasks'] = context['proceeded_tasks']
@@ -660,16 +720,16 @@ class ClusterStorage:
         """
         This method is used to transfer backup logs from the initial control-plane to the new control-planes.
         """
-        new_control_planes = self.cluster.nodes['control-plane'].get_new_nodes()
+        new_control_planes = self.cluster.get_new_nodes().having_roles(['control-plane'])
         if new_control_planes.is_empty():
             return
 
         archive_name = 'dump_log_cluster.tar.gz'
-        archive_dump_path = get_dump_filepath(self.cluster.context, archive_name)
+        archive_dump_path = get_dump_filepath(self.context, archive_name)
         archive_remote_path = f"/tmp/{archive_name}"
         log = self.cluster.log
 
-        control_plane = self.cluster.nodes['control-plane'].get_initial_nodes().get_first_member()
+        control_plane = self.cluster.previous_nodes['control-plane'].get_first_member()
         data_copy_res = control_plane.sudo(f'tar -czvf {archive_remote_path} {self.dir_path}')
         log.verbose("Archive with procedures history is created:\n%s" % data_copy_res)
         control_plane.get(archive_remote_path, archive_dump_path)

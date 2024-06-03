@@ -14,9 +14,8 @@
 
 import io
 import re
-from typing import Tuple, Optional, Dict, List
+from typing import Tuple, Dict, List
 
-from kubemarine import system
 from kubemarine.core import utils, log
 from kubemarine.core.group import NodeGroup, RunnersGroupResult
 
@@ -175,26 +174,28 @@ def is_config_valid(group: NodeGroup, state: str = None, policy: str = None, per
     return valid, result, parsed_result
 
 
-def setup_selinux(group: NodeGroup) -> Optional[RunnersGroupResult]:
+def setup_selinux(group: NodeGroup) -> bool:
     log = group.cluster.log
 
     # this method handles cluster with multiple os, suppressing should be enabled
     if group.get_nodes_os() not in ['rhel', 'rhel8', 'rhel9']:
         log.debug("Skipped - selinux is not supported on Ubuntu/Debian os family")
-        return None
+        return False
 
     expected_state = get_expected_state(group.cluster.inventory)
     expected_policy = get_expected_policy(group.cluster.inventory)
     expected_permissive = get_expected_permissive(group.cluster.inventory)
 
-    valid, result, parsed_result = is_config_valid(group,
-                                                   state=expected_state,
-                                                   policy=expected_policy,
-                                                   permissive=expected_permissive)
+    valid, result, _ = \
+        is_config_valid(group,
+                        state=expected_state,
+                        policy=expected_policy,
+                        permissive=expected_permissive)
 
     if valid:
         log.debug("Skipped - selinux already correctly configured")
-        return result
+        log.debug(result)
+        return False
 
     config = io.StringIO('SELINUX=%s\nSELINUXTYPE=%s\n' % (expected_state, expected_policy))
 
@@ -211,6 +212,4 @@ def setup_selinux(group: NodeGroup) -> Optional[RunnersGroupResult]:
 
     group.sudo(semanage_commands)
 
-    group.cluster.schedule_cumulative_point(system.reboot_nodes)
-    group.cluster.schedule_cumulative_point(system.verify_system)
-    return None
+    return True

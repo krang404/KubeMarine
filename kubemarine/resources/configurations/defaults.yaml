@@ -16,12 +16,12 @@ globals:
     ready:
       timeout: 5
       retries: 15
-    boot:
-     timeout: 600
   timeout_download:
     60
 
-node_defaults: {}
+node_defaults:
+  boot:
+    timeout: 600
 
 nodes: []
 
@@ -37,13 +37,17 @@ services:
     podPidsLimit: 4096
     cgroupDriver: systemd
     serializeImagePulls: false
+    tlsCipherSuites: [TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,TLS_RSA_WITH_AES_256_GCM_SHA384,TLS_RSA_WITH_AES_128_GCM_SHA256]
+  kubeadm_kube-proxy:
+    apiVersion: kubeproxy.config.k8s.io/v1alpha1
+    kind: KubeProxyConfiguration
+    conntrack: {}
   kubeadm_flags:
     ignorePreflightErrors: Port-6443,CoreDNSUnsupportedPlugins
   kubeadm:
-    # for patches functionality we need v1beta3 which is available since k8s v1.22 only
     apiVersion: 'kubeadm.k8s.io/v1beta3'
     kind: ClusterConfiguration
-    kubernetesVersion: v1.26.7
+    kubernetesVersion: v1.26.11
     controlPlaneEndpoint: '{{ cluster_name }}:6443'
     imageRepository: registry.k8s.io
     dns: {}
@@ -53,6 +57,7 @@ services:
     apiServer:
       certSANs: []
       extraArgs:
+        tls-cipher-suites: TLS_AES_128_GCM_SHA256,TLS_AES_256_GCM_SHA384,TLS_CHACHA20_POLY1305_SHA256,TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA,TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,TLS_RSA_WITH_3DES_EDE_CBC_SHA,TLS_RSA_WITH_AES_128_CBC_SHA,TLS_RSA_WITH_AES_128_GCM_SHA256,TLS_RSA_WITH_AES_256_CBC_SHA,TLS_RSA_WITH_AES_256_GCM_SHA384
         enable-admission-plugins: NodeRestriction
         profiling: "false"
         audit-log-path: /var/log/kubernetes/audit/audit.log
@@ -74,10 +79,15 @@ services:
     scheduler:
       extraArgs:
         profiling: "false"
+      extraVolumes: []
     controllerManager:
       extraArgs:
         profiling: "false"
         terminated-pod-gc-threshold: "1000"
+      extraVolumes: []
+    etcd:
+      local:
+        extraArgs: {}
   kubeadm_patches:
     # bind-address flag for apiServer is set in the code
     apiServer: []
@@ -117,7 +127,6 @@ services:
       group: control-plane
     /usr/bin/calicoctl:
       group: control-plane
-    # "crictl" is installed by default ONLY if "containerRuntime != docker", otherwise it is removed programmatically
     /usr/bin/crictl.tar.gz:
       unpack: /usr/bin/
 
@@ -130,59 +139,87 @@ services:
         runtime_type: "io.containerd.runc.v2"
       plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options:
         SystemdCgroup: '{% if services.kubeadm_kubelet.cgroupDriver == "systemd" %}true{% else %}false{% endif %}'
-    dockerConfig:
-      ipv6: False
-      log-driver: json-file
-      log-opts:
-        max-size: 64m
-        max-file: "3"
-      exec-opts:
-        - native.cgroupdriver=systemd
-      icc: False
-      live-restore: True
-      userland-proxy: False
 
   modprobe:
     rhel:
-      - br_netfilter
-      - '{% if not nodes[0]["internal_address"]|isipv4 %}ip6table_filter{% endif %}'
-      - '{% if not nodes[0]["internal_address"]|isipv4 %}nf_conntrack_ipv6{% endif %}'
-      - '{% if not nodes[0]["internal_address"]|isipv4 %}nf_nat_masquerade_ipv6{% endif %}'
-      - '{% if not nodes[0]["internal_address"]|isipv4 %}nf_reject_ipv6{% endif %}'
-      - '{% if not nodes[0]["internal_address"]|isipv4 %}nf_defrag_ipv6{% endif %}'
-    rhel8:
-      - br_netfilter
-      - '{% if not nodes[0]["internal_address"]|isipv4 %}ip6table_filter{% endif %}'
-      - '{% if not nodes[0]["internal_address"]|isipv4 %}nf_conntrack{% endif %}'
-      - '{% if not nodes[0]["internal_address"]|isipv4 %}nf_nat{% endif %}'
-      - '{% if not nodes[0]["internal_address"]|isipv4 %}nf_reject_ipv6{% endif %}'
-      - '{% if not nodes[0]["internal_address"]|isipv4 %}nf_defrag_ipv6{% endif %}'
-    rhel9:
-      - br_netfilter
-      - '{% if not nodes[0]["internal_address"]|isipv4 %}ip6table_filter{% endif %}'
-      - '{% if not nodes[0]["internal_address"]|isipv4 %}nf_conntrack{% endif %}'
-      - '{% if not nodes[0]["internal_address"]|isipv4 %}nf_nat{% endif %}'
-      - '{% if not nodes[0]["internal_address"]|isipv4 %}nf_reject_ipv6{% endif %}'
-      - '{% if not nodes[0]["internal_address"]|isipv4 %}nf_defrag_ipv6{% endif %}'
-    debian:
-      - br_netfilter
-      - '{% if not nodes[0]["internal_address"]|isipv4 %}ip6table_filter{% endif %}'
-      - '{% if not nodes[0]["internal_address"]|isipv4 %}nf_conntrack{% endif %}'
-      - '{% if not nodes[0]["internal_address"]|isipv4 %}nf_nat{% endif %}'
-      - '{% if not nodes[0]["internal_address"]|isipv4 %}nf_reject_ipv6{% endif %}'
-      - '{% if not nodes[0]["internal_address"]|isipv4 %}nf_defrag_ipv6{% endif %}'
+      - modulename: br_netfilter
+        groups: [control-plane, worker]
+      - modulename: nf_conntrack
+        groups: [control-plane, worker]
+        install: '{{ nodes[0]["internal_address"] | isipv4 }}'
+      - modulename: nf_conntrack_ipv6
+        install: '{{ nodes[0]["internal_address"] | isipv6 }}'
+      - modulename: ip6table_filter
+        install: '{{ nodes[0]["internal_address"] | isipv6 }}'
+      - modulename: nf_nat_masquerade_ipv6
+        install: '{{ nodes[0]["internal_address"] | isipv6 }}'
+      - modulename: nf_reject_ipv6
+        install: '{{ nodes[0]["internal_address"] | isipv6 }}'
+      - modulename: nf_defrag_ipv6
+        install: '{{ nodes[0]["internal_address"] | isipv6 }}'
+    rhel8: &modprobe-default-modules
+      - modulename: br_netfilter
+        groups: [control-plane, worker]
+      - modulename: nf_conntrack
+        groups: [control-plane, worker]
+      - modulename: ip6table_filter
+        install: '{{ nodes[0]["internal_address"] | isipv6 }}'
+      - modulename: nf_nat
+        install: '{{ nodes[0]["internal_address"] | isipv6 }}'
+      - modulename: nf_reject_ipv6
+        install: '{{ nodes[0]["internal_address"] | isipv6 }}'
+      - modulename: nf_defrag_ipv6
+        install: '{{ nodes[0]["internal_address"] | isipv6 }}'
+    rhel9: *modprobe-default-modules
+    debian: *modprobe-default-modules
 
   sysctl:
-    net.bridge.bridge-nf-call-iptables: 1
-    net.ipv4.ip_forward: 1
-    net.ipv4.ip_nonlocal_bind: 1
-    net.ipv4.conf.all.route_localnet: 1
-    net.bridge.bridge-nf-call-ip6tables: '{% if not nodes[0]["internal_address"]|isipv4 %}1{% endif %}'
-    net.ipv6.conf.all.forwarding: '{% if not nodes[0]["internal_address"]|isipv4 %}1{% endif %}'
-    net.ipv6.ip_nonlocal_bind: '{% if not nodes[0]["internal_address"]|isipv4 %}1{% endif %}'
-    kernel.panic: 10
-    vm.overcommit_memory: 1
-    kernel.panic_on_oops: 1
+    net.ipv4.ip_nonlocal_bind:
+      value: 1
+      # actually, need to be enabled only if balancer is combined with other roles
+      groups: [balancer]
+    net.ipv6.ip_nonlocal_bind:
+      value: 1
+      # actually, need to be enabled only if balancer is combined with other roles
+      groups: [balancer]
+      install: '{{ nodes[0]["internal_address"] | isipv6 }}'
+    net.bridge.bridge-nf-call-iptables:
+      value: 1
+      groups: [control-plane, worker]
+    net.bridge.bridge-nf-call-ip6tables:
+      value: 1
+      groups: [control-plane, worker]
+      install: '{{ nodes[0]["internal_address"] | isipv6 }}'
+    net.ipv4.ip_forward:
+      value: 1
+      groups: [control-plane, worker]
+    net.ipv4.conf.all.route_localnet:
+      # backward compatibility
+      # https://github.com/kubernetes/kubernetes/blob/master/CHANGELOG/CHANGELOG-1.21.md#no-really-you-must-read-this-before-you-upgrade-6
+      value: 1
+      groups: [control-plane, worker]
+    net.ipv6.conf.all.forwarding:
+      value: 1
+      groups: [control-plane, worker]
+      install: '{{ nodes[0]["internal_address"] | isipv6 }}'
+    net.netfilter.nf_conntrack_max:
+      value: 1000000
+      groups: [control-plane, worker]
+    kernel.panic:
+      value: 10
+      groups: [control-plane, worker]
+      install: '{{ services.kubeadm_kubelet.protectKernelDefaults }}'
+    vm.overcommit_memory:
+      value: 1
+      groups: [control-plane, worker]
+      install: '{{ services.kubeadm_kubelet.protectKernelDefaults }}'
+    kernel.panic_on_oops:
+      value: 1
+      groups: [control-plane, worker]
+      install: '{{ services.kubeadm_kubelet.protectKernelDefaults }}'
+    kernel.pid_max:
+      # default value is set in sysctl.enrich_inventory
+      groups: [control-plane, worker]
 
   etc_hosts:
     127.0.0.1:
@@ -257,9 +294,6 @@ services:
             resources:
             - cronjobs
             - jobs
-          - group: "policy"
-            resources:
-            - podsecuritypolicies
           - group: "rbac.authorization.k8s.io"
             resources:
             - clusterrolebindings
@@ -322,14 +356,6 @@ services:
               - networksets
 
     rules:
-      - '{% if services["cri"]["containerRuntime"] == "docker" %}-w /var/lib/docker -k docker{% endif %}'
-      - '{% if services["cri"]["containerRuntime"] == "docker" %}-w /etc/docker -k docker{% endif %}'
-      - '{% if services["cri"]["containerRuntime"] == "docker" %}-w /usr/lib/systemd/system/docker.service -k docker{% endif %}'
-      - '{% if services["cri"]["containerRuntime"] == "docker" %}-w /usr/lib/systemd/system/docker.socket -k docker{% endif %}'
-      - '{% if services["cri"]["containerRuntime"] == "docker" %}-w /etc/default/docker -k docker{% endif %}'
-      - '{% if services["cri"]["containerRuntime"] == "docker" %}-w /etc/docker/daemon.json -k docker{% endif %}'
-      - '{% if services["cri"]["containerRuntime"] == "docker" %}-w /usr/sbin/runc -k docker{% endif %}'
-      - '{% if services["cri"]["containerRuntime"] == "docker" %}-w /usr/bin/dockerd -k docker{% endif %}'
       - '-w /usr/bin/containerd -k docker'
 
   coredns:
@@ -400,14 +426,14 @@ services:
               zone: '{{ cluster_name }}'
               data:
                 match: '^(.*\.)?{{ cluster_name }}\.$'
-                answer: '{% raw %}{{ .Name }}{% endraw %} 3600 IN A {{ control_plain["internal"] }}'
+                answer: '{{ "{{ .Name }}" }} 3600 IN A {{ control_plain["internal"] }}'
             reject-aaaa:
               enabled: '{{ nodes[0]["internal_address"]|isipv4 }}'
               priority: 1
               class: IN
               type: AAAA
               data:
-                authority: '{% raw %}{{ .Name }}{% endraw %} 3600 IN SOA coredns.kube-system.svc.cluster.local. hostmaster.coredns.kube-system.svc.cluster.local. (3600 3600 3600 3600 3600)'
+                authority: '{{ "{{ .Name }}" }} 3600 IN SOA coredns.kube-system.svc.cluster.local. hostmaster.coredns.kube-system.svc.cluster.local. (3600 3600 3600 3600 3600)'
           forward:
             - .
             - /etc/resolv.conf
@@ -427,10 +453,14 @@ services:
         timeout_client_fin: '1m'
         maxconn: 10000
       keep_configs_updated: True
+      maintenance_mode: False
       mntc_config_location: '/etc/haproxy/haproxy_mntc.cfg'
     target_ports:
-      http: '{% if nodes | select("has_role", "balancer") | reject("has_role", "remove_node") | first %}20080{% else %}80{% endif %}'
-      https: '{% if nodes | select("has_role", "balancer") | reject("has_role", "remove_node") | first %}20443{% else %}443{% endif %}'
+      http: '{% if nodes | select("has_role", "balancer") | first %}20080{% else %}80{% endif %}'
+      https: '{% if nodes | select("has_role", "balancer") | first %}20443{% else %}443{% endif %}'
+    keepalived:
+      keep_configs_updated: True
+      global: {}
 
   packages:
     cache_versions: true
@@ -445,11 +475,10 @@ services:
     package_manager:
       replace-repositories: false
     # Associations for each OS family are merged with 'package.common_associations' section of globals.yaml.
-    # Packages for docker, containerd, haproxy, and keepalived are calculated based on
+    # Packages for containerd, haproxy, and keepalived are calculated based on
     # 'package.<OS family>' sections of globals.yaml, target Kubernetes version, and the compatibility map.
     associations:
       debian:
-        docker: {}
         containerd: {}
         haproxy:
           executable_name: 'haproxy'
@@ -460,7 +489,6 @@ services:
         conntrack:
           package_name: 'conntrack'
       rhel:
-        docker: {}
         containerd: {}
         haproxy:
           executable_name: '/opt/rh/rh-haproxy18/root/usr/sbin/haproxy'
@@ -473,7 +501,6 @@ services:
         semanage:
           package_name: 'policycoreutils-python'
       rhel8:
-        docker: {}
         containerd: {}
         haproxy:
           executable_name: '/usr/sbin/haproxy'
@@ -486,7 +513,6 @@ services:
         semanage:
           package_name: 'policycoreutils-python-utils'
       rhel9:
-        docker: {}
         containerd: {}
         haproxy:
           executable_name: '/usr/sbin/haproxy'
@@ -517,15 +543,18 @@ plugins:
             method: apply_yaml
             arguments:
               plugin_name: calico
-        - expect:
+        - &plugins-calico-expect
+          expect:
             daemonsets:
               - calico-node
             deployments:
               - calico-kube-controllers
+              - '{% if plugins.calico.typha.enabled %}calico-typha{% endif %}'
             pods:
               - coredns
               - calico-kube-controllers
               - calico-node
+              - '{% if plugins.calico.typha.enabled %}calico-typha{% endif %}'
         - thirdparty: /usr/bin/calicoctl
         - template:
             source: templates/plugins/calicoctl.cfg.j2
@@ -540,15 +569,7 @@ plugins:
             source: templates/plugins/calico-rr.sh.j2
             destination: /tmp/calico_rr.sh
             apply_command: /bin/sh /tmp/calico_rr.sh
-        - expect:
-            daemonsets:
-              - calico-node
-            deployments:
-              - calico-kube-controllers
-            pods:
-              - coredns
-              - calico-kube-controllers
-              - calico-node
+        - *plugins-calico-expect
         - python:
             module: plugins/builtin.py
             method: apply_yaml
@@ -561,16 +582,22 @@ plugins:
     mode: ipip
     crossSubnet: true
     natOutgoing: true
-    mtu: 1440
+    mtu: 1430
     fullmesh: true
     announceServices: false
     defaultAsNumber: 64512
     globalBgpPeers: []
     typha:
       # enabled by default for envs with nodes > 3
-      enabled: '{% if (nodes|length) < 4 %}false{% else %}true{% endif %}'
-      # let's start from 2 replicas and increment it every 50 nodes
-      replicas: '{{ (((nodes|length)/50) + 2) | round(1) | int }}'
+      enabled: '{% if (nodes | select("has_roles", ["control-plane", "worker"]) | list | length) < 4 %}false{% else %}true{% endif %}'
+      # If Typha is disabled, set 0 replicas to avoid sudden configuration changes during add/remove nodes.
+      # If enabled, Let's start from 2 replicas and increment it every 50 nodes.
+      # In special case of 1 node, scale to 1 replica.
+      replicas: "\
+        {% if plugins.calico.typha.enabled | is_true %}\
+        {% set kubernetes_nodes = nodes | select('has_roles', ['control-plane', 'worker']) | list | length %}\
+        {{ (1 + ([kubernetes_nodes - 1, 1] | min) + kubernetes_nodes / 50) | round(0, 'floor') | int }}\
+        {% else %}0{% endif %}"
       image: 'calico/typha:{{ plugins.calico.version }}'
       nodeSelector:
         kubernetes.io/os: linux
@@ -680,7 +707,9 @@ plugins:
             pods:
               - ingress-nginx-controller
     config_map:
-      use-proxy-protocol: '{% if nodes | select("has_role", "balancer") | reject("has_role", "remove_node") | first %}true{% else %}false{% endif %}'
+      use-proxy-protocol: '{% if nodes | select("has_role", "balancer") | first %}true{% else %}false{% endif %}'
+      # redefine default value for controller >= v1.9.0 because we need to use snippet annotations for dashboard
+      allow-snippet-annotations: "true"
     webhook:
       image: 'ingress-nginx/kube-webhook-certgen:{{ globals.compatibility_map.software["nginx-ingress-controller"][services.kubeadm.kubernetesVersion]["webhook-version"] }}'
       # resources values are based on https://github.com/kubernetes/ingress-nginx/blob/helm-chart-4.7.1/charts/ingress-nginx/values.yaml#L598
@@ -849,16 +878,7 @@ rbac:
           annotations: {}
         type: kubernetes.io/service-account-token
 
-  psp:
-    pod-security: enabled
-    oob-policies:
-      default: enabled
-      host-network: enabled
-      anyuid: enabled
-    custom-policies:
-      psp-list: []
-      roles-list: []
-      bindings-list: []
+  admission: pss
   pss:
     pod-security: enabled
     defaults:
@@ -877,3 +897,4 @@ procedure_history:
   archive_threshold: 5
   delete_threshold: 10
 
+patches: []

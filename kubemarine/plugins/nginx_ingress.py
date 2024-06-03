@@ -13,14 +13,18 @@
 # limitations under the License.
 
 import io
-import ipaddress
 from typing import Optional, List, Dict
 
+from textwrap import dedent
+import yaml
+
 from kubemarine.core import utils, log
-from kubemarine.core.cluster import KubernetesCluster
+from kubemarine.core.cluster import KubernetesCluster, EnrichmentStage, enrichment
 from kubemarine.core.group import NodeGroup
 from kubemarine.kubernetes import secrets
 from kubemarine.plugins.manifest import Processor, EnrichmentFunction, Manifest, Identity
+
+ERROR_CERT_RENEW_NOT_INSTALLED = "Certificates can not be renewed for nginx plugin since it is not installed"
 
 
 def check_job_for_nginx(cluster: KubernetesCluster) -> None:
@@ -38,14 +42,11 @@ def check_job_for_nginx(cluster: KubernetesCluster) -> None:
         cluster.log.debug('There are no jobs to delete')
 
 
-def enrich_inventory(inventory: dict, cluster: KubernetesCluster) -> dict:
+@enrichment(EnrichmentStage.FULL)
+def enrich_inventory(cluster: KubernetesCluster) -> None:
+    inventory = cluster.inventory
     if not inventory["plugins"]["nginx-ingress-controller"]["install"]:
-        return inventory
-
-    # Change type for hostPorts because of jinja enrichment
-    for port in inventory["plugins"]["nginx-ingress-controller"].get("ports", []):
-        if "hostPort" in port and not isinstance(port['hostPort'], int):
-            port['hostPort'] = int(port['hostPort'])
+        return
 
     if inventory["plugins"]["nginx-ingress-controller"].get('custom_headers'):
         if not inventory["plugins"]["nginx-ingress-controller"].get('config_map'):
@@ -61,76 +62,26 @@ def enrich_inventory(inventory: dict, cluster: KubernetesCluster) -> dict:
     if "resources" in raw_webhook:
         inventory["plugins"]["nginx-ingress-controller"]["webhook"]["resources"] = raw_webhook["resources"]
 
-    return inventory
 
-
-def cert_renew_enrichment(inventory: dict, cluster: KubernetesCluster) -> dict:
+@enrichment(EnrichmentStage.PROCEDURE, procedures=['cert_renew'])
+def cert_renew_enrichment(cluster: KubernetesCluster) -> None:
     # check that renewal is required for nginx
-    if cluster.context.get('initial_procedure') != 'cert_renew' \
-            or not cluster.procedure_inventory.get("nginx-ingress-controller"):
-        return inventory
-
-    nginx_plugin = inventory["plugins"]["nginx-ingress-controller"]
-
-    # check that renewal is possible
-    if not nginx_plugin["install"]:
-        raise Exception("Certificates can not be renewed for nginx plugin since it is not installed")
+    procedure_nginx_cert = cluster.procedure_inventory.get("nginx-ingress-controller", {})
+    if not procedure_nginx_cert:
+        return
 
     # update certificates in inventory
-    nginx_plugin["controller"]["ssl"]["default-certificate"] = cluster.procedure_inventory["nginx-ingress-controller"]
-
-    return inventory
-
-
-def finalize_inventory(cluster: KubernetesCluster, inventory_to_finalize: dict) -> dict:
-    # check that renewal is required for nginx
-    if cluster.context.get('initial_procedure') != 'cert_renew' \
-            or not cluster.procedure_inventory.get("nginx-ingress-controller"):
-        return inventory_to_finalize
-
-    if not inventory_to_finalize["plugins"].get("nginx-ingress-controller"):
-        inventory_to_finalize["plugins"]["nginx-ingress-controller"] = {}
-
-    if not inventory_to_finalize["plugins"]["nginx-ingress-controller"].get("controller"):
-        inventory_to_finalize["plugins"]["nginx-ingress-controller"]["controller"] = {}
-
-    if not inventory_to_finalize["plugins"]["nginx-ingress-controller"]["controller"].get("ssl"):
-        inventory_to_finalize["plugins"]["nginx-ingress-controller"]["controller"]["ssl"] = {}
-
-    nginx_plugin = inventory_to_finalize["plugins"]["nginx-ingress-controller"]
-    nginx_plugin["controller"]["ssl"]["default-certificate"] = cluster.procedure_inventory["nginx-ingress-controller"]
-
-    return inventory_to_finalize
+    cluster.inventory.setdefault("plugins", {}).setdefault("nginx-ingress-controller", {}) \
+        .setdefault("controller", {}).setdefault("ssl", {})["default-certificate"] \
+        = utils.deepcopy_yaml(procedure_nginx_cert)
 
 
-def redeploy_ingress_nginx_is_needed(cluster: KubernetesCluster) -> bool:
-    # redeploy ingres-nginx-controller for add/remove node procedures is needed in case:
-    # 1. plugins.nginx-ingress-controller.install=true
-    # 2. any balancer node exists (including as remove_node)
-    # 3. all balancers have add_node/remove_node roles (added the first or removed the last balancer)
-    # 4. One of following is not overriden:
-    #    4.1. use-proxy-protocol
-    #    4.2. ingress-nginx-ports and some from target ports
-    ingress_nginx_plugin = cluster.inventory['plugins']['nginx-ingress-controller']
-    balancers = [balancer for balancer in cluster.inventory['nodes'] if 'balancer' in balancer['roles']]
-    if not ingress_nginx_plugin.get("install", False) or \
-            not balancers or \
-            any('add_node' not in node['roles'] and 'remove_node' not in node['roles'] for node in balancers):
-        return False
-
-    proxy_protocol_overriden = 'use-proxy-protocol' in cluster.raw_inventory.get('plugins', {})\
-        .get('nginx-ingress-controller', {})\
-        .get('config_map', {})
-    http_target_port_overriden = 'http' in cluster.raw_inventory.get('services', {})\
-        .get('loadbalancer', {})\
-        .get('target_ports', {})
-    https_target_port_overriden = 'https' in cluster.raw_inventory.get('services', {}) \
-        .get('loadbalancer', {}) \
-        .get('target_ports', {})
-    ingress_nginx_ports_overriden = 'ports' in cluster.raw_inventory.get('plugins', {})\
-        .get('nginx-ingress-controller', {})
-    return not proxy_protocol_overriden or not (ingress_nginx_ports_overriden or
-                                                (https_target_port_overriden and http_target_port_overriden))
+@enrichment(EnrichmentStage.PROCEDURE, procedures=['cert_renew'])
+def verify_cert_renew(cluster: KubernetesCluster) -> None:
+    procedure_nginx_cert = cluster.procedure_inventory.get("nginx-ingress-controller", {})
+    # check that renewal is possible
+    if procedure_nginx_cert and not cluster.inventory["plugins"]["nginx-ingress-controller"]["install"]:
+        raise Exception(ERROR_CERT_RENEW_NOT_INSTALLED)
 
 
 def manage_custom_certificate(cluster: KubernetesCluster) -> None:
@@ -201,6 +152,7 @@ class IngressNginxManifestProcessor(Processor):
             "Job_ingress-nginx-admission-create",
             "Job_ingress-nginx-admission-patch",
             "IngressClass_nginx",
+            "NetworkPolicy_ingress-nginx-admission",
             "ValidatingWebhookConfiguration_ingress-nginx-admission",
         ]
 
@@ -209,6 +161,8 @@ class IngressNginxManifestProcessor(Processor):
             self.enrich_namespace_ingress_nginx,
             self.enrich_configmap_ingress_nginx_controller,
             self.add_configmap_ingress_nginx_controller,
+            self.enrich_service_account_secret,
+            self.enrich_service_account,
             self.enrich_deployment_ingress_nginx_controller,
             self.enrich_ingressclass_nginx,
             self.enrich_job_ingress_nginx_admission_create,
@@ -243,9 +197,26 @@ class IngressNginxManifestProcessor(Processor):
             self.log.verbose(f"The {manifest.obj_key(custom_headers_cm)} has been patched in 'data' "
                              f"with the data from 'plugins.nginx-ingress-controller.custom_headers'")
 
+    def enrich_service_account_secret(self, manifest: Manifest) -> None:
+        new_yaml = yaml.safe_load(service_account_secret)
+
+        service_account_key = "ServiceAccount_ingress-nginx"
+        service_account_index = manifest.all_obj_keys().index(service_account_key) \
+            if service_account_key in manifest.all_obj_keys() else -1
+
+        self.include(manifest, service_account_index + 1, new_yaml)
+
+    def enrich_service_account(self, manifest: Manifest) -> None:
+        key = "ServiceAccount_ingress-nginx"
+        source_yaml = manifest.get_obj(key, patch=True)
+        source_yaml['automountServiceAccountToken'] = False
+
     def enrich_deployment_ingress_nginx_controller(self, manifest: Manifest) -> None:
         key = "Deployment_ingress-nginx-controller"
         source_yaml = manifest.get_obj(key, patch=True)
+        service_account_name = "ingress-nginx"
+        self.enrich_volume_and_volumemount(source_yaml, service_account_name)
+        self.log.verbose(f"The {key} has been updated to include the new secret volume and mount.")
 
         self.enrich_deamonset_ingress_nginx_controller_container(manifest)
 
@@ -256,6 +227,8 @@ class IngressNginxManifestProcessor(Processor):
         self.enrich_node_selector(manifest, key, plugin_service='controller')
         self.enrich_tolerations(manifest, key, plugin_service='controller')
 
+        # DeamonSet spec lacks of strategy. Discard it if present.
+        source_yaml['spec'].pop('strategy', None)
         # Patch kind in the last step to avoid sudden key change in log messages
         source_yaml['kind'] = 'DaemonSet'
         self.log.verbose(f"The {key} has been patched in 'kind' with 'DaemonSet'")
@@ -274,7 +247,7 @@ class IngressNginxManifestProcessor(Processor):
             extra_args.append('--default-ssl-certificate' + '=' + 'kube-system/default-ingress-cert')
 
         self.enrich_deamonset_ingress_nginx_controller_container_args(
-            manifest, remove_args=['--publish-service'], extra_args=extra_args)
+            manifest, remove_args=['--publish-service','--enable-metrics'], extra_args=extra_args)
 
         container_pos, container = self.find_container_for_patch(
             manifest, key, container_name='controller', is_init_container=False)
@@ -318,84 +291,10 @@ class IngressNginxManifestProcessor(Processor):
         # The method needs some rework in case of dual stack support
         key = "Service_ingress-nginx-controller"
         ip = self.inventory['services']['kubeadm']['networking']['serviceSubnet'].split('/')[0]
-        if type(ipaddress.ip_address(ip)) is ipaddress.IPv6Address:
+        if utils.isipv(ip, [6]):
             source_yaml = manifest.get_obj(key, patch=True)
             source_yaml['spec']['ipFamilies'] = ['IPv6']
             self.log.verbose(f"The {key} has been patched in 'spec.ipFamilies' with 'IPv6'")
-
-
-class V1_2_X_IngressNginxManifestProcessor(IngressNginxManifestProcessor):
-    def get_enrichment_functions(self) -> List[EnrichmentFunction]:
-        enrichment_functions = super().get_enrichment_functions()
-        enrichment_functions.extend([
-            self.exclude_webhook_resources,
-            self.enrich_role_ingress_nginx,
-        ])
-        return enrichment_functions
-
-    def enrich_deamonset_ingress_nginx_controller_container(self, manifest: Manifest) -> None:
-        key = "Deployment_ingress-nginx-controller"
-
-        container_pos, container = self.find_container_for_patch(
-            manifest, key, container_name='controller', is_init_container=False)
-
-        del container['volumeMounts']
-        self.log.verbose(f"The 'volumeMounts' property has been removed "
-                         f"from 'spec.template.spec.containers.[{container_pos}]' in the {key}")
-
-        super().enrich_deamonset_ingress_nginx_controller_container(manifest)
-
-    def enrich_deamonset_ingress_nginx_controller_container_args(self, manifest: Manifest,
-                                                                 *,
-                                                                 remove_args: List[str],
-                                                                 extra_args: List[str]) -> None:
-        webhook_args_remove = [
-            '--validating-webhook',
-            '--validating-webhook-certificate',
-            '--validating-webhook-key'
-        ]
-        remove_args = remove_args + webhook_args_remove
-        super().enrich_deamonset_ingress_nginx_controller_container_args(
-            manifest, remove_args=remove_args, extra_args=extra_args)
-
-    def enrich_job_ingress_nginx_admission_create(self, manifest: Manifest) -> None:
-        return
-
-    def enrich_job_ingress_nginx_admission_patch(self, manifest: Manifest) -> None:
-        return
-
-    def exclude_webhook_resources(self, manifest: Manifest) -> None:
-        webhook_resources = [
-            "ServiceAccount_ingress-nginx-admission",
-            "Role_ingress-nginx-admission",
-            "ClusterRole_ingress-nginx-admission",
-            "RoleBinding_ingress-nginx-admission",
-            "ClusterRoleBinding_ingress-nginx-admission",
-            "Service_ingress-nginx-controller-admission",
-            "Job_ingress-nginx-admission-create",
-            "Job_ingress-nginx-admission-patch",
-            "ValidatingWebhookConfiguration_ingress-nginx-admission",
-        ]
-        for key in webhook_resources:
-            self.exclude(manifest, key)
-
-    def enrich_role_ingress_nginx(self, manifest: Manifest) -> None:
-        key = "Role_ingress-nginx"
-        source_yaml = manifest.get_obj(key, patch=True)
-        # TODO patch only if psp is enabled?
-        api_list = source_yaml['rules']
-        api_list.append(psp_ingress_nginx)
-        self.log.verbose(f"The {key} has been patched in 'rules' with {psp_ingress_nginx}")
-
-
-def get_ingress_nginx_manifest_processor(logger: log.VerboseLogger, inventory: dict,
-                                         yaml_path: Optional[str] = None, destination: Optional[str] = None) -> Processor:
-    version: str = inventory['plugins']['nginx-ingress-controller']['version']
-    kwargs = {'original_yaml_path': yaml_path, 'destination_name': destination}
-    if utils.minor_version(version) == 'v1.2':
-        return V1_2_X_IngressNginxManifestProcessor(logger, inventory, **kwargs)
-
-    return IngressNginxManifestProcessor(logger, inventory, **kwargs)
 
 
 CUSTOM_HEADERS_CM = {
@@ -407,9 +306,13 @@ CUSTOM_HEADERS_CM = {
     }
 }
 
-psp_ingress_nginx = {
-    "apiGroups": ["extensions"],
-    "resources": ["podsecuritypolicies"],
-    "verbs":     ["use"],
-    "resourceNames": ["oob-host-network-psp"]
-}
+service_account_secret = dedent("""\
+    apiVersion: v1
+    kind: Secret
+    metadata:
+      name: ingress-nginx-token
+      namespace: ingress-nginx
+      annotations:
+        kubernetes.io/service-account.name: ingress-nginx
+    type: kubernetes.io/service-account-token  
+""")

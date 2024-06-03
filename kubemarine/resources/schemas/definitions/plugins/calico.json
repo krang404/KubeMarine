@@ -12,9 +12,9 @@
       "type": "string"
     },
     "mode": {
-      "enum": ["ipip", "vxlan"],
+      "enum": ["ipip", "vxlan", "none"],
       "default": "ipip",
-      "description": "Network protocol to be used in network plugin"
+      "description": "Network overlay technology to be used in network plugin"
     },
     "crossSubnet": {
       "type": "boolean",
@@ -27,7 +27,7 @@
     },
     "mtu": {
       "type": "integer",
-      "default": 1440,
+      "default": 1430,
       "description": "MTU size for Calico interface"
     },
     "fullmesh": {

@@ -25,7 +25,6 @@ from typing import List
 import yaml
 
 from kubemarine.core import utils, flow
-from kubemarine.core.action import Action
 from kubemarine.core.cluster import KubernetesCluster
 from kubemarine.core.resources import DynamicResources
 from kubemarine.procedures import install, backup
@@ -43,6 +42,8 @@ def missing_or_empty(file: str) -> bool:
 
 
 def replace_config_from_backup_if_needed(procedure_inventory_filepath: str, config: str) -> None:
+    # pylint: disable=bad-builtin
+
     if missing_or_empty(config):
         print('Config is missing or empty - retrieving config from backup archive...')
         procedure = utils.load_yaml(procedure_inventory_filepath)
@@ -97,20 +98,13 @@ def unpack_data(resources: DynamicResources) -> None:
 
 def stop_cluster(cluster: KubernetesCluster) -> None:
     cluster.log.debug('Stopping the existing cluster...')
-    cri_impl = cluster.inventory['services']['cri']['containerRuntime']
-    if cri_impl == "docker":
-        result = cluster.nodes['control-plane'].sudo('systemctl stop kubelet; '
-                                              'sudo docker kill $(sudo docker ps -q); '
-                                              'sudo docker rm -f $(sudo docker ps -a -q); '
-                                              'sudo docker ps -a; '
-                                              'sudo rm -rf /var/lib/etcd; '
-                                              'sudo mkdir -p /var/lib/etcd', warn=True)
-    else:
-        result = cluster.nodes['control-plane'].sudo('systemctl stop kubelet; '
-                                              'sudo crictl rm -fa; '
-                                              'sudo crictl ps -a; '
-                                              'sudo rm -rf /var/lib/etcd; '
-                                              'sudo mkdir -p /var/lib/etcd', warn=True)
+    result = cluster.nodes['control-plane'].sudo(
+        'systemctl stop kubelet; '
+        'sudo crictl rm -fa; '
+        'sudo crictl ps -a; '
+        'sudo rm -rf /var/lib/etcd; '
+        'sudo mkdir -p /var/lib/etcd',
+        warn=True)
     cluster.log.verbose(result)
 
 
@@ -176,22 +170,12 @@ def import_etcd(cluster: KubernetesCluster) -> None:
     initial_cluster_list_without_names = []
     for control_plane in cluster.nodes['control-plane'].get_ordered_members_configs_list():
         initial_cluster_list.append(control_plane['name'] + '=https://' + control_plane["internal_address"] + ":2380")
-        initial_cluster_list_without_names.append(control_plane["internal_address"] + ":2379")
+        initial_cluster_list_without_names.append('https://' + control_plane["internal_address"] + ":2379")
     initial_cluster = ','.join(initial_cluster_list)
 
-    if "docker" == cluster.inventory['services']['cri']['containerRuntime']:
-        cont_runtime = "docker"
-    else:
-        cont_runtime = "ctr"
     container_name = f'etcd-{uuid.uuid4().hex}'
-    network_options = '--network host' if cont_runtime == 'docker' else '--net-host'
-    mount_options = '-v /var/lib/etcd:/var/lib/etcd ' \
-                    '-v /etc/kubernetes/pki:/etc/kubernetes/pki ' \
-        if cont_runtime == 'docker' else \
-        '-mount type=bind,src=/var/lib/etcd,dst=/var/lib/etcd,options=rbind:rw ' \
-        '-mount type=bind,src=/etc/kubernetes/pki/etcd,dst=/etc/kubernetes/pki/etcd,options=rbind:rw'
-    name_option = f'--name {container_name}' if cont_runtime == 'docker' else ''
-    container_id = '' if cont_runtime == 'docker' else f'{container_name}'
+    mount_options = '-mount type=bind,src=/var/lib/etcd,dst=/var/lib/etcd,options=rbind:rw ' \
+                    '-mount type=bind,src=/etc/kubernetes/pki/etcd,dst=/etc/kubernetes/pki/etcd,options=rbind:rw'
 
     etcd_instances = 0
     for control_plane in cluster.nodes['control-plane'].get_ordered_members_configs_list():
@@ -200,7 +184,12 @@ def import_etcd(cluster: KubernetesCluster) -> None:
         control_plane_conn.sudo(
             f'chmod 777 {snap_name} && '
             f'sudo ls -la {snap_name} && '
-            f'sudo etcdctl snapshot restore {snap_name} '
+            f'sudo ETCD_IMAGE="{etcd_image}" ETCD_MOUNTS="{mount_options}" etcdctl '
+            f'--cert={etcd_cert} '
+            f'--key={etcd_key} '
+            f'--cacert={etcd_cacert} '
+            f'--endpoints={",".join(initial_cluster_list_without_names)} '
+            f'snapshot restore {snap_name} '
             f'--name={control_plane["name"]} '
             f'--data-dir=/var/lib/etcd/snapshot '
             f'--initial-cluster={initial_cluster} '
@@ -210,10 +199,10 @@ def import_etcd(cluster: KubernetesCluster) -> None:
         _ = control_plane_conn.sudo(
             f'mv /var/lib/etcd/snapshot/member /var/lib/etcd/member && '
             f'sudo rm -rf /var/lib/etcd/snapshot {snap_name} && '
-            f'sudo {cont_runtime} run -d {network_options} '
-            f'--env ETCDCTL_API=3 {name_option} '
+            f'sudo ctr run -d --net-host '
+            f'--env ETCDCTL_API=3 '
             f'{mount_options} '
-            f'{etcd_image} {container_id} etcd '
+            f'{etcd_image} {container_name} etcd '
             f'--advertise-client-urls=https://{control_plane["internal_address"]}:2379 '
             f'--cert-file={etcd_cert} '
             f'--key-file={etcd_key} '
@@ -238,14 +227,18 @@ def import_etcd(cluster: KubernetesCluster) -> None:
 
     # Check DB size is correct
     backup_source = cluster.context['backup_descriptor'].get('etcd', {}).get('source')
-    etcd_statuses_from_descriptor = cluster.context['backup_descriptor'].get('etcd', {}).get('status', {})
-    if backup_source and etcd_statuses_from_descriptor and etcd_statuses_from_descriptor.get(backup_source, {}).get('status', {}).get('dbsize'):
-        expected_dbsize = int(etcd_statuses_from_descriptor.get(backup_source, {}).get('status', {}).get('dbsize'))
+    backup_descriptor_dbsize = None
+    if backup_source:
+        backup_descriptor_dbsize = cluster.context['backup_descriptor'].get('etcd', {}).get('status', {}) \
+            .get(backup_source, {}).get('status', {}).get('dbsize')
+    if backup_descriptor_dbsize:
+        expected_dbsize = int(backup_descriptor_dbsize)
         for item in cluster_status:
             real_dbsize = int(item.get('status', {}).get('dbsize'))
             if not real_dbsize:
                 raise Exception('ETCD member "%s" do not have DB size' % item.get('endpoint'))
-            cluster.log.verbose('Endpoint "%s" DB real size %s, expected size %s' % (item.get('endpoint'), expected_dbsize, real_dbsize))
+            cluster.log.verbose('Endpoint "%s" DB real size %s, expected size %s'
+                                % (item.get('endpoint'), expected_dbsize, real_dbsize))
             # restored db should have equal or greater DB size
             if expected_dbsize > real_dbsize:
                 raise Exception('ETCD member "%s" has invalid DB size' % item.get('endpoint'))
@@ -254,12 +247,9 @@ def import_etcd(cluster: KubernetesCluster) -> None:
         cluster.log.verbose('It is not possible to verify db size - descriptor do not contain such information')
 
     # Stop and remove container
-    if cont_runtime == 'docker':
-        cluster.nodes['control-plane'].sudo(f"docker stop {container_name} && "
-                                            f"sudo docker rm {container_name}")
-    else:
-        cluster.nodes['control-plane'].sudo(f"ctr task rm -f {container_name} && "
-                                            f"sudo ctr container rm {container_name}")
+    cluster.nodes['control-plane'].sudo(
+        f"ctr task rm -f {container_name} && "
+        f"sudo ctr container rm {container_name}")
 
 
 def reboot(cluster: KubernetesCluster) -> None:
@@ -291,13 +281,9 @@ class RestoreFlow(flow.Flow):
         flow.run_actions(resources, [RestoreAction()])
 
 
-class RestoreAction(Action):
+class RestoreAction(flow.TasksAction):
     def __init__(self) -> None:
-        super().__init__('restore', recreate_inventory=True)
-
-    def run(self, res: DynamicResources) -> None:
-        flow.run_tasks(res, tasks)
-        res.make_final_inventory()
+        super().__init__('restore', tasks, recreate_inventory=True)
 
 
 def create_context(cli_arguments: List[str] = None) -> dict:

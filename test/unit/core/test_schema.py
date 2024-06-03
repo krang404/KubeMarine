@@ -15,13 +15,13 @@ import glob
 import os
 import unittest
 from unittest import mock
+from test.unit import utils as test_utils
 
 import yaml
 
-from kubemarine import demo, coredns, __main__
-from kubemarine.core import errors, schema
+from kubemarine import demo, coredns, __main__, plugins
+from kubemarine.core import errors
 from kubemarine.procedures import install
-from test.unit import utils as test_utils
 
 
 class FinalizedInventoryValidation(unittest.TestCase):
@@ -35,13 +35,11 @@ class FinalizedInventoryValidation(unittest.TestCase):
         inventory = demo.generate_inventory(**demo.FULLHA_KEEPALIVED)
         cluster = demo.new_cluster(inventory)
 
-        test_utils.stub_associations_packages(cluster, {})
         finalized_inventory = test_utils.make_finalized_inventory(cluster)
 
         # check that enrichment of finalized inventory is successful and the inventory is valid against the schema
         cluster = self._check_finalized_validation(finalized_inventory)
 
-        test_utils.stub_associations_packages(cluster, {})
         finalized_inventory = test_utils.make_finalized_inventory(cluster)
 
         # check that enrichment is idempotent and double-finalized inventory still valid against the schema
@@ -52,19 +50,17 @@ class FinalizedInventoryValidation(unittest.TestCase):
         cluster = demo.new_cluster(inventory)
         coredns.generate_configmap(cluster.inventory)
 
-        test_utils.stub_associations_packages(cluster, {})
         finalized_inventory = test_utils.make_finalized_inventory(cluster)
 
         # check that generation of coredns does not break finalized inventory
         self._check_finalized_validation(finalized_inventory)
 
-    @mock.patch('kubemarine.plugins.install_plugin')
-    def test_plugins_installation_enriches_valid(self, install_plugin):
+    @mock.patch.object(plugins, plugins.install_plugin.__name__)
+    def test_plugins_installation_enriches_valid(self, _):
         inventory = demo.generate_inventory(**demo.MINIHA)
         cluster = demo.new_cluster(inventory)
         install.deploy_plugins(cluster)
 
-        test_utils.stub_associations_packages(cluster, {})
         finalized_inventory = test_utils.make_finalized_inventory(cluster)
 
         # check that plugins installation does not break finalized inventory
@@ -78,15 +74,12 @@ class TestValidExamples(unittest.TestCase):
         for inventory_filepath in glob.glob(inventories_dir + "/**/*", recursive=True):
             if os.path.isdir(inventory_filepath) or 'cluster' not in os.path.basename(inventory_filepath):
                 continue
-            with open(inventory_filepath, 'r') as stream:
+            with open(inventory_filepath, 'r', encoding='utf-8') as stream:
                 inventory = yaml.safe_load(stream)
 
             # check that enrichment is successful and the inventory is valid against the schema
-            context = demo.create_silent_context()
-            context['nodes'] = demo.generate_nodes_context(inventory)
             try:
-                cluster = demo.FakeKubernetesCluster(inventory, context=context)
-                schema.verify_inventory(cluster.raw_inventory, cluster)
+                demo.new_cluster(inventory)
             except Exception as e:
                 self.fail(f"Enrichment of {os.path.relpath(inventory_filepath, start=inventories_dir)} failed: {e}")
 
@@ -96,24 +89,23 @@ class TestValidExamples(unittest.TestCase):
         for inventory_filepath in glob.glob(inventories_dir + "/**/*", recursive=True):
             if os.path.isdir(inventory_filepath):
                 continue
-            with open(inventory_filepath, 'r') as stream:
+            with open(inventory_filepath, 'r', encoding='utf-8') as stream:
                 procedure_inventory = yaml.safe_load(stream)
 
             relpath = os.path.relpath(inventory_filepath, start=inventories_dir)
             for procedure in __main__.procedures.keys():
                 if procedure in os.path.basename(inventory_filepath):
+                    context = demo.create_silent_context(['fake.yaml'], procedure=procedure)
+                    inventory = demo.generate_inventory(**demo.MINIHA)
+
+                    # check that enrichment is successful and the inventory is valid against the schema
+                    try:
+                        demo.new_cluster(inventory, context=context, procedure_inventory=procedure_inventory)
+                    except Exception as e:
+                        self.fail(f"Enrichment of {relpath} failed: {e}")
                     break
             else:
                 self.fail(f"Unknown procedure for inventory {relpath}")
-
-            context = demo.create_silent_context(['fake.yaml'], procedure=procedure)
-            inventory = demo.generate_inventory(**demo.MINIHA)
-
-            # check that enrichment is successful and the inventory is valid against the schema
-            try:
-                demo.new_cluster(inventory, context=context, procedure_inventory=procedure_inventory)
-            except Exception as e:
-                self.fail(f"Enrichment of {relpath} failed: {e}")
 
 
 class TestErrorHeuristics(unittest.TestCase):
@@ -138,6 +130,18 @@ class TestErrorHeuristics(unittest.TestCase):
         inventory = demo.generate_inventory(**demo.ALLINONE)
         inventory['nodes'][0]['unsupported_property'] = 'value'
         with self.assertRaisesRegex(errors.FailException, r"Property name 'unsupported_property' is not one of \[.*]"):
+            demo.new_cluster(inventory)
+
+    def test_oneOf_property_sets_required(self):
+        """
+        patches section is an example where at least one of property sets is required ("groups" or "nodes")
+        Specify unexpected property to check correctly generated error.
+        See kubemarine.core.schema._unnest_required_subschema_errors
+        """
+        inventory = demo.generate_inventory(**demo.ALLINONE)
+        inventory['patches'] = [{}]
+        with self.assertRaisesRegex(errors.FailException,
+                                    r"At least one of the following property sets is required: \['groups'], \['nodes']"):
             demo.new_cluster(inventory)
 
     def test_raise_max_relevant_from_subschema(self):
@@ -213,6 +217,78 @@ class TestErrorHeuristics(unittest.TestCase):
             'endpoints': ['one', 'another']
         }
         with self.assertRaisesRegex(errors.FailException, r"'address' was unexpected"):
+            demo.new_cluster(inventory)
+
+    def test_propertyNames_not_enum(self):
+        """
+        'services.kubeadm_kube-proxy' section is an example where propertyNames are configured as not(enum).
+        Specify unexpected property to check correctly generated error.
+        See kubemarine.core.schema._friendly_msg
+        """
+        inventory = demo.generate_inventory(**demo.ALLINONE)
+        context = demo.create_silent_context(["fake.yaml"], procedure='reconfigure')
+
+        reconfigure = demo.generate_procedure_inventory(procedure='reconfigure')
+        reconfigure.setdefault('services', {}).setdefault('kubeadm_kube-proxy', {})['kind'] = 'unsupported'
+
+        with self.assertRaisesRegex(errors.FailException, "Property name 'kind' is unexpected"):
+            demo.new_cluster(inventory, procedure_inventory=reconfigure, context=context)
+
+    def test_empty_registry(self):
+        inventory = demo.generate_inventory(**demo.ALLINONE)
+        inventory['registry'] = {}
+        with self.assertRaisesRegex(errors.FailException,
+                                    r"One of the following property sets is required: \['endpoints'], \['address']"):
+            demo.new_cluster(inventory)
+
+    def test_registry_one_not_required_property(self):
+        inventory = demo.generate_inventory(**demo.ALLINONE)
+        inventory['registry'] = {'ssl': False}
+        with self.assertRaisesRegex(errors.FailException, r"'address' is a required property"):
+            demo.new_cluster(inventory)
+
+        inventory['registry'] = {'thirdparties': 'test'}
+        with self.assertRaisesRegex(errors.FailException, r"'endpoints' is a required property"):
+            demo.new_cluster(inventory)
+
+    def test_gateway_missed_credentials(self):
+        inventory = demo.generate_inventory(**demo.ALLINONE)
+        inventory['gateway_nodes'] = [{
+            'name': 'test-gateway',
+            'address': '10.101.1.100',
+            'username': 'root',
+        }]
+        with self.assertRaisesRegex(errors.FailException,
+                                    r"One of the following property sets is required: \['keyfile'], \['password']"):
+            demo.new_cluster(inventory)
+
+    def test_kubeadm_patches_missed_nodes_selector(self):
+        inventory = demo.generate_inventory(**demo.ALLINONE)
+        inventory['services']['kubeadm_patches'] = {
+            'kubelet': [{'patch': {}}]
+        }
+        with self.assertRaisesRegex(errors.FailException,
+                                    r"One of the following property sets is required: \['groups'], \['nodes']"):
+            demo.new_cluster(inventory)
+
+    def test_modprobe_item_empty_dict(self):
+        inventory = demo.generate_inventory(**demo.ALLINONE)
+        inventory['services'].setdefault('modprobe', {})['debian'] = [{}]
+        with self.assertRaisesRegex(errors.FailException,
+                                    r"'modulename' is a required property"):
+            demo.new_cluster(inventory)
+
+    def test_audit_cluster_policy_missed_level(self):
+        inventory = demo.generate_inventory(**demo.ALLINONE)
+        inventory['services']['audit'] = {
+            'cluster_policy': {
+                "rules": [
+                    {"verbs": []}
+                ]
+            }
+        }
+        with self.assertRaisesRegex(errors.FailException,
+                                    r"'level' is a required property"):
             demo.new_cluster(inventory)
 
 

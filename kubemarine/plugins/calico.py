@@ -11,22 +11,25 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import ipaddress
 from textwrap import dedent
 from typing import Optional, List, Dict
 
 import os
+import yaml
 
-from kubemarine import plugins, kubernetes
+from kubemarine import plugins
 from kubemarine.core import utils, log
-from kubemarine.core.cluster import KubernetesCluster
+from kubemarine.core.cluster import KubernetesCluster, EnrichmentStage, enrichment
+from kubemarine.core.group import NodeGroup
 from kubemarine.kubernetes import secrets
 from kubemarine.plugins.manifest import Processor, EnrichmentFunction, Manifest, Identity
 
 
-def enrich_inventory(inventory: dict, cluster: KubernetesCluster) -> dict:
+@enrichment(EnrichmentStage.FULL)
+def enrich_inventory(cluster: KubernetesCluster) -> None:
+    inventory = cluster.inventory
     if not inventory["plugins"]["calico"]["install"]:
-        return inventory
+        return
 
     # if user defined resources himself, we should use them as is, instead of merging with our defaults
     raw_calico_node = cluster.raw_inventory.get("plugins", {}).get("calico", {}).get("node", {})
@@ -42,7 +45,46 @@ def enrich_inventory(inventory: dict, cluster: KubernetesCluster) -> dict:
     if "resources" in raw_apiserver:
         inventory["plugins"]["calico"]["apiserver"]["resources"] = raw_apiserver["resources"]
 
-    return inventory
+
+@enrichment(EnrichmentStage.PROCEDURE, procedures=['remove_node'])
+def enrich_remove_node_set_previous_typha_enabled(cluster: KubernetesCluster) -> None:
+    if not cluster.previous_inventory["plugins"]["calico"]["install"]:
+        return
+
+    # If Typha was (effectively) enabled before removing of node and `enabled` value is not explicitly provided,
+    # Let's set previous flag in all inventories including final, as we are not able to fully remove Typha.
+    typha_enabled_before = is_typha_enabled(cluster.previous_inventory)
+    if typha_enabled_before and 'enabled' not in cluster.inventory.get('plugins', {}).get('calico', {}).get('typha', {}):
+        cluster.inventory.setdefault('plugins', {}).setdefault('calico', {})\
+            .setdefault('typha', {})['enabled'] = typha_enabled_before
+
+
+def new_route_reflectors_added(cluster: KubernetesCluster) -> bool:
+    procedure = cluster.context['initial_procedure']
+    if procedure != 'add_node':
+        return False
+
+    calico = cluster.inventory['plugins']['calico']
+    if calico['fullmesh']:
+        return False
+
+    for node in cluster.get_new_nodes().having_roles(['control-plane', 'worker']).get_ordered_members_configs_list():
+        if node.get('labels', {}).get('route-reflector') is True:
+            break
+    else:
+        return False
+
+    steps = calico['installation']['procedures']
+    for step in steps:
+        if 'template' not in step:
+            continue
+
+        if step['template']['source'] == 'templates/plugins/calico-rr.sh.j2':
+            break
+    else:
+        return False
+
+    return True
 
 
 # DEPRECATED
@@ -63,14 +105,8 @@ def apply_calico_yaml(cluster: KubernetesCluster, calico_original_yaml: str, cal
 
 
 def is_typha_enabled(inventory: dict) -> bool:
-    str_value = utils.true_or_false(inventory['plugins']['calico']['typha']['enabled'])
-    if str_value == 'false':
-        return False
-    elif str_value == 'true':
-        return True
-    else:
-        raise Exception(f"plugins.calico.typha.enabled must be set in 'True' or 'False' "
-                        f"as string or boolean value")
+    enabled: bool = inventory['plugins']['calico']['typha']['enabled']
+    return enabled
 
 
 def is_apiserver_enabled(inventory: dict) -> bool:
@@ -79,6 +115,8 @@ def is_apiserver_enabled(inventory: dict) -> bool:
 
 
 def renew_apiserver_certificate(cluster: KubernetesCluster) -> None:
+    from kubemarine import kubernetes  # pylint: disable=cyclic-import
+
     logger = cluster.log
     if not is_apiserver_enabled(cluster.inventory):
         logger.debug("Calico API server is disabled. Skip renewing of the key and certificate.")
@@ -130,7 +168,7 @@ def renew_apiserver_certificate(cluster: KubernetesCluster) -> None:
     # Try to access some projectcalico.org resource using each instance of the Kubernetes API server.
     expect_config = cluster.inventory['plugins']['calico']['apiserver']['expect']['apiservice']
     with kubernetes.local_admin_config(control_planes) as kubeconfig:
-        control_planes.call(utils.wait_command_successful,
+        control_planes.call(NodeGroup.wait_command_successful,
                             command=f"kubectl --kubeconfig {kubeconfig} get ippools.projectcalico.org",
                             hide=True,
                             retries=expect_config['retries'], timeout=expect_config['timeout'])
@@ -164,7 +202,7 @@ class CalicoManifestProcessor(Processor):
         self.log.verbose(f"The {key} has been patched in 'data.typha_service_name' with '{val}'")
         string_part = source_yaml['data']['cni_network_config']
         ip = self.inventory['services']['kubeadm']['networking']['podSubnet'].split('/')[0]
-        if type(ipaddress.ip_address(ip)) is ipaddress.IPv4Address:
+        if utils.isipv(ip, [4]):
             val = self.inventory['plugins']['calico']['cni']['ipam']['ipv4']
         else:
             val = self.inventory['plugins']['calico']['cni']['ipam']['ipv6']
@@ -173,6 +211,20 @@ class CalicoManifestProcessor(Processor):
         log_str = new_string_part.replace("\n", "")
         self.log.verbose(f"The {key} has been patched in 'data.cni_network_config' with '{log_str}'")
 
+    def enrich_service_account_secret_calico_kube_controllers(self, manifest: Manifest) -> None:
+        new_yaml = yaml.safe_load(service_account_secret_calico_kube_controllers)
+
+        service_account_key = "ServiceAccount_calico-kube-controllers"
+        service_account_index = manifest.all_obj_keys().index(service_account_key) \
+            if service_account_key in manifest.all_obj_keys() else -1
+        
+        self.include(manifest, service_account_index + 1, new_yaml)
+
+    def enrich_service_account_calico_kube_controllers(self, manifest: Manifest) -> None:
+        key = "ServiceAccount_calico-kube-controllers"
+        source_yaml = manifest.get_obj(key, patch=True)
+        source_yaml['automountServiceAccountToken'] = False
+    
     def enrich_deployment_calico_kube_controllers(self, manifest: Manifest) -> None:
         """
         The method implements the enrichment procedure for Calico controller Deployment
@@ -180,6 +232,9 @@ class CalicoManifestProcessor(Processor):
         """
 
         key = "Deployment_calico-kube-controllers"
+        service_account_name = "calico-kube-controllers"
+        source_yaml= manifest.get_obj(key, patch=True)
+        self.enrich_volume_and_volumemount(source_yaml, service_account_name)
         self.enrich_node_selector(manifest, key, plugin_service='kube-controllers')
         self.enrich_tolerations(manifest, key, plugin_service='kube-controllers')
         self.enrich_resources_for_container(manifest, key,
@@ -187,6 +242,20 @@ class CalicoManifestProcessor(Processor):
         self.enrich_image_for_container(manifest, key,
             plugin_service='kube-controllers', container_name='calico-kube-controllers', is_init_container=False)
 
+    def enrich_service_account_secret_calico_node(self, manifest: Manifest) -> None:
+        new_yaml = yaml.safe_load(service_account_secret_calico_node)
+
+        service_account_key = "ServiceAccount_calico-node"
+        service_account_index = manifest.all_obj_keys().index(service_account_key) \
+            if service_account_key in manifest.all_obj_keys() else -1
+        
+        self.include(manifest, service_account_index + 1, new_yaml)
+
+    def enrich_service_account_calico_node(self, manifest: Manifest) -> None:
+        key = "ServiceAccount_calico-node"
+        source_yaml = manifest.get_obj(key, patch=True)
+        source_yaml['automountServiceAccountToken'] = False
+    
     def enrich_daemonset_calico_node(self, manifest: Manifest) -> None:
         """
         The method implements the enrichment procedure for Calico node DaemonSet
@@ -194,6 +263,12 @@ class CalicoManifestProcessor(Processor):
         """
 
         key = "DaemonSet_calico-node"
+
+        service_account_name = "calico-node"
+        init_container_name = "upgrade-ipam"
+        source_yaml= manifest.get_obj(key, patch=True)
+        self.enrich_volume_and_volumemount(source_yaml, service_account_name, init_container_name)
+
         for container_name in ['upgrade-ipam', 'install-cni']:
             self.enrich_image_for_container(manifest, key,
                 plugin_service='cni', container_name=container_name, is_init_container=True)
@@ -220,7 +295,7 @@ class CalicoManifestProcessor(Processor):
         key = "DaemonSet_calico-node"
         env_delete: List[str] = []
         ip = self.inventory['services']['kubeadm']['networking']['podSubnet'].split('/')[0]
-        if type(ipaddress.ip_address(ip)) is ipaddress.IPv4Address:
+        if utils.isipv(ip, [4]):
             env_delete.extend([
                 'CALICO_IPV6POOL_CIDR', 'IP6', 'IP6_AUTODETECTION_METHOD',
                 'CALICO_IPV6POOL_IPIP', 'CALICO_IPV6POOL_VXLAN'
@@ -249,20 +324,28 @@ class CalicoManifestProcessor(Processor):
             return None
         source_yaml = manifest.get_obj(key, patch=True)
 
+        service_account_name = "calico-node"
+        self.enrich_volume_and_volumemount(source_yaml, service_account_name)
+        self.log.verbose(f"The {key} has been updated to include the new secret volume and mount.")
+
         default_tolerations = [{'key': 'node.kubernetes.io/network-unavailable', 'effect': 'NoSchedule'},
                                {'key': 'node.kubernetes.io/network-unavailable', 'effect': 'NoExecute'}]
 
         val = self.inventory['plugins']['calico']['typha']['replicas']
-        source_yaml['spec']['replicas'] = int(val)
+        source_yaml['spec']['replicas'] = val
         self.log.verbose(f"The {key} has been patched in 'spec.replicas' with '{val}'")
 
         self.enrich_node_selector(manifest, key, plugin_service='typha')
-        self.enrich_tolerations(manifest, key, plugin_service='typha', extra_tolerations=default_tolerations)
+        self.enrich_deployment_calico_typha_tolerations(manifest, default_tolerations)
         self.enrich_image_for_container(manifest, key,
             plugin_service='typha', container_name='calico-typha', is_init_container=False)
         self.enrich_deployment_calico_typha_container_env(manifest)
         self.enrich_resources_for_container(manifest, key,
             plugin_service='typha', container_name='calico-typha')
+
+    def enrich_deployment_calico_typha_tolerations(self, manifest: Manifest, default_tolerations: List[dict]) -> None:
+        key = "Deployment_calico-typha"
+        self.enrich_tolerations(manifest, key, plugin_service='typha', extra_tolerations=default_tolerations)
 
     def enrich_deployment_calico_typha_container_env(self, manifest: Manifest) -> None:
         key = "Deployment_calico-typha"
@@ -276,34 +359,6 @@ class CalicoManifestProcessor(Processor):
         # This also searches in calico.typha.env but it is currently not supported by JSON schema.
         self.enrich_env_for_container(
             manifest, key, plugin_service='typha', container_name='calico-typha', env_ensure=env_ensure)
-
-    def enrich_clusterrole_calico_kube_controllers(self, manifest: Manifest) -> None:
-        """
-        The method implements the enrichment procedure for Calico controller ClusterRole
-        :param manifest: Container to operate with manifest objects
-        """
-
-        key = "ClusterRole_calico-kube-controllers"
-        if self.inventory['rbac']['admission'] == "psp" and \
-                self.inventory['rbac']['psp']['pod-security'] == "enabled":
-            source_yaml = manifest.get_obj(key, patch=True)
-            api_list = source_yaml['rules']
-            api_list.append(cluster_role_use_anyuid_psp)
-            self.log.verbose(f"The {key} has been patched in 'rules' with '{cluster_role_use_anyuid_psp}'")
-
-    def enrich_clusterrole_calico_node(self, manifest: Manifest) -> None:
-        """
-        The method implements the enrichment procedure for Calico node ClusterRole
-        :param manifest: Container to operate with manifest objects
-        """
-
-        key = "ClusterRole_calico-node"
-        if self.inventory['rbac']['admission'] == "psp" and \
-                self.inventory['rbac']['psp']['pod-security'] == "enabled":
-            source_yaml = manifest.get_obj(key, patch=True)
-            api_list = source_yaml['rules']
-            api_list.append(cluster_role_use_privileged_psp)
-            self.log.verbose(f"The {key} has been patched in 'rules' with '{cluster_role_use_privileged_psp}'")
 
     def enrich_crd_felix_configuration(self, manifest: Manifest) -> None:
         """
@@ -333,6 +388,7 @@ class CalicoManifestProcessor(Processor):
         return [
             "ConfigMap_calico-config",
             "CustomResourceDefinition_bgpconfigurations.crd.projectcalico.org",
+            "CustomResourceDefinition_bgpfilters.crd.projectcalico.org",
             "CustomResourceDefinition_bgppeers.crd.projectcalico.org",
             "CustomResourceDefinition_blockaffinities.crd.projectcalico.org",
             "CustomResourceDefinition_caliconodestatuses.crd.projectcalico.org",
@@ -352,9 +408,12 @@ class CalicoManifestProcessor(Processor):
             "ClusterRole_calico-kube-controllers",
             "ClusterRoleBinding_calico-kube-controllers",
             "ClusterRole_calico-node",
+            "ClusterRole_calico-cni-plugin",
             "ClusterRoleBinding_calico-node",
+            "ClusterRoleBinding_calico-cni-plugin",
             "DaemonSet_calico-node",
             "ServiceAccount_calico-node",
+            "ServiceAccount_calico-cni-plugin",
             "Deployment_calico-kube-controllers",
             "ServiceAccount_calico-kube-controllers",
             "PodDisruptionBudget_calico-kube-controllers",
@@ -367,14 +426,69 @@ class CalicoManifestProcessor(Processor):
         return [
             self.exclude_typha_objects_if_disabled,
             self.enrich_configmap_calico_config,
+            self.enrich_service_account_secret_calico_kube_controllers,
+            self.enrich_service_account_calico_kube_controllers,
             self.enrich_deployment_calico_kube_controllers,
+            self.enrich_service_account_secret_calico_node,
+            self.enrich_service_account_calico_node,
             self.enrich_daemonset_calico_node,
             self.enrich_deployment_calico_typha,
-            self.enrich_clusterrole_calico_kube_controllers,
-            self.enrich_clusterrole_calico_node,
             self.enrich_crd_felix_configuration,
             self.enrich_metrics,
         ]
+
+
+class CalicoLess_3_27_ManifestProcessor(CalicoManifestProcessor):
+    def enrich_deployment_calico_typha_tolerations(self, manifest: Manifest, default_tolerations: List[dict]) -> None:
+        # "backport" issue https://github.com/projectcalico/calico/pull/7979
+        # to allow Typha to be scheduled on control-planes
+        for toleration in self.get_typha_schedule_control_plane_extra_tolerations(manifest):
+            default_tolerations.insert(0, toleration)
+
+        super().enrich_deployment_calico_typha_tolerations(manifest, default_tolerations)
+
+    def get_typha_schedule_control_plane_extra_tolerations(self, manifest: Manifest) -> List[dict]:
+        key = "Deployment_calico-typha"
+        source_yaml = manifest.get_obj(key, patch=True)
+
+        schedule_control_plane = [{'effect': 'NoExecute', 'operator': 'Exists'},
+                                  {'effect': 'NoSchedule', 'operator': 'Exists'}]
+
+        original_tolerations: List[dict] = source_yaml['spec']['template']['spec'].get('tolerations', [])
+        return [toleration for toleration in schedule_control_plane
+                if toleration not in original_tolerations]
+
+
+service_account_secret_calico_node = dedent("""\
+    apiVersion: v1
+    kind: Secret
+    metadata:
+      name: calico-node-token
+      namespace: kube-system
+      annotations:
+        kubernetes.io/service-account.name: calico-node
+    type: kubernetes.io/service-account-token  
+""")
+service_account_secret_calico_kube_controllers = dedent("""\
+    apiVersion: v1
+    kind: Secret
+    metadata:
+      name: calico-kube-controllers-token
+      namespace: kube-system
+      annotations:
+        kubernetes.io/service-account.name: calico-kube-controllers
+    type: kubernetes.io/service-account-token  
+""")
+
+
+def get_calico_manifest_processor(logger: log.VerboseLogger, inventory: dict,
+                                  yaml_path: Optional[str] = None, destination: Optional[str] = None) -> Processor:
+    version: str = inventory['plugins']['calico']['version']
+    kwargs = {'original_yaml_path': yaml_path, 'destination_name': destination}
+    if utils.version_key(version)[0:2] < utils.minor_version_key("v3.27"):
+        return CalicoLess_3_27_ManifestProcessor(logger, inventory, **kwargs)
+
+    return CalicoManifestProcessor(logger, inventory, **kwargs)
 
 
 class CalicoApiServerManifestProcessor(Processor):
@@ -402,8 +516,9 @@ class CalicoApiServerManifestProcessor(Processor):
     def get_enrichment_functions(self) -> List[EnrichmentFunction]:
         return [
             self.enrich_namespace_calico_apiserver,
+            self.enrich_service_account_secret_calico_apiserver,
+            self.enrich_service_account_calico_apiserver,
             self.enrich_deployment_calico_apiserver,
-            self.enrich_clusterrole_calico_crds,
         ]
 
     def get_namespace_to_necessary_pss_profiles(self) -> Dict[str, str]:
@@ -412,14 +527,31 @@ class CalicoApiServerManifestProcessor(Processor):
     def enrich_namespace_calico_apiserver(self, manifest: Manifest) -> None:
         self.assign_default_pss_labels(manifest, 'calico-apiserver')
 
+    def enrich_service_account_secret_calico_apiserver(self, manifest: Manifest) -> None:
+        new_yaml = yaml.safe_load(service_account_secret_calico_apiserver)
+
+        service_account_key = "ServiceAccount_calico-apiserver"
+        service_account_index = manifest.all_obj_keys().index(service_account_key) \
+            if service_account_key in manifest.all_obj_keys() else -1
+        
+        self.include(manifest, service_account_index + 1, new_yaml)
+
+    def enrich_service_account_calico_apiserver(self, manifest: Manifest) -> None:
+        key = "ServiceAccount_calico-apiserver"
+        source_yaml = manifest.get_obj(key, patch=True)
+        source_yaml['automountServiceAccountToken'] = False
+
     def enrich_deployment_calico_apiserver(self, manifest: Manifest) -> None:
         key = "Deployment_calico-apiserver"
+        source_yaml = manifest.get_obj(key, patch=True)
+        service_account_name = "calico-apiserver"
         self.enrich_node_selector(manifest, key, plugin_service='apiserver')
         self.enrich_tolerations(manifest, key, plugin_service='apiserver')
         self.enrich_image_for_container(
             manifest, key, plugin_service='apiserver', container_name='calico-apiserver', is_init_container=False)
         self.enrich_resources_for_container(
             manifest, key, plugin_service='apiserver', container_name='calico-apiserver')
+        self.enrich_volume_and_volumemount(source_yaml, service_account_name)
 
         self.enrich_deployment_calico_apiserver_container(manifest)
 
@@ -438,26 +570,14 @@ class CalicoApiServerManifestProcessor(Processor):
             manifest, key, plugin_service='apiserver', container_name='calico-apiserver',
             extra_args=additional_args)
 
-    def enrich_clusterrole_calico_crds(self, manifest: Manifest) -> None:
-        key = "ClusterRole_calico-crds"
-        if self.inventory['rbac']['admission'] == "psp" and \
-                self.inventory['rbac']['psp']['pod-security'] == "enabled":
-            source_yaml = manifest.get_obj(key, patch=True)
-            api_list = source_yaml['rules']
-            api_list.append(cluster_role_use_anyuid_psp)
-            self.log.verbose(f"The {key} has been patched in 'rules' with '{cluster_role_use_anyuid_psp}'")
 
-
-cluster_role_use_anyuid_psp = {
-        "apiGroups": ["policy"],
-        "resources": ["podsecuritypolicies"],
-        "verbs":     ["use"],
-        "resourceNames": ["oob-anyuid-psp"]
-}
-
-cluster_role_use_privileged_psp = {
-        "apiGroups": ["policy"],
-        "resources": ["podsecuritypolicies"],
-        "verbs":     ["use"],
-        "resourceNames": ["oob-privileged-psp"]
-}
+service_account_secret_calico_apiserver = dedent("""\
+    apiVersion: v1
+    kind: Secret
+    metadata:
+      name: calico-apiserver-token
+      namespace: calico-apiserver
+      annotations:
+        kubernetes.io/service-account.name: calico-apiserver
+    type: kubernetes.io/service-account-token  
+""")

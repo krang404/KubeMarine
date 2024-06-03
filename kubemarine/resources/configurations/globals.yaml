@@ -158,11 +158,6 @@ thirdparties:
 
 packages:
   debian:
-    docker:
-      package_name:
-        - docker-ce: docker
-        - docker-ce-cli: docker
-        - containerd.io: containerdio
     containerd:
       package_name:
         - containerd: containerd
@@ -173,11 +168,6 @@ packages:
       package_name:
         - keepalived: keepalived
   rhel:
-    docker:
-      package_name:
-        - docker-ce: docker
-        - docker-ce-cli: docker
-        - containerd.io: containerdio
     containerd:
       package_name:
         - containerd.io: containerdio
@@ -188,11 +178,6 @@ packages:
       package_name:
         - keepalived: keepalived
   rhel8:
-    docker:
-      package_name:
-        - docker-ce: docker
-        - docker-ce-cli: docker
-        - containerd.io: containerdio
     containerd:
       package_name:
         - containerd.io: containerdio
@@ -203,11 +188,6 @@ packages:
       package_name:
         - keepalived: keepalived
   rhel9:
-    docker:
-      package_name:
-        - docker-ce: docker
-        - docker-ce-cli: docker
-        - containerd.io: containerdio
     containerd:
       package_name:
         - containerd.io: containerdio
@@ -218,13 +198,6 @@ packages:
       package_name:
         - keepalived: keepalived
   common_associations:
-    docker:
-      executable_name: 'docker'
-      service_name: 'docker'
-      config_location: '/etc/docker/daemon.json'
-      groups:
-        - control-plane
-        - worker
     containerd:
       executable_name: 'containerd'
       service_name: 'containerd'
@@ -259,18 +232,23 @@ packages:
         - control-plane
         - worker
     openssl:
+      cache_versions: false
       package_name: 'openssl'
       groups: [ control-plane, worker, balancer ]
     curl:
+      cache_versions: false
       package_name: 'curl'
       groups: [ control-plane, worker, balancer ]
     unzip:
+      cache_versions: false
       package_name: 'unzip'
       groups: []
     kmod:
+      cache_versions: false
       package_name: 'kmod'
       groups: [ control-plane, worker, balancer ]
     semanage:
+      cache_versions: false
       groups: [ control-plane, worker, balancer ]
 
 compatibility_map:
@@ -346,6 +324,7 @@ compatibility_map:
           - '8.6'
           - '8.7'
           - '8.8'
+          - '8.9'
       - os_family: 'rhel9'
         versions:
           - '9.2'
@@ -359,6 +338,7 @@ compatibility_map:
       - os_family: 'rhel9'
         versions:
           - '9.2'
+          - '9.3'
     ubuntu:
       - os_family: 'debian'
         versions:

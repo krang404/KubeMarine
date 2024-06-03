@@ -14,15 +14,16 @@
 import io
 import sys
 import traceback
+from abc import ABC, abstractmethod
 
-from concurrent.futures import TimeoutError
-from typing import Type
+from textwrap import dedent
+from typing import Type, List
 
 from kubemarine.core import log as klog
 
 
 def get_kme_dictionary() -> dict:
-    from kubemarine.core.group import GroupException
+    from kubemarine.core.group import GroupException  # pylint: disable=cyclic-import
     return {
         "KME0000": {
             "name": "Test exception"
@@ -31,18 +32,27 @@ def get_kme_dictionary() -> dict:
             "instance": GroupException,
             "name": "Remote group exception\n{reason}"
         },
-        "KME0003": {
-            "instance": TimeoutError,
-            "name": "Action took too long to complete and timed out"
-        },
         "KME0004": {
-            "name": "There are no workers defined in the cluster scheme"
+            "name": "There are no control planes defined in the cluster scheme"
         },
         "KME0005": {
             "name": "{hostnames} are not sudoers"
         },
-        "KME0007": {
-            "name": "Docker CRI can not be used with endpoints registry definition."
+        "KME0006": {
+            "offline": dedent(
+                """\
+                Nodes {offline} are not reachable.
+                Check that the nodes addresses are entered correctly in the inventory.
+                The nodes may also be turned off, SSH port is probably not opened or incorrect,
+                or something is incorrect with the SSH daemon.
+                """.rstrip()
+            ),
+            "inaccessible": dedent(
+                """\
+                Nodes {inaccessible} are not accessible through SSH.
+                Check that the SSH credentials (keyfile, username, password) are entered correctly in the inventory.
+                """.rstrip()
+            )
         },
         "KME0008": {
             "name": "Specified Kubernetes version '{version}' - cannot be used! "
@@ -76,19 +86,52 @@ def get_kme_dictionary() -> dict:
     }
 
 
-# TODO: support for more complex KME00XX objects with custom constructors
-class KME(RuntimeError):
-    def __init__(self, code: str, **kwargs: object):
+class BaseKME(RuntimeError, ABC):
+    def __init__(self, code: str):
         self.code = code
-        self.kme = get_kme_dictionary().get(self.code)
-        if self.kme is None:
+        if self.code not in get_kme_dictionary():
             raise ValueError('An error was raised with an unknown error code')
-        name: str = self.kme.get('name')
-        self.message = name.format_map(kwargs)
+        self.kme: dict = get_kme_dictionary()[self.code]
+        self.message = self._format()
         super().__init__(self.message)
+
+    @abstractmethod
+    def _format(self) -> str: ...
 
     def __str__(self) -> str:
         return self.code + ": " + self.message
+
+
+class KME(BaseKME):
+    def __init__(self, code: str, **kwargs: object):
+        self.kwargs = kwargs
+        super().__init__(code)
+
+    def _format(self) -> str:
+        if 'name' not in self.kme:
+            raise ValueError('An error was raised with an unsupported error code')
+
+        name: str = self.kme['name']
+        return name.format_map(self.kwargs)
+
+
+class KME0006(BaseKME):
+    def __init__(self, offline: List[str], inaccessible: List[str]):
+        self.offline = offline
+        self.inaccessible = inaccessible
+        self.summary = ""
+        self.details = ""
+        super().__init__("KME0006")
+
+    def _format(self) -> str:
+        self.summary = f"Failed to connect to {len(self.offline + self.inaccessible)} nodes."
+        msgs = []
+        if self.offline:
+            msgs.append(self.kme['offline'].format(offline=self.offline))
+        if self.inaccessible:
+            msgs.append(self.kme['inaccessible'].format(inaccessible=self.inaccessible))
+        self.details = '\n'.join(msgs)
+        return self.summary + '\n' + self.details
 
 
 class FailException(Exception):
@@ -133,7 +176,7 @@ def pretty_print_error(message: str = '', reason: Exception = None, log: klog.En
 
     reason = wrap_kme_exception(reason)
 
-    if isinstance(reason, KME):
+    if isinstance(reason, BaseKME):
         error_logger(reason)
         return
 

@@ -9,6 +9,7 @@ The following functions are installed in this section.
 - [Advanced Load Balancing Techniques](#advanced-load-balancing-techniques)
   - [Allow and Deny Lists](#allow-and-deny-lists)
   - [Preserving Original HTTP Headers](#preserving-original-http-headers)
+- [Maintenance Mode](#maintenance-mode)
 
 ## TLS Termination on Nginx Ingress Controller
 
@@ -140,3 +141,59 @@ plugins:
     custom_headers:
       Expect: $http_expect
 ```
+
+## Maintenance Mode
+
+Sometimes, it may be required to perform some maintenance operations on the cluster
+during which external "business" traffic should be temporarily stopped,
+while at the same time the cluster API/UI should still be available for technical traffic (administrative tasks).
+For example, such maintenance operations may be software updates or DR scenarios.
+
+There are multiple ways to support such "maintenance mode".
+Kubemarine supports maintenance mode on the level of HAProxy Load Balancer using two different endpoints:
+
+- "Business" endpoint, which is served on particular vIP (e.g. `1.1.1.1`)
+- Additional "technical" endpoint, which is served on separate vIP (e.g. `2.2.2.2`)
+
+Both endpoints are served by the same HAProxy instances and route to the same backends (k8s API / ingress controller).
+The business endpoint is used for business traffic, and the technical endpoint is used for technical traffic.
+Normally, both these endpoints work, so any traffic is served.
+However, if maintenance mode should be enabled, HAProxy configuration could be changed,
+so that the business endpoint no longer forwards traffic to backends, instead returning an HTTP error.
+In this mode, only the technical traffic is served normally.
+
+### How to Use Maintenance Mode
+
+To start using Maintenance Mode on the Kubemarine cluster, it is required to do two things during the cluster installation:
+
+1. Configure at least two vIP - one for business traffic and one for technical traffic.
+   Business vIP should be marked with [`params.maintenance-type: "not bind"`](/documentation/Installation.md#maintenance-type) to be "dropped" during the maintenance mode.
+
+1. Maintenance Mode support should be enabled using [`haproxy.maintenance_mode: True`](/documentation/Installation.md#maintenance-mode).
+   This does not enable the maintenance mode on HAProxy immediately, instead it uploads **additional** maintenance configuration on HAProxy nodes, which could be then used to enable the maintenance mode.
+
+After these steps, HAProxy nodes support enabling the maintenance mode.
+To actually move HAProxy to maintenance mode, it is required to change HAProxy configuration from `haproxy.cfg` to `haproxy-mntc.cfg`.
+To do this without conflicting with Kubemarine, use the following steps:
+
+1. Create HAProxy systemd drop-in directory, if not created already. For example, if the HAProxy service is named `haproxy.service`,
+you need to create the `/etc/systemd/system/haproxy.service.d` directory.
+1. In this directory, create a file named `EnvFile` with the following content:
+
+      ```csv
+      CONFIG=/etc/haproxy/haproxy-mntc.cfg
+      ```
+
+1. In the same directory, create a file named `select.conf` with the path to `EnvFile` created above:
+
+      ```csv
+      [Service]
+      EnvironmentFile=/etc/systemd/system/haproxy.service.d/EnvFile
+      ```
+
+1. Restart the HAProxy service using the command `sudo systemctl daemon-reload; sudo systemctl restart haproxy`
+1. To disable maintenance mode, change `EnvFile` content to use the default configuration and restart HAProxy again:
+
+      ```csv
+      CONFIG=/etc/haproxy/haproxy.cfg
+      ```

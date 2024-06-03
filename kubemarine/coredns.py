@@ -11,14 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import io
 from typing import Union, List, Optional, Any, Dict, Tuple
 
 import yaml
 
 from kubemarine import system
 from kubemarine.core import utils
-
-import io
 
 from kubemarine.core.cluster import KubernetesCluster
 from kubemarine.core.group import RunnersGroupResult
@@ -52,7 +51,7 @@ def proceed_section_keyvalue(data: Dict[str, Any], tabsize: int) -> str:
     return config
 
 
-def generate_nested_sections(type: str, data: Dict[str, Dict[str, Any]], tabsize: int) -> str:
+def generate_nested_sections(type_: str, data: Dict[str, Dict[str, Any]], tabsize: int) -> str:
     tab = " "*tabsize
     config = ''
 
@@ -78,28 +77,28 @@ def generate_nested_sections(type: str, data: Dict[str, Dict[str, Any]], tabsize
     for section in sections:
         section_name, _ = section
         section_value = data[section_name]
-        if type == 'kubernetes':
-            config += '\n' + tab + type
+        if type_ == 'kubernetes':
+            config += '\n' + tab + type_
             if section_value.get('zone'):
                 if isinstance(section_value['zone'], list):
                     section_value['zone'] = ' '.join(section_value['zone'])
                 config += ' ' + section_value['zone']
             config += ' {' + proceed_section_keyvalue(section_value['data'], tabsize + 2) + '\n' + tab + '}'
 
-        elif type == 'hosts':
-            config += '\n' + tab + type
+        elif type_ == 'hosts':
+            config += '\n' + tab + type_
             if section_value.get('file') and isinstance(section_value['file'], str):
                 config += ' ' + section_value['file']
             config += ' {' + proceed_section_keyvalue(section_value['data'], tabsize + 2) + '\n' + tab + '}'
 
-        elif type == 'template':
+        elif type_ == 'template':
             zones: Union[str, List[Optional[str]]] = [None]
             if section_value.get('zone'):
                 zones = section_value['zone']
                 if isinstance(zones, str):
                     zones = [zones]
             for zone in zones:
-                config += '\n' + tab + type
+                config += '\n' + tab + type_
                 if section_value.get('class'):
                     config += ' ' + section_value['class']
                 if section_value.get('type'):
@@ -109,7 +108,7 @@ def generate_nested_sections(type: str, data: Dict[str, Dict[str, Any]], tabsize
                 config += ' {' + proceed_section_keyvalue(section_value['data'], tabsize + 2) + '\n' + tab + '}'
 
         else:
-            config += '\n' + tab + type + ' {' + proceed_section_keyvalue(section_value['data'], tabsize + 2)\
+            config += '\n' + tab + type_ + ' {' + proceed_section_keyvalue(section_value['data'], tabsize + 2) \
                       + '\n' + tab + '}'
 
     return config
@@ -149,10 +148,10 @@ data:'''
 def apply_configmap(cluster: KubernetesCluster, config: str) -> RunnersGroupResult:
     utils.dump_file(cluster, config, 'coredns-configmap.yaml')
 
-    group = cluster.make_group_from_roles(['control-plane', 'worker']).get_final_nodes()
+    group = cluster.make_group_from_roles(['control-plane'])
     group.put(io.StringIO(config), '/etc/kubernetes/coredns-configmap.yaml', backup=True, sudo=True)
 
-    return cluster.nodes['control-plane'].get_final_nodes().get_first_member()\
+    return cluster.nodes['control-plane'].get_first_member()\
         .sudo('kubectl apply -f /etc/kubernetes/coredns-configmap.yaml && '
              'sudo kubectl rollout restart -n kube-system deployment/coredns')
 
@@ -174,7 +173,7 @@ def apply_patch(cluster: KubernetesCluster) -> Union[RunnersGroupResult, str]:
 
         utils.dump_file(cluster, config, filename)
 
-        group = cluster.make_group_from_roles(['control-plane', 'worker']).get_final_nodes()
+        group = cluster.make_group_from_roles(['control-plane'])
         group.put(io.StringIO(config), filepath, backup=True, sudo=True)
 
         apply_command = 'kubectl patch %s coredns -n kube-system --type merge -p \"$(sudo cat %s)\"' % (config_type, filepath)
@@ -182,4 +181,4 @@ def apply_patch(cluster: KubernetesCluster) -> Union[RunnersGroupResult, str]:
     if apply_command == '':
         return 'Nothing to patch'
 
-    return cluster.nodes['control-plane'].get_final_nodes().get_first_member().sudo(apply_command)
+    return cluster.nodes['control-plane'].get_first_member().sudo(apply_command)

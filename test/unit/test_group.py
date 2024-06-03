@@ -26,40 +26,40 @@ from kubemarine.demo import FakeKubernetesCluster
 class TestGroupCreation(unittest.TestCase):
 
     # Test should from the following cluster:
-    # master-1 roles: [master, worker]
+    # control-plane-1 roles: [control-plane, worker]
     # worker-1 roles: [worker]
     # Get only node with single worker role using filter lambda function
     def test_new_group_from_lambda_filter(self):
-        multirole_inventory = demo.generate_inventory(balancer=0, master=1, worker=['master-1', 'worker-1'])
+        multirole_inventory = demo.generate_inventory(balancer=0, control_plane=1, worker=['control-plane-1', 'worker-1'])
         cluster = demo.new_cluster(multirole_inventory)
 
         expected_group = cluster.make_group(cluster.nodes['worker'].get_hosts()[1:])
-        filtered_group = cluster.nodes['worker'].new_group(apply_filter=lambda node: 'master' not in node['roles'])
+        filtered_group = cluster.nodes['worker'].new_group(apply_filter=lambda node: 'control-plane' not in node['roles'])
 
         self.assertEqual(expected_group.nodes, filtered_group.nodes, msg="Filtered groups do not match")
 
     def test_exclude_group(self):
-        inventory = demo.generate_inventory(balancer=2, master=2, worker=0)
+        inventory = demo.generate_inventory(balancer=2, control_plane=2, worker=0)
         cluster = demo.new_cluster(inventory)
 
         result_group = cluster.nodes['all'].exclude_group(cluster.nodes['balancer'])
 
-        self.assertEqual(cluster.nodes['master'].nodes, result_group.nodes, msg="Final groups do not match")
+        self.assertEqual(cluster.nodes['control-plane'].nodes, result_group.nodes, msg="Final groups do not match")
 
     def test_exclude_group_2(self):
-        multirole_inventory = demo.generate_inventory(balancer=0, master=1, worker=['master-1', 'worker-1'])
+        multirole_inventory = demo.generate_inventory(balancer=0, control_plane=1, worker=['control-plane-1', 'worker-1'])
         cluster = demo.new_cluster(multirole_inventory)
 
         expected_group = cluster.make_group(cluster.nodes['worker'].get_hosts()[1:])
-        result_group = cluster.nodes['worker'].exclude_group(cluster.nodes['master'])
+        result_group = cluster.nodes['worker'].exclude_group(cluster.nodes['control-plane'])
 
         self.assertEqual(expected_group.nodes, result_group.nodes, msg="Final groups do not match")
 
     def test_include_group(self):
-        inventory = demo.generate_inventory(balancer=2, master=2, worker=0)
+        inventory = demo.generate_inventory(balancer=2, control_plane=2, worker=0)
         cluster = demo.new_cluster(inventory)
 
-        result_group = cluster.nodes['balancer'].include_group(cluster.nodes['master'])
+        result_group = cluster.nodes['balancer'].include_group(cluster.nodes['control-plane'])
 
         self.assertEqual(cluster.nodes['all'].nodes, result_group.nodes, msg="Final groups do not match")
 
@@ -77,7 +77,7 @@ class TestGroupCall(unittest.TestCase):
 
     def test_run_empty_group(self):
         # bug reproduces inside _do(), that is why it is necessary to use real cluster
-        cluster = demo.new_cluster(demo.generate_inventory(**demo.FULLHA), fake=False)
+        cluster = demo.new_cluster(demo.generate_inventory(**demo.FULLHA))
         empty_group = cluster.nodes["worker"].new_group(apply_filter=lambda node: 'xxx' in node['roles'])
         # if there no nodes in empty group - an exception should not be produced - empty result should be returned
         empty_group.run('whoami')
@@ -128,7 +128,7 @@ class TestGroupCall(unittest.TestCase):
 
     def test_represent_group_exception_with_hide_false(self):
         one_node = self.cluster.nodes["all"].get_first_member()
-        results = demo.create_hosts_result(one_node.get_hosts(), stderr='command failed', code=1)
+        results = demo.create_hosts_result(one_node.get_hosts(), stderr='command failed', hide=False, code=1)
         self.cluster.fake_shell.add(results, "run", ['some command'])
 
         exception = None
@@ -157,8 +157,8 @@ class TestGroupCall(unittest.TestCase):
 
     def test_write_stream(self):
         expected_data = 'hello\nworld'
-        self.cluster.nodes['master'].put(io.StringIO(expected_data), '/tmp/test/file.txt')
-        actual_data_group = self.cluster.fake_fs.read_all(self.cluster.nodes['master'].get_hosts(), '/tmp/test/file.txt')
+        self.cluster.nodes['control-plane'].put(io.StringIO(expected_data), '/tmp/test/file.txt')
+        actual_data_group = self.cluster.fake_fs.read_all(self.cluster.nodes['control-plane'].get_hosts(), '/tmp/test/file.txt')
 
         for host, actual_data in actual_data_group.items():
             self.assertEqual(expected_data, actual_data, msg="Written and read data are not equal for node %s" % host)
@@ -175,7 +175,7 @@ class TestGroupCall(unittest.TestCase):
         self.cluster.fake_fs.emulate_latency = True
         with tempfile.TemporaryDirectory() as tempdir:
             file = os.path.join(tempdir, 'file.txt')
-            with open(file, 'w') as f:
+            with open(file, 'w', encoding='utf-8') as f:
                 f.write('a' * 100000)
 
             all_nodes = self.cluster.nodes["all"]
@@ -183,6 +183,27 @@ class TestGroupCall(unittest.TestCase):
 
             for host in all_nodes.get_hosts():
                 self.assertEqual('a' * 100000, self.cluster.fake_fs.read(host, '/fake/path'))
+
+    def test_wait_commands_successful_intermediate_failed(self):
+        node = self.cluster.nodes["all"].get_first_member()
+
+        results = demo.create_hosts_result(node.get_hosts(), stdout='result1')
+        TestGroupCall.cluster.fake_shell.add(results, "run", ['command1'], usage_limit=1)
+
+        results = demo.create_hosts_result(node.get_hosts(), stderr='error2', code=1)
+        TestGroupCall.cluster.fake_shell.add(results, "run", ['command2'], usage_limit=1)
+
+        results = demo.create_hosts_result(node.get_hosts(), stdout='result2')
+        TestGroupCall.cluster.fake_shell.add(results, "run", ['command2'], usage_limit=1)
+
+        results = demo.create_hosts_result(node.get_hosts(), stdout='result3')
+        TestGroupCall.cluster.fake_shell.add(results, "run", ['command3'], usage_limit=1)
+
+        node.wait_commands_successful(['command1', 'command2', 'command3'], sudo=False, timeout=0)
+
+        for cmd, expected_calls in (('command1', 1), ('command2', 2), ('command3', 1)):
+            actual_calls = TestGroupCall.cluster.fake_shell.called_times(node.get_host(), 'run', [cmd])
+            self.assertEqual(expected_calls, actual_calls, "Number of calls is not expected")
 
 
 if __name__ == '__main__':

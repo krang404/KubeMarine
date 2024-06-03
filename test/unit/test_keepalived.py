@@ -16,13 +16,12 @@
 
 import unittest
 from typing import List
+from test.unit import utils
 
 import yaml
 
 from kubemarine import demo, keepalived, yum
-from kubemarine.core import flow
-from kubemarine.procedures import remove_node, add_node
-from test.unit import utils
+from kubemarine.procedures import install
 
 
 class TestKeepalivedDefaultsEnrichment(unittest.TestCase):
@@ -122,9 +121,6 @@ class TestKeepalivedDefaultsEnrichment(unittest.TestCase):
                          self.cluster.globals['keepalived']['defaults']['priority']['max_value'] -
                          self.cluster.globals['keepalived']['defaults']['priority']['step'] * 2)
 
-    def test_keepalived_role_appeared(self):
-        self.assertIn('keepalived', self.cluster.roles)
-
     def test_keepalived_group_appeared(self):
         self.assertIsNotNone(self.cluster.nodes.get('keepalived'))
 
@@ -133,21 +129,20 @@ class TestKeepalivedDefaultsEnrichment(unittest.TestCase):
 
     def test_vrrp_defined_no_hosts_and_balancers(self):
         # vrrp_ip defined, but hosts for it is not defined + no balancers to auto determine
-        inventory = demo.generate_inventory(balancer=0, master=3, worker=3, keepalived=1)
+        inventory = demo.generate_inventory(balancer=0, control_plane=3, worker=3, keepalived=1)
         # Cluster is enriched with warnings, and the VRRP IP is not taken into account.
         cluster = demo.new_cluster(inventory)
 
         self.assertTrue(cluster.make_group_from_roles(['keepalived']).is_empty())
 
-        utils.stub_associations_packages(cluster, {})
-        finalized_inventory = cluster.make_finalized_inventory()
+        finalized_inventory = utils.make_finalized_inventory(cluster)
 
         self.assertEqual(1, len(finalized_inventory['vrrp_ips']))
         self.assertEqual([], finalized_inventory['vrrp_ips'][0]['hosts'])
 
     def test_vrrp_assigned_not_balancer(self):
-        inventory = demo.generate_inventory(master=3, worker=3, balancer=1, keepalived=1)
-        first_control_plane = next(node for node in inventory['nodes'] if 'master' in node['roles'])
+        inventory = demo.generate_inventory(control_plane=3, worker=3, balancer=1, keepalived=1)
+        first_control_plane = next(node for node in inventory['nodes'] if 'control-plane' in node['roles'])
         inventory['vrrp_ips'][0] = {
             'ip': inventory['vrrp_ips'][0],
             'hosts': [first_control_plane['name']]
@@ -157,36 +152,35 @@ class TestKeepalivedDefaultsEnrichment(unittest.TestCase):
 
         self.assertTrue(cluster.make_group_from_roles(['keepalived']).is_empty())
 
-        utils.stub_associations_packages(cluster, {})
-        finalized_inventory = cluster.make_finalized_inventory()
+        finalized_inventory = utils.make_finalized_inventory(cluster)
 
         self.assertEqual(1, len(finalized_inventory['vrrp_ips']))
         self.assertEqual(1, len(finalized_inventory['vrrp_ips'][0]['hosts']))
         self.assertEqual(first_control_plane['name'], finalized_inventory['vrrp_ips'][0]['hosts'][0]['name'])
 
     def test_vrrp_remove_only_balancer_enrich_group_finalized_hosts_empty(self):
-        inventory = demo.generate_inventory(master=3, worker=3, balancer=1, keepalived=1)
+        inventory = demo.generate_inventory(control_plane=3, worker=3, balancer=1, keepalived=1)
         balancer = next(node for node in inventory['nodes'] if 'balancer' in node['roles'])
 
-        resources = self._run_remove_node(inventory, [balancer])
-        cluster = resources.last_cluster
+        cluster = self._new_remove_node_cluster(inventory, [balancer])
 
-        self.assertEqual([balancer['name']], cluster.nodes['all'].get_nodes_for_removal().get_nodes_names(),
+        self.assertEqual([balancer['name']], cluster.get_nodes_for_removal().get_nodes_names(),
                          "Unexpected nodes for removal")
-        self.assertEqual([balancer['name']], cluster.make_group_from_roles(['keepalived']).get_nodes_names(),
-                         "Node for removal should present among 'keepalived' group")
+        self.assertEqual([balancer['name']], cluster.get_nodes_for_removal().having_roles(['keepalived']).get_nodes_names(),
+                         "Node for removal should present among 'keepalived' group to be removed")
+        self.assertEqual([], install.get_keepalived_configure_group(cluster).get_nodes_names(),
+                         "Unexpected nodes to reconfigure keepalived")
 
-        utils.stub_associations_packages(cluster, {})
-        finalized_inventory = cluster.make_finalized_inventory()
+        finalized_inventory = utils.make_finalized_inventory(cluster)
 
         self.assertEqual(1, len(finalized_inventory['vrrp_ips']))
         self.assertEqual([], finalized_inventory['vrrp_ips'][0]['hosts'])
 
-        self.assertEqual(1, len(resources.stored_inventory['vrrp_ips']))
-        self.assertEqual(inventory['vrrp_ips'], resources.stored_inventory['vrrp_ips'])
+        self.assertEqual(1, len(cluster.formatted_inventory['vrrp_ips']))
+        self.assertEqual(inventory['vrrp_ips'], cluster.formatted_inventory['vrrp_ips'])
 
     def test_vrrp_assigned_to_removed_balancer(self):
-        inventory = demo.generate_inventory(master=3, worker=3, balancer=2, keepalived=2)
+        inventory = demo.generate_inventory(control_plane=3, worker=3, balancer=2, keepalived=2)
         balancers = [node for node in inventory['nodes'] if 'balancer' in node['roles']]
         inventory['vrrp_ips'][0] = {
             'ip': inventory['vrrp_ips'][0],
@@ -198,16 +192,16 @@ class TestKeepalivedDefaultsEnrichment(unittest.TestCase):
             'floating_ip': '2.2.2.2'
         }
 
-        resources = self._run_remove_node(inventory, [balancers[0]])
-        cluster = resources.last_cluster
+        cluster = self._new_remove_node_cluster(inventory, [balancers[0]])
 
-        self.assertEqual([balancers[0]['name']], cluster.nodes['all'].get_nodes_for_removal().get_nodes_names(),
+        self.assertEqual([balancers[0]['name']], cluster.get_nodes_for_removal().get_nodes_names(),
                          "Unexpected nodes for removal")
-        self.assertEqual([balancers[0]['name'], balancers[1]['name']], cluster.make_group_from_roles(['keepalived']).get_nodes_names(),
-                         "Node for removal should be present among 'keepalived' group")
+        self.assertEqual([balancers[1]['name']], cluster.make_group_from_roles(['keepalived']).get_nodes_names(),
+                         "Node for removal should not present among 'keepalived' group")
+        self.assertEqual([balancers[1]['name']], install.get_keepalived_configure_group(cluster).get_nodes_names(),
+                         "Unexpected nodes to reconfigure keepalived")
 
-        utils.stub_associations_packages(cluster, {})
-        finalized_inventory = cluster.make_finalized_inventory()
+        finalized_inventory = utils.make_finalized_inventory(cluster)
 
         self.assertEqual(2, len(finalized_inventory['vrrp_ips']))
         self.assertEqual(1, len(finalized_inventory['vrrp_ips'][0]['hosts']))
@@ -215,49 +209,38 @@ class TestKeepalivedDefaultsEnrichment(unittest.TestCase):
         self.assertEqual(1, len(finalized_inventory['vrrp_ips'][1]['hosts']))
         self.assertEqual(balancers[1]['name'], finalized_inventory['vrrp_ips'][1]['hosts'][0]['name'])
 
-        self.assertEqual(2, len(resources.stored_inventory['vrrp_ips']))
-        self.assertEqual(inventory['vrrp_ips'], resources.stored_inventory['vrrp_ips'])
+        self.assertEqual(2, len(cluster.formatted_inventory['vrrp_ips']))
+        self.assertEqual(inventory['vrrp_ips'], cluster.formatted_inventory['vrrp_ips'])
 
     def test_remove_and_add_only_balancer(self):
-        inventory = demo.generate_inventory(master=3, worker=3, balancer=1, keepalived=1)
-        nodes_context = demo.generate_nodes_context(inventory)
+        inventory = demo.generate_inventory(control_plane=3, worker=3, balancer=1, keepalived=1)
         balancer = next(node for node in inventory['nodes'] if 'balancer' in node['roles'])
 
-        resources = self._run_remove_node(inventory, [balancer], nodes_context=nodes_context)
-        cluster = resources.last_cluster
+        cluster = self._new_remove_node_cluster(inventory, [balancer])
 
-        self.assertEqual([balancer['name']], cluster.make_group_from_roles(['keepalived']).get_nodes_names(),
-                         "Node for removal should present among 'keepalived' group")
+        self.assertEqual([], cluster.make_group_from_roles(['keepalived']).get_nodes_names(),
+                         "Node for removal should not present among 'keepalived' group")
+        self.assertEqual([], install.get_keepalived_configure_group(cluster).get_nodes_names(),
+                         "Unexpected nodes to reconfigure keepalived")
 
-        resources = self._run_add_node(resources.stored_inventory, [balancer], nodes_context=nodes_context)
-        cluster = resources.last_cluster
+        cluster = self._new_add_node_cluster(cluster.formatted_inventory, [balancer])
 
         self.assertEqual([balancer['name']], cluster.make_group_from_roles(['keepalived']).get_nodes_names(),
                          "New nodes should present among 'keepalived' group")
+        self.assertEqual([balancer['name']], install.get_keepalived_configure_group(cluster).get_nodes_names(),
+                         "Unexpected nodes to reconfigure keepalived")
 
-    def _run_remove_node(self, inventory: dict, nodes: List[dict], nodes_context = None) -> demo.FakeResources:
-        if nodes_context is None:
-            nodes_context = demo.generate_nodes_context(inventory)
-
+    def _new_remove_node_cluster(self, inventory: dict, nodes: List[dict]) -> demo.FakeKubernetesCluster:
         context = demo.create_silent_context(['fake.yaml', '--without-act'], procedure='remove_node')
         procedure_inventory = demo.generate_procedure_inventory('remove_node')
         procedure_inventory['nodes'] = nodes
-        resources = demo.FakeResources(context, inventory, procedure_inventory=procedure_inventory,
-                                       nodes_context=nodes_context)
-        flow.ActionsFlow([remove_node.RemoveNodeAction()]).run_flow(resources)
-        return resources
+        return demo.new_cluster(inventory, context=context, procedure_inventory=procedure_inventory)
 
-    def _run_add_node(self, inventory: dict, nodes: List[dict], nodes_context = None) -> demo.FakeResources:
-        if nodes_context is None:
-            nodes_context = demo.generate_nodes_context(inventory)
-
+    def _new_add_node_cluster(self, inventory: dict, nodes: List[dict]) -> demo.FakeKubernetesCluster:
         context = demo.create_silent_context(['fake.yaml', '--without-act'], procedure='add_node')
         procedure_inventory = demo.generate_procedure_inventory('add_node')
         procedure_inventory['nodes'] = nodes
-        resources = demo.FakeResources(context, inventory, procedure_inventory=procedure_inventory,
-                                       nodes_context=nodes_context)
-        flow.ActionsFlow([add_node.AddNodeAction()]).run_flow(resources)
-        return resources
+        return demo.new_cluster(inventory, context=context, procedure_inventory=procedure_inventory)
 
     def test_two_vrrp_different_interfaces(self):
         scheme = demo.new_scheme(demo.ALLINONE, 'keepalived', 2)
@@ -278,7 +261,7 @@ class TestKeepalivedDefaultsEnrichment(unittest.TestCase):
 
     def test_password_enrich_exponential_float(self):
         # Make sure to execute global patches of environment / libraries
-        from kubemarine import __main__
+        from kubemarine import __main__  # pylint: disable=unused-import
 
         inventory = demo.generate_inventory(**demo.FULLHA_KEEPALIVED)
         ip = inventory['vrrp_ips'][0]
@@ -288,7 +271,6 @@ class TestKeepalivedDefaultsEnrichment(unittest.TestCase):
         }
         cluster = demo.new_cluster(inventory)
 
-        utils.stub_associations_packages(cluster, {})
         finalized_inventory = utils.make_finalized_inventory(cluster)
         finalized_dumped = yaml.dump(finalized_inventory)
         self.assertIn("'952184e0'", finalized_dumped)
@@ -392,7 +374,7 @@ class TestKeepalivedInstallation(unittest.TestCase):
 class TestKeepalivedConfigGeneration(unittest.TestCase):
 
     def test_skip_vrrp_not_assigned(self):
-        inventory = demo.generate_inventory(master=3, worker=3, balancer=2, keepalived=2)
+        inventory = demo.generate_inventory(control_plane=3, worker=3, balancer=2, keepalived=2)
         first_balancer = next(node for node in inventory['nodes'] if 'balancer' in node['roles'])
         inventory['vrrp_ips'][0] = {
             'ip': inventory['vrrp_ips'][0],
@@ -413,7 +395,7 @@ class TestKeepalivedConfigGeneration(unittest.TestCase):
         self.assertIn(f"vrrp_instance balancer_{enriched_vrrp_ips[1]['id']}", config_2)
 
     def test_skip_removed_peers(self):
-        inventory = demo.generate_inventory(master=3, worker=3, balancer=3, keepalived=1)
+        inventory = demo.generate_inventory(control_plane=3, worker=3, balancer=3, keepalived=1)
         first_balancer = next(node for node in inventory['nodes'] if 'balancer' in node['roles'])
 
         context = demo.create_silent_context(['fake.yaml'], procedure='remove_node')
@@ -422,7 +404,7 @@ class TestKeepalivedConfigGeneration(unittest.TestCase):
 
         cluster = demo.new_cluster(inventory, procedure_inventory=remove_node, context=context)
 
-        balancers = cluster.nodes['balancer'].get_ordered_members_configs_list()
+        balancers = cluster.previous_nodes['balancer'].get_ordered_members_configs_list()
 
         only_left_peer_template = """\
     unicast_peer {{
@@ -434,6 +416,38 @@ class TestKeepalivedConfigGeneration(unittest.TestCase):
 
         config_3 = keepalived.generate_config(cluster, balancers[2])
         self.assertIn(only_left_peer_template.format(peer=balancers[1]['internal_address']), config_3)
+
+    def test_default_global_defs(self):
+        inventory = demo.generate_inventory(control_plane=3, worker=3, balancer=1, keepalived=1)
+        first_balancer = next(node for node in inventory['nodes'] if 'balancer' in node['roles'])
+
+        cluster = demo.new_cluster(inventory)
+
+        config_1 = keepalived.generate_config(cluster, first_balancer)
+        self.assertNotIn("global_defs", config_1)
+
+    def test_default_overriden_global_defs(self):
+        inventory = demo.generate_inventory(control_plane=3, worker=3, balancer=1, keepalived=1)
+        first_balancer = next(node for node in inventory['nodes'] if 'balancer' in node['roles'])
+
+        vrrp_garp_master_refresh = 60
+        inventory['services'] = {
+            "loadbalancer": {
+                "keepalived": {
+                    "global": {
+                        "vrrp_garp_master_refresh": vrrp_garp_master_refresh
+                    }
+                }
+            }
+        }
+
+        cluster = demo.new_cluster(inventory)
+        only_vrrp_garp_template = """\
+global_defs {{
+    vrrp_garp_master_refresh {vrrp_garp_master_refresh}
+}}"""
+        config_1 = keepalived.generate_config(cluster, first_balancer)
+        self.assertIn(only_vrrp_garp_template.format(vrrp_garp_master_refresh=vrrp_garp_master_refresh), config_1)
 
 
 class TestKeepalivedConfigApply(unittest.TestCase):

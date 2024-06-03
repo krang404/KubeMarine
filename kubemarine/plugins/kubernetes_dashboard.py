@@ -11,16 +11,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from textwrap import dedent
 from typing import List, Optional, Dict
+import yaml
 
-from kubemarine.core import summary, utils, log
-from kubemarine.core.cluster import KubernetesCluster
+from kubemarine.core import summary, log
+from kubemarine.core.cluster import KubernetesCluster, EnrichmentStage, enrichment
 from kubemarine.plugins.manifest import Processor, EnrichmentFunction, Manifest, Identity
 
 
-def enrich_inventory(inventory: dict, cluster: KubernetesCluster) -> dict:
+@enrichment(EnrichmentStage.FULL)
+def enrich_inventory(cluster: KubernetesCluster) -> None:
+    inventory = cluster.inventory
     if not inventory["plugins"]["kubernetes-dashboard"]["install"]:
-        return inventory
+        return
 
     # if user defined resources himself, we should use them as is, instead of merging with our defaults
     raw_dashboard = cluster.raw_inventory.get("plugins", {}).get("kubernetes-dashboard", {}).get("dashboard", {})
@@ -29,8 +33,6 @@ def enrich_inventory(inventory: dict, cluster: KubernetesCluster) -> dict:
     raw_metrics_scrapper = cluster.raw_inventory.get("plugins", {}).get("kubernetes-dashboard", {}).get("metrics-scraper", {})
     if "resources" in raw_metrics_scrapper:
         inventory["plugins"]["kubernetes-dashboard"]["metrics-scraper"]["resources"] = raw_metrics_scrapper["resources"]
-
-    return inventory
 
 
 def schedule_summary_report(cluster: KubernetesCluster) -> None:
@@ -66,6 +68,8 @@ class DashboardManifestProcessor(Processor):
     def get_enrichment_functions(self) -> List[EnrichmentFunction]:
         return [
             self.enrich_namespace_kubernetes_dashboard,
+            self.enrich_service_account_secret_kubernetes_dashboard,
+            self.enrich_service_account_kubernetes_dashboard,
             self.enrich_deployment_kubernetes_dashboard,
             self.enrich_deployment_dashboard_metrics_scraper,
         ]
@@ -76,8 +80,29 @@ class DashboardManifestProcessor(Processor):
     def enrich_namespace_kubernetes_dashboard(self, manifest: Manifest) -> None:
         self.assign_default_pss_labels(manifest, 'kubernetes-dashboard')
 
+    def enrich_service_account_secret_kubernetes_dashboard(self, manifest: Manifest) -> None:
+        new_yaml = yaml.safe_load(service_account_secret_kubernetes_dashboard)
+
+        service_account_key = "ServiceAccount_kubernetes-dashboard"
+        service_account_index = manifest.all_obj_keys().index(service_account_key) \
+            if service_account_key in manifest.all_obj_keys() else -1
+        
+        self.include(manifest, service_account_index + 1, new_yaml)
+
+    def enrich_service_account_kubernetes_dashboard(self, manifest: Manifest) -> None:
+        key = "ServiceAccount_kubernetes-dashboard"
+        source_yaml = manifest.get_obj(key, patch=True)
+        source_yaml['automountServiceAccountToken'] = False
+
     def enrich_deployment_kubernetes_dashboard(self, manifest: Manifest) -> None:
         key = "Deployment_kubernetes-dashboard"
+        source_yaml = manifest.get_obj(key, patch=True)
+        
+        service_account_name = "kubernetes-dashboard"
+        self.enrich_volume_and_volumemount(source_yaml, service_account_name)
+       
+        self.log.verbose(f"The {key} has been updated to include the new secret volume and mount.")
+
         self.enrich_image_for_container(manifest, key,
             plugin_service='dashboard', container_name='kubernetes-dashboard', is_init_container=False)
 
@@ -87,29 +112,29 @@ class DashboardManifestProcessor(Processor):
 
     def enrich_deployment_dashboard_metrics_scraper(self, manifest: Manifest) -> None:
         key = "Deployment_dashboard-metrics-scraper"
+        source_yaml = manifest.get_obj(key, patch=True)
+        
+        service_account_name = "kubernetes-dashboard"
+        self.enrich_volume_and_volumemount(source_yaml, service_account_name)
+       
+        self.log.verbose(f"The {key} has been updated to include the new secret volume and mount.")
+
         self.enrich_image_for_container(manifest, key,
             plugin_service='metrics-scraper', container_name='dashboard-metrics-scraper', is_init_container=False)
 
-        self.enrich_resources_for_container(manifest, key, container_name='dashboard-metrics-scraper', plugin_service="metrics-scraper")
+        self.enrich_resources_for_container(
+            manifest, key, container_name='dashboard-metrics-scraper', plugin_service="metrics-scraper")
         self.enrich_node_selector(manifest, key, plugin_service='metrics-scraper')
         self.enrich_tolerations(manifest, key, plugin_service='metrics-scraper', override=True)
 
 
-class V2_5_X_DashboardManifestProcessor(DashboardManifestProcessor):
-    def enrich_deployment_dashboard_metrics_scraper(self, manifest: Manifest) -> None:
-        key = "Deployment_dashboard-metrics-scraper"
-        source_yaml = manifest.get_obj(key, patch=True)
-        template_spec: dict = source_yaml['spec']['template']['spec']
-        del template_spec['securityContext']
-        self.log.verbose(f"The 'securityContext' property has been removed from 'spec.template.spec' in the {key}")
-        super().enrich_deployment_dashboard_metrics_scraper(manifest)
-
-
-def get_dashboard_manifest_processor(logger: log.VerboseLogger, inventory: dict,
-                                     yaml_path: Optional[str] = None, destination: Optional[str] = None) -> Processor:
-    version: str = inventory['plugins']['kubernetes-dashboard']['version']
-    kwargs = {'original_yaml_path': yaml_path, 'destination_name': destination}
-    if utils.minor_version(version) == 'v2.5':
-        return V2_5_X_DashboardManifestProcessor(logger, inventory, **kwargs)
-
-    return DashboardManifestProcessor(logger, inventory, **kwargs)
+service_account_secret_kubernetes_dashboard = dedent("""\
+    apiVersion: v1
+    kind: Secret
+    metadata:
+      name: kubernetes-dashboard-token
+      namespace: kubernetes-dashboard
+      annotations:
+        kubernetes.io/service-account.name: kubernetes-dashboard
+    type: kubernetes.io/service-account-token  
+""")

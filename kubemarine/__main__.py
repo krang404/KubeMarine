@@ -25,6 +25,8 @@ import yaml
 
 from kubemarine import procedures as proc
 
+# pylint: disable=bad-builtin
+
 # Don't remove this line. The idna encoding
 # is used by getaddrinfo when dealing with unicode hostnames,
 # and in some cases, there appears to be a race condition
@@ -34,7 +36,7 @@ from kubemarine import procedures as proc
 # the encodings.idna is imported and registered in the codecs registry,
 # which will stop the LookupErrors from happening.
 # See: https://bugs.python.org/issue29288
-u''.encode('idna')
+u''.encode('idna')  # pylint: disable=redundant-u-string-prefix
 
 # Take pattern to resolve float used by ruamel instead of that is used by pyyaml.
 # https://sourceforge.net/p/ruamel-yaml/code/ci/0.17.21/tree/resolver.py#l43
@@ -83,8 +85,8 @@ procedures = OrderedDict({
         'description': "Remove existing nodes from cluster",
         'group': 'maintenance'
     },
-    'manage_psp': {
-        'description': "Manage PSP on Kubernetes cluster",
+    'reconfigure': {
+        'description': "Reconfigure managed Kubernetes cluster",
         'group': 'maintenance'
     },
     'manage_pss': {
@@ -111,6 +113,10 @@ procedures = OrderedDict({
         'description': "Print current release version",
         'group': 'other'
     },
+    'config': {
+        'description': "Print the supported k8s versions with the respective configurations of third-parties",
+        'group': 'other'
+    },
     'do': {
         'description': "Execute shell command on cluster nodes",
         'group': 'other'
@@ -118,10 +124,6 @@ procedures = OrderedDict({
     'selftest': {
         'description': "Test internal imports and resources presence",
         'group': 'other'
-    },
-    'migrate_cri': {
-        'description': "Migrate from Docker to Containerd",
-        'group': 'maintenance'
     },
 })
 
@@ -177,7 +179,7 @@ def selftest() -> None:
 
     time_start = int(round(time.time() * 1000))
 
-    for procedure, procedure_details in procedures.items():
+    for procedure in procedures:
         print("\nImporting %s..." % procedure)
 
         if procedure in ['version', 'selftest']:
@@ -192,15 +194,8 @@ def selftest() -> None:
 
         print("%s has %s imports" % (procedure, len(imports)))
 
-        if "main" not in dir(module):
-            raise Exception("No main method in %s" % procedure)
-        if procedure not in ["do", "migrate_kubemarine"]:
-            if "tasks" not in dir(module):
-                raise Exception("Tasks tree is not presented in %s" % procedure)
-            if not isinstance(module.tasks, OrderedDict):
-                raise Exception("Tasks are not ordered in %s" % procedure)
-            if not module.tasks:
-                raise Exception("Tasks are empty in %s" % procedure)
+        if isinstance(module, proc.TasksProcedure) and not module.tasks:
+            raise Exception("Tasks are empty in %s" % procedure)
 
         print("%s OK" % procedure)
 
@@ -215,8 +210,8 @@ def selftest() -> None:
 
     print('\nValidating patch duplicates ...')
 
-    module = proc.import_procedure('migrate_kubemarine')
-    patches = module.load_patches()
+    from kubemarine.procedures import migrate_kubemarine
+    patches = migrate_kubemarine.load_patches()
     patch_ids = [patch.identifier for patch in patches]
     unique = set()
     for p_id in patch_ids:

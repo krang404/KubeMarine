@@ -3,8 +3,8 @@ This section provides troubleshooting information for Kubemarine and Kubernetes 
 - [Kubemarine Errors](#kubemarine-errors)
   - [KME0001: Unexpected exception](#kme0001-unexpected-exception)
   - [KME0002: Remote group exception](#kme0002-remote-group-exception)
-  - [KME0003: Action took too long to complete and timed out](#kme0003-action-took-too-long-to-complete-and-timed-out)
-  - [KME0004: There are no workers defined in the cluster scheme](#kme0004-there-are-no-workers-defined-in-the-cluster-scheme)
+    - [Command did not complete within a number of seconds](#command-did-not-complete-within-a-number-of-seconds)
+  - [KME0004: There are no control planes defined in the cluster scheme](#kme0004-there-are-no-control-planes-defined-in-the-cluster-scheme)
   - [KME0005: {hostnames} are not sudoers](#kme0005-hostnames-are-not-sudoers)
 - [Troubleshooting Tools](#troubleshooting-tools)
   - [etcdctl Script](#etcdctl-script)
@@ -30,12 +30,16 @@ This section provides troubleshooting information for Kubemarine and Kubernetes 
   - [No Pod-to-Pod Traffic for Some Nodes with More Than One Network Interface](#no-pod-to-pod-traffic-for-some-nodes-with-more-than-one-network-interface)
   - [No Pod-to-Pod Traffic for Some Nodes with More Than One IPs with Different CIDR Notation](#no-pod-to-pod-traffic-for-some-nodes-with-more-than-one-ips-with-different-cidr-notation)
   - [Ingress Cannot Be Created or Updated](#ingress-cannot-be-created-or-updated)
+  - [vIP Address is Unreachable](#vip-address-is-unreachable)
+  - [CoreDNS Cannot Resolve the Name](#coredns-cannot-resolve-the-name)
+    - [Case 1](#case-1)
+    - [Case 2](#case-2)
 - [Troubleshooting Kubemarine](#troubleshooting-kubemarine)
+  - [Operation not Permitted Error in Kubemarine Docker Run](#operation-not-permitted-error-in-kubemarine-docker-run)
   - [Failures During Kubernetes Upgrade Procedure](#failures-during-kubernetes-upgrade-procedure)
   - [Numerous Generation of Auditd System Messages](#numerous-generation-of-auditd-system)
   - [Failure During Installation on Ubuntu OS With Cloud-init](#failure-during-installation-on-ubuntu-os-with-cloud-init)
   - [Troubleshooting an Installation That Ended Incorrectly](#troubleshooting-an-installation-that-ended-incorrectly)
-  - [Kubelet Has Conflict With Kubepods-burstable.slice and Kube-proxy Pods Stick in ContainerCreating Status](#kubelet-has-conflict-with-kubepods-burstableslice-and-kube-proxy-pods-stick-in-containercreating-status)
   - [Upgrade Procedure to v1.28.3 Fails on ETCD Step](#upgrade-procedure-to-v1283-fails-on-etcd-step)
   - [kubectl logs and kubectl exec fail](#kubectl-logs-and-kubectl-exec-fail)
 
@@ -109,23 +113,8 @@ KME0002: Remote group exception
 	
 	Exit code: 127
 	
-	Stdout:
-	
-	
-	
-	Stderr:
-	
+	=== stderr ===
 	bash: apt: command not found
-```
-
-Hierarchical error:
-
-```
-FAILURE!
-TASK FAILED xxx
-KME0002: Remote group exception
-10.101.10.1:
-	KME0003: Action took too long to complete and timed out
 ```
 
 An error indicating an unexpected runtime bash command exit on a remote cluster host. This error 
@@ -133,7 +122,7 @@ occurs when a command is terminated unexpectedly with a non-zero error code.
 
 The error prints the status of the command execution for each node in the group on which the bash command 
 was executed. The status can be a correct result (shell results), a result with an error 
-(shell error), as well as a hierarchical KME with its own code.
+(shell error), as well as a [timeout](#command-did-not-complete-within-a-number-of-seconds) error.
 
 To fix it, first try checking the nodes and the cluster with 
 [IAAS checker](Kubecheck.md#iaas-procedure) and [PAAS checker](Kubecheck.md#paas-procedure). If you 
@@ -147,14 +136,20 @@ If you still can't resolve this error yourself, start
 error with its stacktrace. We will try to help as soon as possible.
 
 
-## KME0003: Action took too long to complete and timed out
+### Command did not complete within a number of seconds
 
 ```
 FAILURE!
 TASK FAILED xxx
 KME0002: Remote group exception
 10.101.10.1:
-	KME0003: Action took too long to complete and timed out
+ 	Command did not complete within 2700 seconds!
+ 	
+ 	Command: 'echo "sleeping..." && sleep 3000'
+ 	
+ 	=== stdout ===
+ 	sleeping...
+	
 ```
 
 An error that occurs when a command did not have time to execute at the specified time.
@@ -172,18 +167,18 @@ frozen stage of the procedure. It will be useful to check the cluster with
 [IAAS checker](Kubecheck.md#iaas-procedure) to detect problems with network connectivity.
 
 
-## KME0004: There are no workers defined in the cluster scheme
+## KME0004: There are no control planes defined in the cluster scheme
 
 ```
 FAILURE!
-KME0004: There are no workers defined in the cluster scheme
+KME0004: There are no control planes defined in the cluster scheme
 ```
 
-An error related with the absence of any worker role in the inventory file. The error occurs before
+An error related with the absence of any control plane role in the inventory file. The error occurs before
 the payload is executed on the cluster.
 
-To fix it, you need to either specify new nodes with the `worker` role, or add the `worker` role to 
-the existing control-planes nodes.
+To fix it, you need to either specify new nodes with the `control-plane` role, or add the `control-plane` role to 
+the existing worker nodes.
 
 An example of specifying different nodes with separate `control-plane` and `worker` roles is as follows.
 
@@ -327,11 +322,11 @@ kubectl patch crontab/my-new-cron-object -p '{"metadata":{"finalizers":[]}}' --t
 **Solution**: To change MTU size to required value run following command on any control-plane node:
 
 ```
-# kubectl patch configmap/calico-config -n kube-system --type merge -p '{"data":{"veth_mtu": "1440"}}'
+# kubectl patch configmap/calico-config -n kube-system --type merge -p '{"data":{"veth_mtu": "1430"}}'
 ```
 
 where:
-  - **1440** is the size of MTU. For MTU 1450 on interface eth0 you should set MTU size 1430 for calico-config.
+  - **1430** is the size of MTU. For MTU 1450 on interface eth0 you should set MTU size 1430 for calico-config.
 
 
 After updating the ConfigMap, perform a rolling restart of all calico/node pods. For example:
@@ -362,7 +357,7 @@ The maximum size cannot be changed, so `kubectl apply` is unable to apply large 
 * `--max-requests-inflight` is the maximum number of non-mutating requests. The default value is 400.
 * `--max-mutating-requests-inflight` is the maximum number of mutating requests. The default value is 200.
 
-`kube-apiserver` configration file is stored in /etc/kubernetes/manifests/kube-apiserver.yaml. This file should be changed 
+`kube-apiserver` configuration file is stored in /etc/kubernetes/manifests/kube-apiserver.yaml. This file should be changed 
 on all control-planes. Also, the configuration map `kubeadm-config` from kube-system namespace should have the same values 
 in `apiServer` section.
 
@@ -486,7 +481,7 @@ In etcd logs there are such messages:
 
 **Root Cause**: Etcd database treats requests too slowly.
 
-**Solution**: to impove etcd performance.
+**Solution**: To improve etcd performance.
 
 First of all it is necessary to check that the disk under `/var/lib/etcd` satisfies [the recommendations](/documentation/Installation.md#etcd-recommendation).
 
@@ -518,11 +513,11 @@ Other general etcd tuning recommendations can be found in the [official etcd doc
 panic: failed to update; member unknown
 ```
 
-other etcd pods do not start due to no connection to the failed cluster members.
+Other etcd pods do not start due to no connection to the failed cluster members.
 
 **Root cause**: The etcd database is corrupted.
 
-**Solution**: If you have relevant backup created by [`kubemarine backup`](/documentation/Maintenance.md#backup-procedure) procedure and it is suitable to restore the whole kubernetes cluster from it, you can use [`kubemarine restore`](/documentation/Maintenance.md#restore-procedure) procedure.
+**Solution**: If you have relevant backup created by [`kubemarine backup`](/documentation/Maintenance.md#backup-procedure) procedure and it is suitable to restore the whole Kubernetes cluster from it, you can use [`kubemarine restore`](/documentation/Maintenance.md#restore-procedure) procedure.
 
 If you want to restore not the whole cluster, but etcd database only, you can use `kubemarine restore` procedure with the list of required tasks:
 
@@ -536,7 +531,7 @@ kubemarine restore --config=${CLUSTER_YAML} --tasks="prepare,import.etcd,reboot 
 
 ### Manual Restoration of Etcd Database
 
-If it is not possible to use standard kubemarine procedure to restore etcd, you can do that manually.
+If it is not possible to use standard Kubemarine procedure to restore etcd, you can do that manually.
 
 #### Manual Etcd Restoration from a Snapshot
 
@@ -928,9 +923,171 @@ spec:
         - '--disable-full-test'
 ```
 
+## vIP Address is Unreachable
+
+**Symptoms**:
+
+Installation failed with error:
+
+```console
+.....
+<DATETIME> VERBOSE [log.verbose] I1220 14:12:57.517911    3239 waitcontrolplane.go:83] [wait-control-plane] Waiting for the API server to be healthy
+<DATETIME> VERBOSE [log.verbose] I1220 14:12:58.520621    3239 with_retry.go:234] Got a Retry-After 1s response for attempt 1 to https://api.example.com:6443/healthz?timeout=10s
+<DATETIME> VERBOSE [log.verbose] I1220 14:12:59.522460    3239 with_retry.go:234] Got a Retry-After 1s response for attempt 2 to https://api.example.com:6443/healthz?timeout=10s
+<DATETIME> VERBOSE [log.verbose] I1220 14:13:00.523457    3239 with_retry.go:234] Got a Retry-After 1s response for attempt 3 to https://api.example.com:6443/healthz?timeout=10s
+<DATETIME> VERBOSE [log.verbose] I1220 14:13:01.524729    3239 with_retry.go:234] Got a Retry-After 1s response for attempt 4 to https://api.example.com:6443/healthz?timeout=10s
+<DATETIME> VERBOSE [log.verbose] I1220 14:13:02.526164    3239 with_retry.go:234] Got a Retry-After 1s response for attempt 5 to https://api.example.com:6443/healthz?timeout=10s
+<DATETIME> VERBOSE [log.verbose] I1220 14:13:03.529524    3239 with_retry.go:234] Got a Retry-After 1s response for attempt 6 to https://api.example.com:6443/healthz?timeout=10s
+<DATETIME> VERBOSE [log.verbose] I1220 14:13:04.530520    3239 with_retry.go:234] Got a Retry-After 1s response for attempt 7 to https://api.example.com:6443/healthz?timeout=10s
+<DATETIME> VERBOSE [log.verbose] I1220 14:13:05.531711    3239 with_retry.go:234] Got a Retry-After 1s response for attempt 8 to https://api.example.com:6443/healthz?timeout=10s
+<DATETIME> VERBOSE [log.verbose] I1220 14:13:06.532613    3239 with_retry.go:234] Got a Retry-After 1s response for attempt 9 to https://api.example.com:6443/healthz?timeout=10s
+202
+.....
+<DATETIME> VERBOSE [log.verbose] couldn't initialize a Kubernetes cluster
+.....
+<DATETIME> CRITICAL [errors.error_logger] TASK FAILED deploy.kubernetes.init
+<DATETIME> CRITICAL [errors.error_logger] KME0002: Remote group exception
+```
+
+Looks like IP address for Kubernetes API is unreachable.
+
+**Root Cause**:
+
+1. Make shure vIP address is unreachable:
+
+    Try to check connectivity with `api.example.com`:
+
+    ```console
+    ping -c 1 -W 2 api.example.com
+
+
+    PING api.example.com (10.10.10.144) 56(84) bytes of data.
+
+    --- api.example.com ping statistics ---
+    1 packets transmitted, 0 received, 100% packet loss, time 0ms
+    ```
+
+    IP address `10.10.10.144` is the floating IP address for internal `192.168.0.4` and it is unreachable.
+
+1. Check vIP address is managed by keepalived and exists on the correct network interface:
+
+    Check the vIP address is on the interface of node with **balancer**:
+
+      ```console
+      sudo ip a
+
+
+      ....
+    2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc fq_codel state UP group default qlen 1000
+        link/ether fa:16:3e:54:45:74 brd ff:ff:ff:ff:ff:ff
+        altname enp0s3
+        altname ens3
+        inet 192.168.0.11/24 brd 192.168.0.255 scope global dynamic noprefixroute eth0
+          valid_lft 36663sec preferred_lft 36663sec
+        inet 192.168.0.4/32 scope global vip_2910a02af7
+          valid_lft forever preferred_lft forever
+    ```
+
+1. Try to ping by internal IP address from any worker node:
+
+    ```console
+    ping -c 1 -W 2 192.168.0.4
+
+
+    PING 192.168.0.4 (192.168.0.4) 56(84) bytes of data.
+
+    --- 192.168.0.4 ping statistics ---
+    1 packets transmitted, 0 received, 100% packet loss, time 0ms
+    ```
+
+1. Check the ARP table for correct MAC address. Should be the same with `fa:16:3e:54:45:74`
+
+    On worker node:
+
+    ```console
+    sudo arp -a | grep 192.168.0.4
+
+    <NODENAME> (192.168.0.4) at 10:e7:c6:c0:47:35 [ether] on ens3
+    ```
+
+1. In case of the MAC address from arp command is different with correct value GARP protocol is disabled in environment and **keepalived** can not announce new MAC address for vIP address.
+
+    **Solution**: Уou need to contact technical support and ask to enable the GARP protocol.
+
+## CoreDNS Cannot Resolve the Name
+
+### Case 1
+
+**Symptoms**: A pod cannot resolve a short name. A check inside the pod looks like the following:
+
+```
+$ nslookup kubernetes.default
+Server:         172.30.0.10
+Address:        172.30.0.10:53
+
+
+** server can't find kubernetes.default: NXDOMAIN
+```
+
+**Root cause**: Images with the `busybox` utility that represents the `nslookup` command could have issues with the `search` directives in `/etc/resolv.conf`.
+
+**Solution**: Use FQDN instead of a short name, which consists of `service` and `namespace` only. For example, `kubernetes.default.svc.cluster.local` instead of `kubernetes.default`. In some cases, addition of `bind-tools` package fixes the issue with short names. For more information, refer to the following: 
+* [https://github.com/docker-library/busybox/issues/48](https://github.com/docker-library/busybox/issues/48)
+* [https://stackoverflow.com/questions/65181012/does-alpine-have-known-dns-issue-within-kubernetes](https://stackoverflow.com/questions/65181012/does-alpine-have-known-dns-issue-within-kubernetes)
+
+### Case 2
+
+**Symptoms**: A pod that is attached to `hostNetwork` cannot resolve a name periodically or constantly, even if it is FQDN. The following error message is displayed:
+
+```
+$ nslookup kubernetes.default.svc.cluster.local
+;; connection timed out; no servers could be reached
+``` 
+
+**Root cause**: Traffic from node network to pod network is blocked for UDP port 53.
+
+**Solution**: Change the cloud provider configuration to allow the traffic on the IaaS layer. In OpenStack, the Security Groups manage the allowed traffic.
+
+## Pods do not Start Properly
+
+**Symptoms**: Pods do not start properly and `Audit` daemon has the following messages in the log:
+`Error receiving audit netlink packet (No buffer space available)`
+
+**Root cause**: `Audit` daemon internal issue.
+
+**Solution**: Change the `Audit` daemon configuration or disable it.
+
 # Troubleshooting Kubemarine
 
 This section provides troubleshooting information for Kubemarine-specific or installation-specific issues.
+
+## Operation not Permitted Error in Kubemarine Docker Run
+
+**Symptoms**: Some command in Kubemarine docker fails with "Operation not permitted" error. The command can be absolutely different, e.g. new thread creation for Kubemarine run or simple `ls` command.
+
+**Root cause**: The problem is not compatible docker and Kubemarine base [image version](/Dockerfile#L1): Kubemarine uses system calls, that is not allowed by default in docker.
+
+**Solution**: Check the compatibility issues for used docker version and Kubemarine base [image version](/Dockerfile#L1) and 
+upgrade docker version to one, where found issues are resolved. 
+
+As alternative, provide additional grants to Kubemarine container using `--privileged` or `--cap-add` options for docker command.
+
+**Example of problem**: Kubemarine image `v0.25.0` runs `ls -la` command on `Centos 7.5 OS` with docker version `1.13.1-102` installed:
+
+```bash
+$ docker run --entrypoint ls kubemarine:v0.25.0 -la
+ls: cannot access '.': Operation not permitted
+ls: cannot access '..': Operation not permitted
+ls: cannot access '.dockerignore': Operation not permitted
+total 0
+d????????? ? ? ? ?            ? .
+d????????? ? ? ? ?            ? ..
+-????????? ? ? ? ?            ? .dockerignore
+```
+
+The root cause here is in `coreutils 8.32` library, that is installed in that Kubemarine image. This library uses `statx` calls for `ls` command,
+but those calls were added to docker white-list only since `1.13.1-109` version. For this reason it works only with this  or newer version.
+
 
 ## Failures During Kubernetes Upgrade Procedure
 
@@ -1230,17 +1387,6 @@ Rules are deleted in predefined.rules, which is located on this path /etc/audit/
   ```
 The user can analyze these files and try to find the reason for the failed installation of Kubemarine.
 
-
-## Kubelet Has Conflict With Kubepods-burstable.slice and Kube-proxy Pods Stick in ContainerCreating Status
-
-* Sometimes the `migrate_cri` procedure fails because of kubelet has conflict with kubepods-burstable.slice and `kube-proxy` pods stuck in ContainerCreating status.
-
-**Solution**: 
-```
-sudo systemctl stop kubepods-burstable.slice
-sudo systemctl restart containerd
-```
-
 ## kubectl logs and kubectl exec fail
 
 **Symptoms**: The attempt to get pod logs and execute a command inside the container fails with the following errors:
@@ -1257,4 +1403,4 @@ Error from server: error dialing backend: remote error: tls: internal error
 
 **Root cause**: The `kubelet` server certificate is not approved, whereas the cluster has been configured not to use self-signed certificates for the `kubelet` server.
 
-**Solution**: Perform CSR approval steps from the maintenance guide. Refer to the [Kubelet Server Certificate Approval](https://github.com/Netcracker/KubeMarine/blob/main/documentation/Maintenance.md#kubelet-server-certificate-approval) section for details.
+**Solution**: Perform CSR approval steps from the maintenance guide. Refer to the [Kubelet Server Certificate Approval](https://github.com/Netcracker/KubeMarine/blob/main/documentation/internal/Hardening.md#kubelet-server-certificate-approval) section for details.

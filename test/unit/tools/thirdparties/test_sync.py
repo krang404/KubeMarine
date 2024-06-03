@@ -12,32 +12,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import io
+import itertools
 import re
 import unittest
 from contextlib import contextmanager
 from copy import deepcopy
 from typing import List, Dict, ContextManager
 from unittest import mock
-
-import yaml
-from ruamel.yaml import CommentedMap
+from test.unit import utils as test_utils
+from test.unit.tools.thirdparties.stub import (
+    FakeSynchronization, FakeInternalCompatibility, FakeKubernetesVersions,
+    FAKE_CACHED_MANIFEST_RESOLVER, FakeManifest, NoneManifestsEnrichment, FakeUpgradeConfig,
+    FakeKubernetesImagesResolver
+)
 
 from kubemarine.core import utils, static
 from kubemarine.plugins import builtin
 from kubemarine.plugins.manifest import Manifest, Processor, Identity
-from scripts.thirdparties.src.software import thirdparties, plugins
+from scripts.thirdparties.src.software import thirdparties, plugins, kubernetes_images
 from scripts.thirdparties.src.software.plugins import (
     ManifestResolver, ManifestsEnrichment,
     ERROR_UNEXPECTED_IMAGE, ERROR_SUSPICIOUS_ABA_VERSIONS
 )
 from scripts.thirdparties.src.tracker import (
     SummaryTracker, ERROR_PREVIOUS_MINOR
-)
-from test.unit import utils as test_utils
-from test.unit.tools.thirdparties.stub import (
-    FakeSynchronization, FakeInternalCompatibility, FakeKubernetesVersions,
-    FAKE_CACHED_MANIFEST_RESOLVER, FakeManifest, NoneManifestsEnrichment, FakeUpgradeConfig
 )
 
 
@@ -51,6 +49,7 @@ class SynchronizationTest(unittest.TestCase):
     def setUp(self) -> None:
         self.compatibility = FakeInternalCompatibility()
         self.kubernetes_versions = FakeKubernetesVersions()
+        self.images_resolver = FakeKubernetesImagesResolver()
         self.manifest_resolver = FAKE_CACHED_MANIFEST_RESOLVER
         self.manifests_enrichment = NoneManifestsEnrichment()
         self.upgrade_config = FakeUpgradeConfig()
@@ -156,19 +155,21 @@ class SynchronizationTest(unittest.TestCase):
                                  actual_mapping.get('version'),
                                  f"Version for {thirdparty!r} and Kubernetes {ver} was not synced")
 
-    def _check_added_k8s_images(self, ver: str, from_ver: str):
+    def _check_added_k8s_images(self, ver: str, _: str):
         for k8s_image in ('kube-apiserver', 'kube-controller-manager', 'kube-scheduler', 'kube-proxy',
                           'pause', 'etcd', 'coredns/coredns'):
+            expected_version = self.images_resolver.stub_image(ver, k8s_image).split(':')[1]
+
             software_mapping = self.compatibility.stored['kubernetes_images.yaml'][k8s_image]
             actual_mapping = software_mapping.get(ver, {})
-            self.assertEqual(f"fake-{k8s_image}-version",
+            self.assertEqual(expected_version,
                              actual_mapping.get('version'),
                              f"Version for {k8s_image!r} and Kubernetes {ver} was not synced")
             self.assertTrue(utils.is_sorted(list(software_mapping), key=utils.version_key),
                             f"Kubernetes versions for {k8s_image!r} are not sorted")
 
     def _check_added_packages(self, ver: str, from_ver: str):
-        for package in ('docker', 'containerd', 'containerdio'):
+        for package in ('containerd', 'containerdio'):
             software_mapping = self.compatibility.stored['packages.yaml'][package]
             actual_mapping = software_mapping.get(ver, {})
             original_mapping = ORIGINAL_COMPATIBILITY_MAPS['packages.yaml'][package][from_ver]
@@ -270,8 +271,10 @@ class SynchronizationTest(unittest.TestCase):
         for test_identity in builtin.MANIFEST_PROCESSOR_PROVIDERS:
             with self.subTest(test_identity.name):
                 class FakeManifestResolver(ManifestResolver):
-                    def _resolve(self, manifest_identity: Identity, plugin_version: str) -> Manifest:
+                    def _resolve(self, manifest_identity: Identity, plugin_version: str,
+                                 test_identity=test_identity) -> Manifest:
                         if manifest_identity != test_identity:
+                            # pylint: disable-next=protected-access
                             return FAKE_CACHED_MANIFEST_RESOLVER._resolve(manifest_identity, plugin_version)
 
                         manifest = FakeManifest(manifest_identity, plugin_version)
@@ -291,6 +294,7 @@ class SynchronizationTest(unittest.TestCase):
 
             def _resolve(self, manifest_identity: Identity, plugin_version: str) -> Manifest:
                 if manifest_identity != Identity('calico'):
+                    # pylint: disable-next=protected-access
                     return FAKE_CACHED_MANIFEST_RESOLVER._resolve(manifest_identity, plugin_version)
 
                 manifest = FakeManifest(manifest_identity, plugin_version)
@@ -343,8 +347,23 @@ class SynchronizationTest(unittest.TestCase):
                 with self.assertRaisesRegex(Exception, error_msg_pattern.format(**kwargs)):
                     self.run_sync()
 
+    def test_mapped_software_latest_patch_ascending_order(self):
+        for software_name in ('calico', 'nginx-ingress-controller', 'kubernetes-dashboard', 'local-path-provisioner',
+                              'crictl'):
+            with self.subTest(software_name):
+                k8s_latest = self.k8s_versions()[-1]
+                self.kubernetes_versions = FakeKubernetesVersions()
+                software_version = self.compatibility_map()[k8s_latest][software_name]
+                for latest_patch_k8s_version in self.latest_patch_k8s_versions():
+                    software_version = test_utils.increment_version(software_version)
+                    self.compatibility_map()[latest_patch_k8s_version][software_name] = software_version
+
+                # No error should be raised
+                self.run_sync()
+
     def test_plugins_suspicious_aba_extra_images(self):
-        if len(self.k8s_versions()) < 3:
+        latest_patch_k8s_versions = self.latest_patch_k8s_versions()
+        if len(latest_patch_k8s_versions) < 3:
             self.skipTest("Cannot check suspicions A -> B -> A versions of extra images,")
 
         plugin_images = {
@@ -355,18 +374,62 @@ class SynchronizationTest(unittest.TestCase):
         for plugin, extra_image in plugin_images.items():
             with self.subTest(plugin):
                 self.kubernetes_versions = FakeKubernetesVersions()
-                self.compatibility_map()[self.k8s_versions()[0]][extra_image] = 'A'
-                self.compatibility_map()[self.k8s_versions()[1]][extra_image] = 'B'
-                self.compatibility_map()[self.k8s_versions()[-1]][extra_image] = 'A'
+                self.compatibility_map()[latest_patch_k8s_versions[0]][extra_image] = 'A'
+                self.compatibility_map()[latest_patch_k8s_versions[1]][extra_image] = 'B'
+                self.compatibility_map()[latest_patch_k8s_versions[-1]][extra_image] = 'A'
 
                 kwargs = {
                     'image': re.escape(extra_image), 'plugin': re.escape(plugin),
-                    'version_A': 'A', 'version_B': '.*',
-                    'older_k8s_version': re.escape(self.k8s_versions()[0]),
-                    'newer_k8s_version': re.escape(self.k8s_versions()[-1]),
-                    'k8s_version': '.*',
+                    'version_A': '.*', 'version_B': '.*',
+                    'older_k8s_version': '.*', 'newer_k8s_version': '.*', 'k8s_version': '.*',
                 }
                 with self.assertRaisesRegex(Exception, ERROR_SUSPICIOUS_ABA_VERSIONS.format(**kwargs)):
+                    self.run_sync()
+
+    def test_kubernetes_images_not_ascending_order(self):
+        k8s_versions = self.latest_patch_k8s_versions()
+        if len(k8s_versions) == 1:
+            self.skipTest("Cannot check kubernetes images ascending order for the only minor Kubernetes version.")
+
+        for image_name in ('pause', 'etcd', 'coredns/coredns'):
+            with self.subTest(image_name):
+                k8s_oldest = k8s_versions[0]
+                k8s_latest = k8s_versions[-1]
+                k8s_new = test_utils.increment_version(k8s_oldest)
+
+                self.kubernetes_versions = FakeKubernetesVersions()
+                self.compatibility_map()[k8s_new] = deepcopy(self.compatibility_map()[k8s_oldest])
+
+                image_oldest = ORIGINAL_COMPATIBILITY_MAPS['kubernetes_images.yaml'][image_name][k8s_oldest]['version']
+                image_latest = ORIGINAL_COMPATIBILITY_MAPS['kubernetes_images.yaml'][image_name][k8s_latest]['version']
+
+                if image_name in ('pause', 'etcd'):
+                    new_image_version = image_latest[:-1] + str(int(image_latest[-1]) + 1)
+                else:
+                    new_image_version = test_utils.increment_version(image_latest)
+
+                class FakeResolver(FakeKubernetesImagesResolver):
+                    def resolve(self, k8s_version: str) -> List[str]:
+                        # pylint: disable=cell-var-from-loop
+
+                        k8s_resolve = k8s_oldest if k8s_version == k8s_new else k8s_version
+                        images = super().resolve(k8s_resolve)
+                        if k8s_version == k8s_new:
+                            for i, image in enumerate(images):
+                                if image_name in image:
+                                    images[i] = image.replace(image_oldest, new_image_version)
+                                    break
+
+                        return images
+
+                self.images_resolver = FakeResolver()
+
+                kwargs = {
+                    'image': re.escape(image_name),
+                    'older_version': re.escape(new_image_version), 'older_k8s_version': re.escape(k8s_new),
+                    'newer_version': '.*', 'newer_k8s_version': '.*',
+                }
+                with self.assertRaisesRegex(Exception, kubernetes_images.ERROR_ASCENDING_VERSIONS.format(**kwargs)):
                     self.run_sync()
 
     def test_manifests_enrichment_add_new_version(self):
@@ -496,7 +559,7 @@ class SynchronizationTest(unittest.TestCase):
     def _mock_globals_load_kubernetes_versions(self):
         backup = deepcopy(static.KUBERNETES_VERSIONS)
         def load_kubernetes_versions_mocked() -> dict:
-            return self._convert_ruamel_pyyaml(self.kubernetes_versions.stored)
+            return utils.convert_native_yaml(self.kubernetes_versions.stored)
 
         try:
             with mock.patch.object(static, static.load_kubernetes_versions.__name__,
@@ -508,22 +571,18 @@ class SynchronizationTest(unittest.TestCase):
     @contextmanager
     def _mock_globals_load_compatibility_map(self):
         def load_compatibility_map_mocked(filename: str) -> dict:
-            return self._convert_ruamel_pyyaml(self.compatibility.stored[filename])
+            return utils.convert_native_yaml(self.compatibility.stored[filename])
 
         with test_utils.backup_globals(), \
                 mock.patch.object(static, static.load_compatibility_map.__name__,
                                   side_effect=load_compatibility_map_mocked):
             yield
 
-    def _convert_ruamel_pyyaml(self, source: CommentedMap) -> dict:
-        stream = io.StringIO()
-        utils.yaml_structure_preserver().dump(source, stream)
-        return yaml.safe_load(io.StringIO(stream.getvalue()))
-
     def run_sync(self) -> SummaryTracker:
         return FakeSynchronization(
             self.compatibility,
             self.kubernetes_versions,
+            self.images_resolver,
             self.manifest_resolver,
             self.manifests_enrichment,
             self.upgrade_config,
@@ -534,6 +593,10 @@ class SynchronizationTest(unittest.TestCase):
 
     def k8s_versions(self) -> List[str]:
         return sorted(self.compatibility_map(), key=utils.version_key)
+
+    def latest_patch_k8s_versions(self) -> List[str]:
+        return [sorted(versions, key=utils.version_key)[-1]
+                for _, versions in itertools.groupby(self.k8s_versions(), key=utils.minor_version)]
 
 
 if __name__ == '__main__':
